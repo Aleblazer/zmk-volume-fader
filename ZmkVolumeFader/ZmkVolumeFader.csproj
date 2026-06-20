@@ -8,11 +8,18 @@
     <UseWindowsForms>true</UseWindowsForms>
     <RootNamespace>ZmkVolumeFader</RootNamespace>
     <AssemblyName>ZmkVolumeFader</AssemblyName>
+    <ApplicationIcon>app.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="HidSharp" Version="2.1.0" />
     <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Embed the icon so the form and tray can load it at runtime. -->
+    <None Remove="app.ico" />
+    <EmbeddedResource Include="app.ico" />
   </ItemGroup>
 
 </Project>

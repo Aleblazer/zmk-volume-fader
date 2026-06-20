@@ -87,12 +87,13 @@ public class MainForm : Form
     volatile bool _run;
     bool _loadingSettings;
 
-    readonly NotifyIcon _tray = new() { Text = "ZMK Volume Fader", Icon = SystemIcons.Application };
+    readonly NotifyIcon _tray = new() { Text = "ZMK Volume Fader", Icon = LoadAppIcon() };
     bool _exiting;   // true when quitting for real (tray Exit / shutdown) so close doesn't re-prompt
 
     public MainForm()
     {
         Text = "ZMK Volume Fader";
+        Icon = LoadAppIcon();
         ClientSize = new Size(600, 260);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
@@ -187,6 +188,17 @@ public class MainForm : Form
         p.Controls.Add(n);
         p.Controls.Add(new Label { Text = "%", AutoSize = true, Margin = new Padding(2, 6, 0, 0) });
         return p;
+    }
+
+    // The app icon, embedded in the assembly (see ApplicationIcon / EmbeddedResource
+    // in the .csproj). Used for the window/taskbar and the tray.
+    static Icon LoadAppIcon()
+    {
+        var asm = typeof(MainForm).Assembly;
+        string name = asm.GetManifestResourceNames()
+            .First(n => n.EndsWith(".ico", StringComparison.OrdinalIgnoreCase));
+        using var s = asm.GetManifestResourceStream(name)!;
+        return new Icon(s);
     }
 
     // ---- audio devices ----------------------------------------------------
