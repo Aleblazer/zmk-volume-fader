@@ -115,18 +115,17 @@ public class MainForm : Form
     }
 
     // Flat, themed numeric stepper (replaces NumericUpDown, whose spin buttons
-    // can't be dark-themed). Click the upper/lower right zone, or scroll.
+    // can't be dark-themed). A borderless child text box handles typing/caret;
+    // this control paints the frame + chevrons. Type then Enter, click a
+    // chevron, use Up/Down, or scroll.
     sealed class Stepper : Control
     {
+        readonly TextBox _box = new() { BorderStyle = BorderStyle.None, TextAlign = HorizontalAlignment.Right, MaxLength = 3 };
         int _value = 100, _min = 1, _max = 100;
         public event EventHandler? ValueChanged;
         public int Minimum { get => _min; set => _min = value; }
         public int Maximum { get => _max; set => _max = value; }
-        public int Value
-        {
-            get => _value;
-            set { int v = Math.Clamp(value, _min, _max); if (v != _value) { _value = v; Invalidate(); ValueChanged?.Invoke(this, EventArgs.Empty); } }
-        }
+        public int Value { get => _value; set => Set(value); }
         public Color BorderColor { get; set; } = Color.Gray;
         public Color ChevronColor { get; set; } = Color.Gray;
 
@@ -134,10 +133,52 @@ public class MainForm : Form
         {
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
                      | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
-            Size = new Size(58, 23);
+            Size = new Size(62, 23);
+            _box.Text = _value.ToString();
+            _box.KeyDown += OnBoxKeyDown;
+            _box.KeyPress += (_, e) => { if (!char.IsControl(e.KeyChar) && !char.IsDigit(e.KeyChar)) e.Handled = true; };
+            _box.LostFocus += (_, _) => Commit();
+            _box.MouseWheel += (_, e) => Set(_value + Math.Sign(e.Delta));
+            Controls.Add(_box);
+            LayoutBox();
         }
 
         int Zone => 18;   // right strip holding the chevrons
+
+        void LayoutBox()
+        {
+            int h = _box.PreferredHeight;
+            _box.SetBounds(7, Math.Max(0, (Height - h) / 2), Math.Max(10, Width - Zone - 9), h);
+        }
+
+        void Set(int v)
+        {
+            v = Math.Clamp(v, _min, _max);
+            bool changed = v != _value;
+            _value = v;
+            string s = v.ToString();
+            if (_box.Text != s) _box.Text = s;
+            Invalidate();
+            if (changed) ValueChanged?.Invoke(this, EventArgs.Empty);
+        }
+
+        void Commit()
+        {
+            if (int.TryParse(_box.Text, out int v)) Set(v);
+            else _box.Text = _value.ToString();
+        }
+
+        void OnBoxKeyDown(object? sender, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Enter) { Commit(); e.SuppressKeyPress = true; }
+            else if (e.KeyCode == Keys.Up) { Set(_value + 1); e.SuppressKeyPress = true; }
+            else if (e.KeyCode == Keys.Down) { Set(_value - 1); e.SuppressKeyPress = true; }
+        }
+
+        protected override void OnSizeChanged(EventArgs e) { base.OnSizeChanged(e); LayoutBox(); }
+        protected override void OnFontChanged(EventArgs e) { base.OnFontChanged(e); _box.Font = Font; LayoutBox(); }
+        protected override void OnBackColorChanged(EventArgs e) { base.OnBackColorChanged(e); _box.BackColor = BackColor; }
+        protected override void OnForeColorChanged(EventArgs e) { base.OnForeColorChanged(e); _box.ForeColor = ForeColor; }
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -152,9 +193,6 @@ public class MainForm : Form
                 g.FillPath(bg, path);
                 g.DrawPath(pen, path);
             }
-            var textRect = new Rectangle(4, 0, Width - Zone - 4, Height);
-            TextRenderer.DrawText(g, _value.ToString(), Font, textRect, ForeColor,
-                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
             int cx = Width - Zone / 2 - 3, my = Height / 2;
             using var cb = new SolidBrush(ChevronColor);
             g.FillPolygon(cb, new[] { new Point(cx - 4, my - 2), new Point(cx + 4, my - 2), new Point(cx, my - 6) });
@@ -164,14 +202,13 @@ public class MainForm : Form
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
-            if (e.X >= Width - Zone) Value += e.Y < Height / 2 ? 1 : -1;
-            Focus();
+            if (e.X >= Width - Zone) { Set(_value + (e.Y < Height / 2 ? 1 : -1)); _box.Focus(); }
         }
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
             base.OnMouseWheel(e);
-            Value += Math.Sign(e.Delta);
+            Set(_value + Math.Sign(e.Delta));
         }
 
         static GraphicsPath Rounded(Rectangle r, int radius)
