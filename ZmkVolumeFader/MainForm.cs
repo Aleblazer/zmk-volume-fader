@@ -114,6 +114,79 @@ public class MainForm : Form
         }
     }
 
+    // Flat, themed numeric stepper (replaces NumericUpDown, whose spin buttons
+    // can't be dark-themed). Click the upper/lower right zone, or scroll.
+    sealed class Stepper : Control
+    {
+        int _value = 100, _min = 1, _max = 100;
+        public event EventHandler? ValueChanged;
+        public int Minimum { get => _min; set => _min = value; }
+        public int Maximum { get => _max; set => _max = value; }
+        public int Value
+        {
+            get => _value;
+            set { int v = Math.Clamp(value, _min, _max); if (v != _value) { _value = v; Invalidate(); ValueChanged?.Invoke(this, EventArgs.Empty); } }
+        }
+        public Color BorderColor { get; set; } = Color.Gray;
+        public Color ChevronColor { get; set; } = Color.Gray;
+
+        public Stepper()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+                     | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+            Size = new Size(58, 23);
+        }
+
+        int Zone => 18;   // right strip holding the chevrons
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.Clear(Parent?.BackColor ?? BackColor);
+            var box = new Rectangle(0, 0, Width - 1, Height - 1);
+            using (var path = Rounded(box, 6))
+            {
+                using var bg = new SolidBrush(BackColor);
+                using var pen = new Pen(BorderColor);
+                g.FillPath(bg, path);
+                g.DrawPath(pen, path);
+            }
+            var textRect = new Rectangle(4, 0, Width - Zone - 4, Height);
+            TextRenderer.DrawText(g, _value.ToString(), Font, textRect, ForeColor,
+                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            int cx = Width - Zone / 2 - 3, my = Height / 2;
+            using var cb = new SolidBrush(ChevronColor);
+            g.FillPolygon(cb, new[] { new Point(cx - 4, my - 2), new Point(cx + 4, my - 2), new Point(cx, my - 6) });
+            g.FillPolygon(cb, new[] { new Point(cx - 4, my + 2), new Point(cx + 4, my + 2), new Point(cx, my + 6) });
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.X >= Width - Zone) Value += e.Y < Height / 2 ? 1 : -1;
+            Focus();
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            Value += Math.Sign(e.Delta);
+        }
+
+        static GraphicsPath Rounded(Rectangle r, int radius)
+        {
+            int d = radius * 2;
+            var p = new GraphicsPath();
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+    }
+
     sealed class DeviceItem
     {
         public required string Id;
@@ -129,7 +202,7 @@ public class MainForm : Form
         public required FaderBar Bar;
         public required Label Pct;     // big "62%" readout
         public required Label Raw;     // small "raw N (min-max)" calibration readout
-        public required NumericUpDown Limit;
+        public required Stepper Limit;
         public double Sm = -1;          // EMA state (smoothed raw value)
         public int LastRaw;             // last raw value (so a cap change can re-render)
         public int LastApplied = -1;    // last volume % pushed to the device (deadband)
@@ -150,8 +223,8 @@ public class MainForm : Form
 
     // ---- controls ---------------------------------------------------------
 
-    readonly ComboBox _cbLeft = new() { DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 0) };
-    readonly ComboBox _cbRight = new() { DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 0) };
+    readonly ComboBox _cbLeft = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right };
+    readonly ComboBox _cbRight = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right };
     readonly FaderBar _barLeft = new() { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
     readonly FaderBar _barRight = new() { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
     readonly Label _pctLeft = new() { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
@@ -160,14 +233,14 @@ public class MainForm : Form
     readonly Label _rawRight = new() { Text = "", AutoSize = true, Anchor = AnchorStyles.Left, Font = new Font("Segoe UI", 8.25f) };
     readonly Label _nameLeft = new() { Text = "Left fader", AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
     readonly Label _nameRight = new() { Text = "Right fader", AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
-    readonly NumericUpDown _limLeft = new() { Minimum = 1, Maximum = 100, Value = 100, Width = 52, BorderStyle = BorderStyle.FixedSingle, TextAlign = HorizontalAlignment.Center };
-    readonly NumericUpDown _limRight = new() { Minimum = 1, Maximum = 100, Value = 100, Width = 52, BorderStyle = BorderStyle.FixedSingle, TextAlign = HorizontalAlignment.Center };
+    readonly Stepper _limLeft = new() { Minimum = 1, Maximum = 100, Value = 100 };
+    readonly Stepper _limRight = new() { Minimum = 1, Maximum = 100, Value = 100 };
     readonly Button _btnRefresh = new() { Text = "Refresh devices", AutoSize = true, FlatStyle = FlatStyle.Flat, Padding = new Padding(10, 5, 10, 5), Margin = new Padding(0) };
     readonly Label _status = new() { Text = "Starting…", AutoSize = true, Anchor = AnchorStyles.Left };
     readonly Label _statusDot = new() { Text = "●", AutoSize = true, Font = new Font("Segoe UI", 8f), Margin = new Padding(0, 3, 6, 0) };
 
-    readonly CardPanel _cardL = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 118, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
-    readonly CardPanel _cardR = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 118, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
+    readonly CardPanel _cardL = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 122, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
+    readonly CardPanel _cardR = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 122, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
     TableLayoutPanel _tlL = null!, _tlR = null!, _footer = null!;
     FlowLayoutPanel _maxL = null!, _maxR = null!;
 
@@ -187,7 +260,7 @@ public class MainForm : Form
         Text = "ZMK Volume Fader";
         Icon = LoadAppIcon();
         Font = new Font("Segoe UI", 9.75f);
-        ClientSize = new Size(460, 332);
+        ClientSize = new Size(460, 340);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
@@ -237,7 +310,7 @@ public class MainForm : Form
 
     // Lay out one fader card; returns the inner table and (via out) the Max group.
     TableLayoutPanel BuildCard(CardPanel card, Label name, Label pct, FaderBar bar, Label raw,
-                               ComboBox combo, out FlowLayoutPanel maxGroup, NumericUpDown limit)
+                               ComboBox combo, out FlowLayoutPanel maxGroup, Stepper limit)
     {
         var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -259,12 +332,12 @@ public class MainForm : Form
         return t;
     }
 
-    static FlowLayoutPanel MaxCap(NumericUpDown n)
+    static FlowLayoutPanel MaxCap(Stepper n)
     {
-        var p = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(8, 0, 0, 0) };
-        p.Controls.Add(new Label { Text = "Max", AutoSize = true, Margin = new Padding(0, 5, 5, 0) });
+        var p = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Anchor = AnchorStyles.Left, Margin = new Padding(10, 0, 0, 0) };
+        p.Controls.Add(new Label { Text = "Max", AutoSize = true, Margin = new Padding(0, 4, 6, 0) });
         p.Controls.Add(n);
-        p.Controls.Add(new Label { Text = "%", AutoSize = true, Margin = new Padding(3, 5, 0, 0) });
+        p.Controls.Add(new Label { Text = "%", AutoSize = true, Margin = new Padding(4, 4, 0, 0) });
         return p;
     }
 
@@ -293,8 +366,14 @@ public class MainForm : Form
         foreach (var tl in new Control[] { _tlL, _tlR, _maxL, _maxR }) tl.BackColor = Color.Transparent;
 
         foreach (var b in new[] { _barLeft, _barRight }) { b.Track = t.Inset; b.Fill = t.Accent; b.BackColor = t.Card; b.Invalidate(); }
-        foreach (var c in new[] { _cbLeft, _cbRight }) { c.BackColor = t.CtlBg; c.ForeColor = t.Text; }
-        foreach (var u in new[] { _limLeft, _limRight }) { u.BackColor = t.CtlBg; u.ForeColor = t.Text; }
+        foreach (var c in new[] { _cbLeft, _cbRight })
+        {
+            c.BackColor = t.CtlBg; c.ForeColor = t.Text;
+            // Win10+ dark combo: themes the drop button and the dropdown list.
+            if (c.IsHandleCreated) SetWindowTheme(c.Handle, t.Dark ? "DarkMode_CFD" : null, null);
+            c.Invalidate();
+        }
+        foreach (var u in new[] { _limLeft, _limRight }) { u.BackColor = t.CtlBg; u.ForeColor = t.Text; u.BorderColor = t.CtlBorder; u.ChevronColor = t.Subtle; u.Invalidate(); }
         _btnRefresh.BackColor = t.CtlBg;
         _btnRefresh.ForeColor = t.Text;
         _btnRefresh.FlatAppearance.BorderColor = t.CtlBorder;
@@ -318,6 +397,9 @@ public class MainForm : Form
 
     [DllImport("dwmapi.dll")]
     static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+    static extern int SetWindowTheme(IntPtr hWnd, string? subApp, string? subId);
 
     void SetTitleBarDark(bool dark)
     {
@@ -453,7 +535,7 @@ public class MainForm : Form
         catch { }
     }
 
-    static decimal ClampLimit(int pct) => Math.Clamp(pct, 1, 100);
+    static int ClampLimit(int pct) => Math.Clamp(pct, 1, 100);
 
     // ---- calibration ------------------------------------------------------
 
