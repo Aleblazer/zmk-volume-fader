@@ -1,0 +1,25 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # net8.0-windows + WinForms must build on Windows.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore
+        run: dotnet restore LiberArkFaders/LiberArkFaders.csproj
+
+      - name: Build
+        run: dotnet build LiberArkFaders/LiberArkFaders.csproj -c Release --no-restore
