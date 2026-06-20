@@ -128,6 +128,7 @@ public class MainForm : Form
         public int Value { get => _value; set => Set(value); }
         public Color BorderColor { get; set; } = Color.Gray;
         public Color ChevronColor { get; set; } = Color.Gray;
+        public Color Surround { get; set; } = Color.FromArgb(0x2B, 0x2E, 0x36);  // fills the rounded corners
 
         public Stepper()
         {
@@ -184,7 +185,7 @@ public class MainForm : Form
         {
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Parent?.BackColor ?? BackColor);
+            g.Clear(Surround);
             var box = new Rectangle(0, 0, Width - 1, Height - 1);
             using (var path = Rounded(box, 6))
             {
@@ -260,8 +261,8 @@ public class MainForm : Form
 
     // ---- controls ---------------------------------------------------------
 
-    readonly ComboBox _cbLeft = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right };
-    readonly ComboBox _cbRight = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right };
+    readonly ComboBox _cbLeft = new() { DropDownStyle = ComboBoxStyle.DropDownList, DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right };
+    readonly ComboBox _cbRight = new() { DropDownStyle = ComboBoxStyle.DropDownList, DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right };
     readonly FaderBar _barLeft = new() { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
     readonly FaderBar _barRight = new() { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
     readonly Label _pctLeft = new() { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
@@ -329,6 +330,8 @@ public class MainForm : Form
 
         _cbLeft.SelectedIndexChanged += (_, _) => OnDevicePicked(_left);
         _cbRight.SelectedIndexChanged += (_, _) => OnDevicePicked(_right);
+        _cbLeft.DrawItem += OnComboDrawItem;
+        _cbRight.DrawItem += OnComboDrawItem;
         _limLeft.ValueChanged += (_, _) => OnLimitChanged(_left);
         _limRight.ValueChanged += (_, _) => OnLimitChanged(_right);
 
@@ -410,7 +413,7 @@ public class MainForm : Form
             if (c.IsHandleCreated) SetWindowTheme(c.Handle, t.Dark ? "DarkMode_CFD" : null, null);
             c.Invalidate();
         }
-        foreach (var u in new[] { _limLeft, _limRight }) { u.BackColor = t.CtlBg; u.ForeColor = t.Text; u.BorderColor = t.CtlBorder; u.ChevronColor = t.Subtle; u.Invalidate(); }
+        foreach (var u in new[] { _limLeft, _limRight }) { u.BackColor = t.CtlBg; u.ForeColor = t.Text; u.BorderColor = t.CtlBorder; u.ChevronColor = t.Subtle; u.Surround = t.Card; u.Invalidate(); }
         _btnRefresh.BackColor = t.CtlBg;
         _btnRefresh.ForeColor = t.Text;
         _btnRefresh.FlatAppearance.BorderColor = t.CtlBorder;
@@ -430,6 +433,32 @@ public class MainForm : Form
             if (c is Label l) apply(l);
             WalkLabels(c, apply);
         }
+    }
+
+    // Owner-draw the device combos so the closed box and list match the theme
+    // (CtlBg fill, theme text) and the highlighted item uses the green accent.
+    void OnComboDrawItem(object? sender, DrawItemEventArgs e)
+    {
+        var cb = (ComboBox)sender!;
+        bool inList = (e.State & DrawItemState.ComboBoxEdit) == 0;
+        bool hi = inList && (e.State & DrawItemState.Selected) != 0;
+        Color bg = hi ? _theme.Accent : _theme.CtlBg;
+        Color fg = hi ? AccentText() : _theme.Text;
+        using (var b = new SolidBrush(bg)) e.Graphics.FillRectangle(b, e.Bounds);
+        if (e.Index >= 0)
+        {
+            var r = new Rectangle(e.Bounds.X + 4, e.Bounds.Y, e.Bounds.Width - 6, e.Bounds.Height);
+            TextRenderer.DrawText(e.Graphics, cb.GetItemText(cb.Items[e.Index]), cb.Font, r, fg,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+        }
+    }
+
+    // Black or white, whichever reads on the accent green.
+    Color AccentText()
+    {
+        var a = _theme.Accent;
+        double lum = (0.299 * a.R + 0.587 * a.G + 0.114 * a.B) / 255.0;
+        return lum > 0.55 ? Color.FromArgb(0x10, 0x18, 0x12) : Color.White;
     }
 
     [DllImport("dwmapi.dll")]
