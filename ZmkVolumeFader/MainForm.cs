@@ -1,5 +1,8 @@
+using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using HidSharp;
+using Microsoft.Win32;
 using NAudio.CoreAudioApi;
 
 namespace ZmkVolumeFader;
@@ -7,9 +10,9 @@ namespace ZmkVolumeFader;
 /// <summary>
 /// Reads a ZMK dongle's hid-io fader joystick (report id 2: two signed
 /// 16-bit LE axes, [1..2]=left [3..4]=right, raw wiper mV ~0..3300) and drives
-/// the volume of two chosen Windows output devices (e.g. the Audeze Maxwell
-/// Game / Chat endpoints). Each fader has its own max-volume cap: the throw
-/// scales into 0..cap (top = cap, middle = cap/2, bottom = 0).
+/// the volume of two chosen Windows output devices. Each fader has its own
+/// max-volume cap: the throw scales into 0..cap (top = cap, middle = cap/2).
+/// The UI follows the OS light/dark theme with a green accent.
 /// </summary>
 public class MainForm : Form
 {
@@ -17,24 +20,99 @@ public class MainForm : Form
 
     // Fader value (raw wiper mV, ~0..3300 on a 16-bit axis) -> volume percent.
     // The pot reads strongly compressed at the top, so this piecewise curve
-    // inverts that to feel ~linear across the throw. These points are the old
-    // 8-bit curve scaled by 13 (the previous mV/13 divisor) onto the new mV
-    // scale, so the body keeps the linear feel it had -- but with ~13x finer
-    // steps, the top no longer goes chunky. The end points are continuous dead
-    // bands (ValueToPercent clamps past them): value 0 reads 0%, value >= the
-    // last point reads 100%. Measured jitter bands: bottom 0-3 (so 0% lands at
-    // 4, just above it), top 3220-3249 (so 100% lands at 3215, just below the
-    // band floor -- the smoothed value can't dip under it, so no flicker and
-    // full volume is always reached). Recalibrate from the live "raw (min-max)"
-    // readouts: sweep fully, set the ends just outside each band, mids to taste.
+    // inverts that to feel ~linear across the throw. End points are continuous
+    // dead bands (ValueToPercent clamps past them). Measured jitter bands:
+    // bottom 0-3 (0% at 4), top 3220-3249 (100% at 3215). Recalibrate from the
+    // live "raw (min-max)" readouts: sweep fully, set ends just outside each band.
     static readonly (int v, int pct)[] Curve =
         { (4, 0), (143, 25), (1612, 50), (3133, 75), (3215, 100) };
 
-    // Output hysteresis (percent): once a volume % is shown, hold it until the
-    // value moves more than this off it. Stops noise that sits on a boundary
-    // (e.g. ~8.5%) from flip-flopping between two adjacent percentages. Must be
-    // < 1 so real moves still register as clean 1% steps.
+    // Output hysteresis (percent): hold the current % until the value moves more
+    // than this off it, so boundary noise can't flip-flop 8<->9. Must be < 1.
     const double Hyst = 0.9;
+
+    // ---- theme ------------------------------------------------------------
+
+    sealed record Theme(bool Dark, Color Window, Color Card, Color Inset, Color Text,
+                        Color Subtle, Color Accent, Color CtlBg, Color CtlBorder);
+
+    static Color Hex(int r, int g, int b) => Color.FromArgb(r, g, b);
+
+    static readonly Theme DarkTheme = new(
+        Dark: true,
+        Window: Hex(0x23, 0x25, 0x2B), Card: Hex(0x2B, 0x2E, 0x36), Inset: Hex(0x15, 0x17, 0x1B),
+        Text: Hex(0xF2, 0xF3, 0xF5), Subtle: Hex(0x9A, 0xA0, 0xAA), Accent: Hex(0x46, 0xE0, 0x7A),
+        CtlBg: Hex(0x1C, 0x1E, 0x23), CtlBorder: Hex(0x3A, 0x3D, 0x44));
+
+    static readonly Theme LightTheme = new(
+        Dark: false,
+        Window: Hex(0xF3, 0xF3, 0xF4), Card: Hex(0xFF, 0xFF, 0xFF), Inset: Hex(0xE4, 0xE6, 0xEA),
+        Text: Hex(0x1B, 0x1D, 0x21), Subtle: Hex(0x66, 0x6C, 0x74), Accent: Hex(0x1F, 0xA6, 0x4E),
+        CtlBg: Hex(0xFF, 0xFF, 0xFF), CtlBorder: Hex(0xD2, 0xD5, 0xDA));
+
+    Theme _theme = LightTheme;
+
+    // ---- custom controls --------------------------------------------------
+
+    // Flat rounded volume bar (replaces the segmented system ProgressBar).
+    sealed class FaderBar : Control
+    {
+        int _value;
+        public int Value { get => _value; set { int v = Math.Clamp(value, 0, 100); if (v != _value) { _value = v; Invalidate(); } } }
+        public Color Track { get; set; } = Color.Gray;
+        public Color Fill { get; set; } = Color.LimeGreen;
+
+        public FaderBar() => SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+                                      | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.Clear(BackColor);
+            if (Width < 2 || Height < 2) return;
+            using (var tp = Pill(new RectangleF(0, 0, Width, Height)))
+            using (var tb = new SolidBrush(Track)) g.FillPath(tb, tp);
+            float fw = Width * (_value / 100f);
+            if (fw >= 2)
+            {
+                using var fp = Pill(new RectangleF(0, 0, fw, Height));
+                using var fb = new SolidBrush(Fill);
+                g.FillPath(fb, fp);
+            }
+        }
+
+        static GraphicsPath Pill(RectangleF r)
+        {
+            var p = new GraphicsPath();
+            float d = Math.Min(r.Height, r.Width);
+            if (d <= 0) { p.AddRectangle(r); return p; }
+            p.AddArc(r.X, r.Y, d, d, 90, 180);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 180);
+            p.CloseFigure();
+            return p;
+        }
+    }
+
+    // Panel clipped to a rounded rectangle, for the fader cards.
+    sealed class CardPanel : Panel
+    {
+        public int Radius = 10;
+        public CardPanel() => DoubleBuffered = true;
+        protected override void OnSizeChanged(EventArgs e)
+        {
+            base.OnSizeChanged(e);
+            if (Width <= 0 || Height <= 0) return;
+            int d = Radius * 2;
+            using var p = new GraphicsPath();
+            p.AddArc(0, 0, d, d, 180, 90);
+            p.AddArc(Width - d - 1, 0, d, d, 270, 90);
+            p.AddArc(Width - d - 1, Height - d - 1, d, d, 0, 90);
+            p.AddArc(0, Height - d - 1, d, d, 90, 90);
+            p.CloseFigure();
+            Region = new Region(p);
+        }
+    }
 
     sealed class DeviceItem
     {
@@ -48,13 +126,14 @@ public class MainForm : Form
     sealed class Axis
     {
         public required ComboBox Combo;
-        public required ProgressBar Bar;
-        public required Label Lbl;
-        public required NumericUpDown Limit;  // max output volume % (1..100)
+        public required FaderBar Bar;
+        public required Label Pct;     // big "62%" readout
+        public required Label Raw;     // small "raw N (min-max)" calibration readout
+        public required NumericUpDown Limit;
         public double Sm = -1;          // EMA state (smoothed raw value)
         public int LastRaw;             // last raw value (so a cap change can re-render)
         public int LastApplied = -1;    // last volume % pushed to the device (deadband)
-        public int RawMin = int.MaxValue, RawMax = int.MinValue;  // observed raw range, for calibration
+        public int RawMin = int.MaxValue, RawMax = int.MinValue;  // observed raw range
     }
 
     sealed class Settings
@@ -69,15 +148,28 @@ public class MainForm : Form
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "ZmkVolumeFader", "settings.json");
 
-    readonly ComboBox _cbLeft = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 300 };
-    readonly ComboBox _cbRight = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 300 };
-    readonly ProgressBar _pbLeft = new() { Maximum = 100, Width = 300 };
-    readonly ProgressBar _pbRight = new() { Maximum = 100, Width = 300 };
-    readonly Label _lblLeft = new() { Text = "--", AutoSize = true };
-    readonly Label _lblRight = new() { Text = "--", AutoSize = true };
-    readonly NumericUpDown _limLeft = new() { Minimum = 1, Maximum = 100, Value = 100, Width = 54 };
-    readonly NumericUpDown _limRight = new() { Minimum = 1, Maximum = 100, Value = 100, Width = 54 };
-    readonly Label _status = new() { Text = "Starting...", AutoSize = true, Dock = DockStyle.Bottom, Padding = new Padding(8) };
+    // ---- controls ---------------------------------------------------------
+
+    readonly ComboBox _cbLeft = new() { DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 0) };
+    readonly ComboBox _cbRight = new() { DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 0) };
+    readonly FaderBar _barLeft = new() { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
+    readonly FaderBar _barRight = new() { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
+    readonly Label _pctLeft = new() { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
+    readonly Label _pctRight = new() { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
+    readonly Label _rawLeft = new() { Text = "", AutoSize = true, Anchor = AnchorStyles.Left, Font = new Font("Segoe UI", 8.25f) };
+    readonly Label _rawRight = new() { Text = "", AutoSize = true, Anchor = AnchorStyles.Left, Font = new Font("Segoe UI", 8.25f) };
+    readonly Label _nameLeft = new() { Text = "Left fader", AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
+    readonly Label _nameRight = new() { Text = "Right fader", AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
+    readonly NumericUpDown _limLeft = new() { Minimum = 1, Maximum = 100, Value = 100, Width = 52, BorderStyle = BorderStyle.FixedSingle, TextAlign = HorizontalAlignment.Center };
+    readonly NumericUpDown _limRight = new() { Minimum = 1, Maximum = 100, Value = 100, Width = 52, BorderStyle = BorderStyle.FixedSingle, TextAlign = HorizontalAlignment.Center };
+    readonly Button _btnRefresh = new() { Text = "Refresh devices", AutoSize = true, FlatStyle = FlatStyle.Flat, Padding = new Padding(10, 5, 10, 5), Margin = new Padding(0) };
+    readonly Label _status = new() { Text = "Starting…", AutoSize = true, Anchor = AnchorStyles.Left };
+    readonly Label _statusDot = new() { Text = "●", AutoSize = true, Font = new Font("Segoe UI", 8f), Margin = new Padding(0, 3, 6, 0) };
+
+    readonly CardPanel _cardL = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 118, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
+    readonly CardPanel _cardR = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 118, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
+    TableLayoutPanel _tlL = null!, _tlR = null!, _footer = null!;
+    FlowLayoutPanel _maxL = null!, _maxR = null!;
 
     readonly MMDeviceEnumerator _enum = new();
 
@@ -88,45 +180,42 @@ public class MainForm : Form
     bool _loadingSettings;
 
     readonly NotifyIcon _tray = new() { Text = "ZMK Volume Fader", Icon = LoadAppIcon() };
-    bool _exiting;   // true when quitting for real (tray Exit / shutdown) so close doesn't re-prompt
+    bool _exiting;
 
     public MainForm()
     {
         Text = "ZMK Volume Fader";
         Icon = LoadAppIcon();
-        ClientSize = new Size(600, 260);
+        Font = new Font("Segoe UI", 9.75f);
+        ClientSize = new Size(460, 332);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
 
-        var lay = new TableLayoutPanel
-        {
-            Dock = DockStyle.Top,
-            AutoSize = true,
-            ColumnCount = 3,
-            Padding = new Padding(12),
-            CellBorderStyle = TableLayoutPanelCellBorderStyle.None,
-        };
-        lay.Controls.Add(new Label { Text = "Left fader", AutoSize = true, Anchor = AnchorStyles.Left, Padding = new Padding(0, 6, 8, 0) }, 0, 0);
-        lay.Controls.Add(_cbLeft, 1, 0);
-        lay.Controls.Add(_lblLeft, 2, 0);
-        lay.Controls.Add(_pbLeft, 1, 1);
-        lay.Controls.Add(MaxCap(_limLeft), 2, 1);
-        lay.Controls.Add(new Label { Text = "Right fader", AutoSize = true, Anchor = AnchorStyles.Left, Padding = new Padding(0, 12, 8, 0) }, 0, 2);
-        lay.Controls.Add(_cbRight, 1, 2);
-        lay.Controls.Add(_lblRight, 2, 2);
-        lay.Controls.Add(_pbRight, 1, 3);
-        lay.Controls.Add(MaxCap(_limRight), 2, 3);
+        _left = new Axis { Combo = _cbLeft, Bar = _barLeft, Pct = _pctLeft, Raw = _rawLeft, Limit = _limLeft };
+        _right = new Axis { Combo = _cbRight, Bar = _barRight, Pct = _pctRight, Raw = _rawRight, Limit = _limRight };
 
-        var btnRefresh = new Button { Text = "Refresh devices", AutoSize = true, Margin = new Padding(0, 10, 0, 0) };
-        btnRefresh.Click += (_, _) => LoadDevices();
-        lay.Controls.Add(btnRefresh, 1, 4);
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(14), BackColor = Color.Transparent };
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        for (int i = 0; i < 3; i++) root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        Controls.Add(lay);
-        Controls.Add(_status);
+        _tlL = BuildCard(_cardL, _nameLeft, _pctLeft, _barLeft, _rawLeft, _cbLeft, out _maxL, _limLeft);
+        _tlR = BuildCard(_cardR, _nameRight, _pctRight, _barRight, _rawRight, _cbRight, out _maxR, _limRight);
 
-        _left = new Axis { Combo = _cbLeft, Bar = _pbLeft, Lbl = _lblLeft, Limit = _limLeft };
-        _right = new Axis { Combo = _cbRight, Bar = _pbRight, Lbl = _lblRight, Limit = _limRight };
+        _footer = new TableLayoutPanel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, AutoSize = true, ColumnCount = 2, RowCount = 1, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 0) };
+        _footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        _footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        _btnRefresh.Click += (_, _) => LoadDevices();
+        _footer.Controls.Add(_btnRefresh, 0, 0);
+        var statusFlow = new FlowLayoutPanel { AutoSize = true, Anchor = AnchorStyles.Right, BackColor = Color.Transparent, Margin = new Padding(0, 6, 0, 0) };
+        statusFlow.Controls.Add(_statusDot);
+        statusFlow.Controls.Add(_status);
+        _footer.Controls.Add(statusFlow, 1, 0);
+
+        root.Controls.Add(_cardL, 0, 0);
+        root.Controls.Add(_cardR, 0, 1);
+        root.Controls.Add(_footer, 0, 2);
+        Controls.Add(root);
 
         _cbLeft.SelectedIndexChanged += (_, _) => OnDevicePicked(_left);
         _cbRight.SelectedIndexChanged += (_, _) => OnDevicePicked(_right);
@@ -142,14 +231,112 @@ public class MainForm : Form
 
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) MinimizeToTray(); };
 
-        Load += (_, _) => { LoadDevices(); LoadSettings(); StartHid(); };
+        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); StartHid(); };
         FormClosing += OnFormClosing;
+    }
+
+    // Lay out one fader card; returns the inner table and (via out) the Max group.
+    TableLayoutPanel BuildCard(CardPanel card, Label name, Label pct, FaderBar bar, Label raw,
+                               ComboBox combo, out FlowLayoutPanel maxGroup, NumericUpDown limit)
+    {
+        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4, BackColor = Color.Transparent };
+        t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // name / pct
+        t.RowStyles.Add(new RowStyle(SizeType.Absolute, 16));  // bar
+        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // raw readout
+        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // combo / max
+
+        t.Controls.Add(name, 0, 0);
+        t.Controls.Add(pct, 1, 0);
+        t.Controls.Add(bar, 0, 1); t.SetColumnSpan(bar, 2);
+        t.Controls.Add(raw, 0, 2); t.SetColumnSpan(raw, 2);
+        t.Controls.Add(combo, 0, 3);
+        maxGroup = MaxCap(limit);
+        t.Controls.Add(maxGroup, 1, 3);
+
+        card.Controls.Add(t);
+        return t;
+    }
+
+    static FlowLayoutPanel MaxCap(NumericUpDown n)
+    {
+        var p = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(8, 0, 0, 0) };
+        p.Controls.Add(new Label { Text = "Max", AutoSize = true, Margin = new Padding(0, 5, 5, 0) });
+        p.Controls.Add(n);
+        p.Controls.Add(new Label { Text = "%", AutoSize = true, Margin = new Padding(3, 5, 0, 0) });
+        return p;
+    }
+
+    // ---- theme application ------------------------------------------------
+
+    static bool OsLightTheme()
+    {
+        try
+        {
+            using var k = Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+            if (k?.GetValue("AppsUseLightTheme") is int i) return i != 0;
+        }
+        catch { }
+        return true;
+    }
+
+    static Theme CurrentTheme() => OsLightTheme() ? LightTheme : DarkTheme;
+
+    void ApplyTheme(Theme t)
+    {
+        _theme = t;
+        BackColor = t.Window;
+        _footer.BackColor = Color.Transparent;
+        foreach (var card in new[] { _cardL, _cardR }) card.BackColor = t.Card;
+        foreach (var tl in new Control[] { _tlL, _tlR, _maxL, _maxR }) tl.BackColor = Color.Transparent;
+
+        foreach (var b in new[] { _barLeft, _barRight }) { b.Track = t.Inset; b.Fill = t.Accent; b.BackColor = t.Card; b.Invalidate(); }
+        foreach (var c in new[] { _cbLeft, _cbRight }) { c.BackColor = t.CtlBg; c.ForeColor = t.Text; }
+        foreach (var u in new[] { _limLeft, _limRight }) { u.BackColor = t.CtlBg; u.ForeColor = t.Text; }
+        _btnRefresh.BackColor = t.CtlBg;
+        _btnRefresh.ForeColor = t.Text;
+        _btnRefresh.FlatAppearance.BorderColor = t.CtlBorder;
+
+        // Most labels are muted; the big % is primary, the status dot is accent.
+        WalkLabels(this, l => { l.ForeColor = t.Subtle; l.BackColor = Color.Transparent; });
+        _pctLeft.ForeColor = _pctRight.ForeColor = t.Text;
+        _statusDot.ForeColor = t.Accent;
+
+        SetTitleBarDark(t.Dark);
+    }
+
+    static void WalkLabels(Control root, Action<Label> apply)
+    {
+        foreach (Control c in root.Controls)
+        {
+            if (c is Label l) apply(l);
+            WalkLabels(c, apply);
+        }
+    }
+
+    [DllImport("dwmapi.dll")]
+    static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+    void SetTitleBarDark(bool dark)
+    {
+        if (!IsHandleCreated) return;
+        int v = dark ? 1 : 0;
+        // 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 2004+); 19 on older builds.
+        if (DwmSetWindowAttribute(Handle, 20, ref v, sizeof(int)) != 0)
+            DwmSetWindowAttribute(Handle, 19, ref v, sizeof(int));
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        base.WndProc(ref m);
+        if (m.Msg == 0x001A)   // WM_SETTINGCHANGE — re-read the OS theme
+            ApplyTheme(CurrentTheme());
     }
 
     // ---- tray -------------------------------------------------------------
 
-    // Hide() drops the window from the taskbar too; the HID thread keeps running,
-    // so the faders still drive volume while we're tucked in the tray.
     void MinimizeToTray() => Hide();
 
     void RestoreFromTray()
@@ -161,8 +348,6 @@ public class MainForm : Form
 
     void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
-        // The X / Alt+F4 offers to minimize to the tray instead of quitting.
-        // Tray "Exit" and OS shutdown skip the prompt and close for real.
         if (!_exiting && e.CloseReason == CloseReason.UserClosing)
         {
             var r = MessageBox.Show(this, "Minimize to tray instead of exiting?",
@@ -175,23 +360,11 @@ public class MainForm : Form
             }
         }
 
-        _run = false;          // stop the HID reader
-        _tray.Visible = false; // remove the tray icon promptly (avoid a lingering ghost)
+        _run = false;
+        _tray.Visible = false;
         _tray.Dispose();
     }
 
-    // "Max [ n ] %" group around a cap spinner.
-    static FlowLayoutPanel MaxCap(NumericUpDown n)
-    {
-        var p = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 2, 0, 0) };
-        p.Controls.Add(new Label { Text = "Max", AutoSize = true, Margin = new Padding(0, 6, 4, 0) });
-        p.Controls.Add(n);
-        p.Controls.Add(new Label { Text = "%", AutoSize = true, Margin = new Padding(2, 6, 0, 0) });
-        return p;
-    }
-
-    // The app icon, embedded in the assembly (see ApplicationIcon / EmbeddedResource
-    // in the .csproj). Used for the window/taskbar and the tray.
     static Icon LoadAppIcon()
     {
         var asm = typeof(MainForm).Assembly;
@@ -235,13 +408,13 @@ public class MainForm : Form
     {
         if (_loadingSettings) return;
         SaveSettings();
-        a.LastApplied = -1;   // force the next fader move to push to the new device
+        a.LastApplied = -1;
     }
 
     void OnLimitChanged(Axis a)
     {
         if (!_loadingSettings) SaveSettings();
-        Render(a);   // re-apply now so a new cap takes effect without moving the fader
+        Render(a);
     }
 
     // ---- settings ---------------------------------------------------------
@@ -259,7 +432,7 @@ public class MainForm : Form
             _limLeft.Value = ClampLimit(s.LeftMax);
             _limRight.Value = ClampLimit(s.RightMax);
         }
-        catch { /* ignore corrupt settings */ }
+        catch { }
         finally { _loadingSettings = false; }
     }
 
@@ -277,7 +450,7 @@ public class MainForm : Form
             Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
             File.WriteAllText(SettingsPath, JsonSerializer.Serialize(s));
         }
-        catch { /* best effort */ }
+        catch { }
     }
 
     static decimal ClampLimit(int pct) => Math.Clamp(pct, 1, 100);
@@ -301,10 +474,7 @@ public class MainForm : Form
 
     // ---- HID --------------------------------------------------------------
 
-    // Generic Desktop (0x0001) / Joystick (0x0004). The keyboard shares this VID/PID
-    // and also sits on the Generic Desktop page, so match the Joystick usage exactly
-    // rather than guessing by report size (which moved when axes went 16-bit).
-    const uint JoystickUsage = 0x00010004;
+    const uint JoystickUsage = 0x00010004;   // Generic Desktop / Joystick
 
     static SortedSet<uint> Usages(HidDevice d)
     {
@@ -325,11 +495,9 @@ public class MainForm : Form
             .Where(d => d.VendorID == VID && d.ProductID == PID)
             .ToArray();
 
-        // Prefer the collection that actually exposes the Joystick usage.
         var joy = mine.FirstOrDefault(d => Usages(d).Contains(JoystickUsage));
         if (joy != null) return joy;
 
-        // Fallback: smallest input report on the Generic Desktop page.
         return mine
             .Where(d => Usages(d).Any(u => (u >> 16) == 0x0001))
             .OrderBy(d => d.GetMaxInputReportLength())
@@ -348,11 +516,11 @@ public class MainForm : Form
         while (_run)
         {
             var dev = FindFader();
-            if (dev == null) { SetStatus("Dongle not found — plug it in…"); Thread.Sleep(1500); continue; }
-            if (!dev.TryOpen(out HidStream stream)) { SetStatus("Found dongle, but couldn't open it"); Thread.Sleep(1500); continue; }
+            if (dev == null) { SetStatus("Dongle not found — plug it in…", false); Thread.Sleep(1500); continue; }
+            if (!dev.TryOpen(out HidStream stream)) { SetStatus("Found dongle, but couldn't open it", false); Thread.Sleep(1500); continue; }
 
             string devName; try { devName = dev.GetProductName(); } catch { devName = "ZMK keyboard"; }
-            SetStatus($"Connected to {devName}");
+            SetStatus($"Connected to {devName}", true);
             using (stream)
             {
                 stream.ReadTimeout = 1000;
@@ -362,17 +530,15 @@ public class MainForm : Form
                     int n;
                     try { n = stream.Read(buf, 0, buf.Length); }
                     catch (TimeoutException) { continue; }
-                    catch { break; } // disconnected — fall out and re-find
-                    // Report id 2: [1..2] = left axis, [3..4] = right axis, each
-                    // signed 16-bit little-endian (raw wiper mV, ~0..3300).
+                    catch { break; }
                     if (n >= 5 && buf[0] == 0x02)
                         OnFaders(ReadAxis(buf, 1), ReadAxis(buf, 3));
                 }
             }
+            SetStatus("Reconnecting…", false);
         }
     }
 
-    // Signed 16-bit little-endian axis at offset i.
     static int ReadAxis(byte[] b, int i) => (short)(b[i] | (b[i + 1] << 8));
 
     void OnFaders(int left, int right)
@@ -391,46 +557,45 @@ public class MainForm : Form
         if (raw > a.RawMax) a.RawMax = raw;
         a.LastRaw = raw;
 
-        // Smooth the raw value (EMA). The 16-bit value is finer but noisier
-        // (~+/-15 counts of ADC noise), so smooth harder than the old 8-bit path.
+        // EMA smooth (16-bit value is finer but noisier, ~+/-15 counts).
         a.Sm = a.Sm < 0 ? raw : a.Sm * 0.85 + raw * 0.15;
         Render(a);
     }
 
-    // Map the smoothed value through the curve, scale by the fader's max cap,
-    // update the bar/label, and push to the device (1% deadband). Also called
-    // when the cap spinner changes, so a new limit applies without moving the
-    // fader. ValueToPercent clamps to the curve ends, so 0% / 100% are continuous.
     void Render(Axis a)
     {
-        if (a.Sm < 0) return;   // no reading yet
+        if (a.Sm < 0) return;
 
         int v = (int)Math.Round(a.Sm);
-        double faderPct = ValueToPercent(v);                  // 0..100 fader position
-        int cap = (int)a.Limit.Value;                         // max output volume %
-        double pf = Math.Clamp(faderPct * cap / 100.0, 0, 100);  // continuous applied %
+        double faderPct = ValueToPercent(v);
+        int cap = (int)a.Limit.Value;
+        double pf = Math.Clamp(faderPct * cap / 100.0, 0, 100);
 
-        // Hysteresis: keep the current integer % unless the value has moved more
-        // than Hyst off it, so boundary noise (~8.5%) can't flip-flop 8<->9.
+        // Hysteresis: hold the current integer % until pf moves > Hyst off it.
         int applied = a.LastApplied < 0 || Math.Abs(pf - a.LastApplied) > Hyst
             ? (int)Math.Round(pf)
             : a.LastApplied;
 
         a.Bar.Value = applied;
-        a.Lbl.Text = $"{applied}%   raw {a.LastRaw} ({a.RawMin}-{a.RawMax})";
+        a.Pct.Text = $"{applied}%";
+        a.Raw.Text = $"raw {a.LastRaw}  ·  {a.RawMin}–{a.RawMax}";
 
-        if (applied == a.LastApplied) return;   // unchanged after hysteresis
+        if (applied == a.LastApplied) return;
         a.LastApplied = applied;
         if (a.Combo.SelectedItem is DeviceItem di)
         {
             try { di.Device.AudioEndpointVolume.MasterVolumeLevelScalar = applied / 100f; }
-            catch { /* device vanished; user can Refresh */ }
+            catch { }
         }
     }
 
-    void SetStatus(string text)
+    void SetStatus(string text, bool connected)
     {
         if (!IsHandleCreated) return;
-        BeginInvoke(() => _status.Text = text);
+        BeginInvoke(() =>
+        {
+            _status.Text = text;
+            _statusDot.ForeColor = connected ? _theme.Accent : _theme.Subtle;
+        });
     }
 }
