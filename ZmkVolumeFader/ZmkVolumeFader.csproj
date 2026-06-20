@@ -6,8 +6,8 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWindowsForms>true</UseWindowsForms>
-    <RootNamespace>LiberArkFaders</RootNamespace>
-    <AssemblyName>LiberArkFaders</AssemblyName>
+    <RootNamespace>ZmkVolumeFader</RootNamespace>
+    <AssemblyName>ZmkVolumeFader</AssemblyName>
   </PropertyGroup>
 
   <ItemGroup>

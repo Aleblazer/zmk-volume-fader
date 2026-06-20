@@ -2,10 +2,10 @@ using System.Text.Json;
 using HidSharp;
 using NAudio.CoreAudioApi;
 
-namespace LiberArkFaders;
+namespace ZmkVolumeFader;
 
 /// <summary>
-/// Reads the LiberArk68 dongle's hid-io fader joystick (report id 2: two signed
+/// Reads a ZMK dongle's hid-io fader joystick (report id 2: two signed
 /// 16-bit LE axes, [1..2]=left [3..4]=right, raw wiper mV ~0..3300) and drives
 /// the volume of two chosen Windows output devices (e.g. the Audeze Maxwell
 /// Game / Chat endpoints). Each fader has its own max-volume cap: the throw
@@ -67,7 +67,7 @@ public class MainForm : Form
 
     static string SettingsPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "LiberArkFaders", "settings.json");
+        "ZmkVolumeFader", "settings.json");
 
     readonly ComboBox _cbLeft = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 300 };
     readonly ComboBox _cbRight = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 300 };
@@ -87,9 +87,12 @@ public class MainForm : Form
     volatile bool _run;
     bool _loadingSettings;
 
+    readonly NotifyIcon _tray = new() { Text = "ZMK Volume Fader", Icon = SystemIcons.Application };
+    bool _exiting;   // true when quitting for real (tray Exit / shutdown) so close doesn't re-prompt
+
     public MainForm()
     {
-        Text = "LiberArk68 Faders";
+        Text = "ZMK Volume Fader";
         ClientSize = new Size(600, 260);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
@@ -129,8 +132,51 @@ public class MainForm : Form
         _limLeft.ValueChanged += (_, _) => OnLimitChanged(_left);
         _limRight.ValueChanged += (_, _) => OnLimitChanged(_right);
 
+        var trayMenu = new ContextMenuStrip();
+        trayMenu.Items.Add("Open", null, (_, _) => RestoreFromTray());
+        trayMenu.Items.Add("Exit", null, (_, _) => { _exiting = true; Close(); });
+        _tray.ContextMenuStrip = trayMenu;
+        _tray.DoubleClick += (_, _) => RestoreFromTray();
+        _tray.Visible = true;
+
+        Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) MinimizeToTray(); };
+
         Load += (_, _) => { LoadDevices(); LoadSettings(); StartHid(); };
-        FormClosing += (_, _) => { _run = false; };
+        FormClosing += OnFormClosing;
+    }
+
+    // ---- tray -------------------------------------------------------------
+
+    // Hide() drops the window from the taskbar too; the HID thread keeps running,
+    // so the faders still drive volume while we're tucked in the tray.
+    void MinimizeToTray() => Hide();
+
+    void RestoreFromTray()
+    {
+        Show();
+        WindowState = FormWindowState.Normal;
+        Activate();
+    }
+
+    void OnFormClosing(object? sender, FormClosingEventArgs e)
+    {
+        // The X / Alt+F4 offers to minimize to the tray instead of quitting.
+        // Tray "Exit" and OS shutdown skip the prompt and close for real.
+        if (!_exiting && e.CloseReason == CloseReason.UserClosing)
+        {
+            var r = MessageBox.Show(this, "Minimize to tray instead of exiting?",
+                "ZMK Volume Fader", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (r == DialogResult.Yes)
+            {
+                e.Cancel = true;
+                MinimizeToTray();
+                return;
+            }
+        }
+
+        _run = false;          // stop the HID reader
+        _tray.Visible = false; // remove the tray icon promptly (avoid a lingering ghost)
+        _tray.Dispose();
     }
 
     // "Max [ n ] %" group around a cap spinner.
@@ -293,7 +339,7 @@ public class MainForm : Form
             if (dev == null) { SetStatus("Dongle not found — plug it in…"); Thread.Sleep(1500); continue; }
             if (!dev.TryOpen(out HidStream stream)) { SetStatus("Found dongle, but couldn't open it"); Thread.Sleep(1500); continue; }
 
-            string devName; try { devName = dev.GetProductName(); } catch { devName = "LiberArk68"; }
+            string devName; try { devName = dev.GetProductName(); } catch { devName = "ZMK keyboard"; }
             SetStatus($"Connected to {devName}");
             using (stream)
             {

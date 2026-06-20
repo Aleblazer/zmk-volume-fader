@@ -19,7 +19,7 @@ jobs:
           dotnet-version: 8.0.x
 
       - name: Restore
-        run: dotnet restore LiberArkFaders/LiberArkFaders.csproj
+        run: dotnet restore ZmkVolumeFader/ZmkVolumeFader.csproj
 
       - name: Build
-        run: dotnet build LiberArkFaders/LiberArkFaders.csproj -c Release --no-restore
+        run: dotnet build ZmkVolumeFader/ZmkVolumeFader.csproj -c Release --no-restore

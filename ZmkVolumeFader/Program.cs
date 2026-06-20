@@ -1,4 +1,4 @@
-namespace LiberArkFaders;
+namespace ZmkVolumeFader;
 
 static class Program
 {

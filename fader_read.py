@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LiberArk68 fader reader — Phase 2 bring-up / verification tool.
+ZMK fader reader — HID verification tool.
 
 Opens the dongle's zmk-hid-io interface (HID usage page 0xFF0C) and prints
 incoming report bytes whenever they change, so you can confirm both faders
@@ -8,7 +8,7 @@ reach the PC and see which byte index maps to the left vs right slider.
 
 Setup (Windows):
     py -m pip install hidapi
-    py pc\\fader_read.py
+    py fader_read.py
 
 If nothing shows up, run with --list to see every HID interface the dongle
 exposes and pass --page / --path explicitly.
@@ -47,7 +47,7 @@ def pick_path(page):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Read LiberArk68 faders over HID")
+    ap = argparse.ArgumentParser(description="Read ZMK faders over HID")
     ap.add_argument("--list", action="store_true", help="list all HID interfaces and exit")
     ap.add_argument("--page", type=lambda x: int(x, 0), default=HID_IO_USAGE_PAGE,
                     help="HID usage page to open (default 0xFF0C)")
