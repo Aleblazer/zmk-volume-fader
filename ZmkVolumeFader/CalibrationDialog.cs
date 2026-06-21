@@ -4,10 +4,10 @@ namespace ZmkVolumeFader;
 
 /// <summary>
 /// Modal calibration dialog. Per fader: record the raw min/max by sweeping, pick
-/// a taper preset, or switch to "Custom (measure)" and capture the raw value at
-/// 0/25/50/75/100%. A live preview shows the resulting volume as you move it.
-/// The edited <see cref="Left"/>/<see cref="Right"/> calibrations are read back
-/// by the owner on a Save result.
+/// a taper preset, or switch to "Custom (measure)" and capture the actual curve
+/// via the sweep wizard. A live preview shows the resulting volume as you move it.
+/// The edited <see cref="LeftCal"/>/<see cref="RightCal"/> calibrations are read
+/// back by the owner on a Save result.
 /// </summary>
 sealed class CalibrationDialog : Form
 {
@@ -25,7 +25,8 @@ sealed class CalibrationDialog : Form
     readonly ComboBox[] _taper = new ComboBox[2];
     readonly Panel[] _barFill = new Panel[2];
     readonly FlowLayoutPanel[] _customRow = new FlowLayoutPanel[2];
-    readonly Button[][] _capBtn = { new Button[5], new Button[5] };
+    readonly Button[] _measureBtn = new Button[2];
+    readonly Label[] _customStatus = new Label[2];
     readonly bool[] _recording = new bool[2];
 
     readonly System.Windows.Forms.Timer _tick = new() { Interval = 50 };
@@ -49,7 +50,7 @@ sealed class CalibrationDialog : Form
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(430, 568);
+        ClientSize = new Size(430, 528);
         BackColor = _t.Window;
 
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(14), BackColor = Color.Transparent };
@@ -85,7 +86,7 @@ sealed class CalibrationDialog : Form
     Panel BuildFader(int i, string name)
     {
         int idx = i;
-        var card = new Panel { Width = 398, Height = 200, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
+        var card = new Panel { Width = 398, Height = 184, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
 
         var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 5, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -112,16 +113,12 @@ sealed class CalibrationDialog : Form
         t.Controls.Add(taperPanel, 0, 2);
         t.SetColumnSpan(taperPanel, 2);
 
-        _customRow[i] = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0, 0, 0, 2) };
-        for (int k = 0; k < 5; k++)
-        {
-            int kk = k;
-            var b = new Button { Size = new Size(66, 42), FlatStyle = FlatStyle.Flat, Margin = new Padding(0, 0, 4, 0), BackColor = _t.CtlBg, ForeColor = _t.Text, TextAlign = ContentAlignment.MiddleCenter };
-            b.FlatAppearance.BorderColor = _t.CtlBorder;
-            b.Click += (_, _) => CapturePoint(idx, kk);
-            _capBtn[i][k] = b;
-            _customRow[i].Controls.Add(b);
-        }
+        _customRow[i] = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 2) };
+        _measureBtn[i] = MakeButton("Measure curve…", false);
+        _measureBtn[i].Click += (_, _) => OpenWizard(idx);
+        _customStatus[i] = new Label { AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(8, 6, 0, 0) };
+        _customRow[i].Controls.Add(_measureBtn[i]);
+        _customRow[i].Controls.Add(_customStatus[i]);
         t.Controls.Add(_customRow[i], 0, 3);
         t.SetColumnSpan(_customRow[i], 2);
 
@@ -133,9 +130,8 @@ sealed class CalibrationDialog : Form
         t.Controls.Add(_previewLbl[i], 1, 4);
 
         card.Controls.Add(t);
-        SeedCustomIfNeeded(i);
         UpdateCustomVisibility(i);
-        UpdateCaptureLabels(i);
+        UpdateCustomStatus(i);
         return card;
     }
 
@@ -173,37 +169,23 @@ sealed class CalibrationDialog : Form
     void OnTaperChanged(int i)
     {
         _cal[i].Taper = (TaperKind)_taper[i].SelectedIndex;
-        SeedCustomIfNeeded(i);
         UpdateCustomVisibility(i);
-        UpdateCaptureLabels(i);
-    }
-
-    void SeedCustomIfNeeded(int i)
-    {
-        if (_cal[i].Taper != TaperKind.Custom) return;
-        if (_cal[i].CustomRaw is { Length: 5 }) return;
-        int lo = Math.Min(_cal[i].Min, _cal[i].Max), hi = Math.Max(_cal[i].Min, _cal[i].Max);
-        if (hi - lo < 2) { lo = 0; hi = 3250; }
-        _cal[i].CustomRaw = new[] { lo, lo + (hi - lo) / 4, lo + (hi - lo) / 2, lo + 3 * (hi - lo) / 4, hi };
-    }
-
-    void CapturePoint(int i, int k)
-    {
-        if (_cal[i].CustomRaw is not { Length: 5 }) SeedCustomIfNeeded(i);
-        _cal[i].CustomRaw![k] = _raw[i]();
-        UpdateCaptureLabels(i);
+        UpdateCustomStatus(i);
     }
 
     void UpdateCustomVisibility(int i) => _customRow[i].Visible = _cal[i].Taper == TaperKind.Custom;
 
-    void UpdateCaptureLabels(int i)
+    void UpdateCustomStatus(int i)
     {
-        var cr = _cal[i].CustomRaw;
-        for (int k = 0; k < 5; k++)
-        {
-            string val = cr is { Length: 5 } ? cr[k].ToString() : "—";
-            _capBtn[i][k].Text = $"{k * 25}%\n{val}";
-        }
+        int n = _cal[i].CustomPoints?.Length ?? 0;
+        _customStatus[i].Text = n >= 2 ? $"curve: {n} points" : "not measured";
+    }
+
+    // Open the guided sweep wizard; it edits _cal[i] (Min/Max/Taper/CustomPoints) on Save.
+    void OpenWizard(int i)
+    {
+        using var w = new CurveCaptureDialog(_t, i == 0 ? "Left fader" : "Right fader", _raw[i], _cal[i]);
+        if (w.ShowDialog(this) == DialogResult.OK) UpdateCustomStatus(i);
     }
 
     void Tick(int i)
