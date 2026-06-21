@@ -18,14 +18,9 @@ public class MainForm : Form
 {
     const int VID = 0x1D50, PID = 0x615E;
 
-    // Fader value (raw wiper mV, ~0..3300 on a 16-bit axis) -> volume percent.
-    // The pot reads strongly compressed at the top, so this piecewise curve
-    // inverts that to feel ~linear across the throw. End points are continuous
-    // dead bands (ValueToPercent clamps past them). Measured jitter bands:
-    // bottom 0-3 (0% at 4), top 3220-3249 (100% at 3215). Recalibrate from the
-    // live "raw (min-max)" readouts: sweep fully, set ends just outside each band.
-    static readonly (int v, int pct)[] Curve =
-        { (4, 0), (143, 25), (1612, 50), (3133, 75), (3215, 100) };
+    // The per-fader value->% mapping lives in each Axis.Cal / Axis.Curve (see
+    // Calibration). It's edited live via the Calibrate dialog and persisted to
+    // settings, so there's no hardcoded curve here.
 
     // Output hysteresis (percent): hold the current % until the value moves more
     // than this off it, so boundary noise can't flip-flop 8<->9. Must be < 1.
@@ -33,7 +28,7 @@ public class MainForm : Form
 
     // ---- theme ------------------------------------------------------------
 
-    sealed record Theme(bool Dark, Color Window, Color Card, Color Inset, Color Text,
+    internal sealed record Theme(bool Dark, Color Window, Color Card, Color Inset, Color Text,
                         Color Subtle, Color Accent, Color CtlBg, Color CtlBorder);
 
     static Color Hex(int r, int g, int b) => Color.FromArgb(r, g, b);
@@ -241,6 +236,8 @@ public class MainForm : Form
         public required Label Pct;     // big "62%" readout
         public required Label Raw;     // small "raw N (min-max)" calibration readout
         public required Stepper Limit;
+        public Calibration Cal = new();                       // value->% mapping (persisted)
+        public (int v, int pct)[] Curve = Array.Empty<(int, int)>();  // built from Cal
         public double Sm = -1;          // EMA state (smoothed raw value)
         public int LastRaw;             // last raw value (so a cap change can re-render)
         public int LastApplied = -1;    // last volume % pushed to the device (deadband)
@@ -253,6 +250,8 @@ public class MainForm : Form
         public string? RightDeviceId { get; set; }
         public int LeftMax { get; set; } = 100;
         public int RightMax { get; set; } = 100;
+        public Calibration? LeftCal { get; set; }
+        public Calibration? RightCal { get; set; }
     }
 
     static string SettingsPath => Path.Combine(
@@ -274,6 +273,7 @@ public class MainForm : Form
     readonly Stepper _limLeft = new() { Minimum = 1, Maximum = 100, Value = 100 };
     readonly Stepper _limRight = new() { Minimum = 1, Maximum = 100, Value = 100 };
     readonly Button _btnRefresh = new() { Text = "Refresh devices", AutoSize = true, FlatStyle = FlatStyle.Flat, Padding = new Padding(10, 5, 10, 5), Margin = new Padding(0) };
+    readonly Button _btnCalibrate = new() { Text = "Calibrate", AutoSize = true, FlatStyle = FlatStyle.Flat, Padding = new Padding(10, 5, 10, 5), Margin = new Padding(8, 0, 0, 0) };
     readonly Label _status = new() { Text = "Starting…", AutoSize = true, Anchor = AnchorStyles.Left };
     readonly Label _statusDot = new() { Text = "●", AutoSize = true, Font = new Font("Segoe UI", 8f), Margin = new Padding(0, 3, 6, 0) };
 
@@ -289,6 +289,7 @@ public class MainForm : Form
     Thread? _hidThread;
     volatile bool _run;
     bool _loadingSettings;
+    bool _calibrating;   // true while the calibration dialog is open (don't drive devices)
 
     readonly NotifyIcon _tray = new() { Text = "ZMK Volume Fader", Icon = LoadAppIcon() };
     bool _exiting;
@@ -305,6 +306,8 @@ public class MainForm : Form
 
         _left = new Axis { Combo = _cbLeft, Bar = _barLeft, Pct = _pctLeft, Raw = _rawLeft, Limit = _limLeft };
         _right = new Axis { Combo = _cbRight, Bar = _barRight, Pct = _pctRight, Raw = _rawRight, Limit = _limRight };
+        _left.Curve = _left.Cal.BuildCurve();
+        _right.Curve = _right.Cal.BuildCurve();
 
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(14), BackColor = Color.Transparent };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -317,7 +320,11 @@ public class MainForm : Form
         _footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         _footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         _btnRefresh.Click += (_, _) => LoadDevices();
-        _footer.Controls.Add(_btnRefresh, 0, 0);
+        _btnCalibrate.Click += (_, _) => OpenCalibration();
+        var leftBtns = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0) };
+        leftBtns.Controls.Add(_btnRefresh);
+        leftBtns.Controls.Add(_btnCalibrate);
+        _footer.Controls.Add(leftBtns, 0, 0);
         var statusFlow = new FlowLayoutPanel { AutoSize = true, Anchor = AnchorStyles.Right, BackColor = Color.Transparent, Margin = new Padding(0, 6, 0, 0) };
         statusFlow.Controls.Add(_statusDot);
         statusFlow.Controls.Add(_status);
@@ -414,9 +421,12 @@ public class MainForm : Form
             c.Invalidate();
         }
         foreach (var u in new[] { _limLeft, _limRight }) { u.BackColor = t.CtlBg; u.ForeColor = t.Text; u.BorderColor = t.CtlBorder; u.ChevronColor = t.Subtle; u.Surround = t.Card; u.Invalidate(); }
-        _btnRefresh.BackColor = t.CtlBg;
-        _btnRefresh.ForeColor = t.Text;
-        _btnRefresh.FlatAppearance.BorderColor = t.CtlBorder;
+        foreach (var btn in new[] { _btnRefresh, _btnCalibrate })
+        {
+            btn.BackColor = t.CtlBg;
+            btn.ForeColor = t.Text;
+            btn.FlatAppearance.BorderColor = t.CtlBorder;
+        }
 
         // Most labels are muted; the big % is primary, the status dot is accent.
         WalkLabels(this, l => { l.ForeColor = t.Subtle; l.BackColor = Color.Transparent; });
@@ -579,6 +589,8 @@ public class MainForm : Form
             SelectById(_cbRight, s.RightDeviceId);
             _limLeft.Value = ClampLimit(s.LeftMax);
             _limRight.Value = ClampLimit(s.RightMax);
+            if (s.LeftCal != null) ApplyCalibration(_left, s.LeftCal);
+            if (s.RightCal != null) ApplyCalibration(_right, s.RightCal);
         }
         catch { }
         finally { _loadingSettings = false; }
@@ -594,6 +606,8 @@ public class MainForm : Form
                 RightDeviceId = (_cbRight.SelectedItem as DeviceItem)?.Id,
                 LeftMax = (int)_limLeft.Value,
                 RightMax = (int)_limRight.Value,
+                LeftCal = _left.Cal,
+                RightCal = _right.Cal,
             };
             Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
             File.WriteAllText(SettingsPath, JsonSerializer.Serialize(s));
@@ -605,19 +619,30 @@ public class MainForm : Form
 
     // ---- calibration ------------------------------------------------------
 
-    static double ValueToPercent(int v)
+    void OpenCalibration()
     {
-        if (v <= Curve[0].v) return Curve[0].pct;
-        for (int i = 1; i < Curve.Length; i++)
+        using var dlg = new CalibrationDialog(_theme, _left.Cal.Clone(), _right.Cal.Clone(),
+            () => _left.LastRaw, () => _right.LastRaw);
+        _calibrating = true;                 // stop driving devices while sweeping
+        var result = dlg.ShowDialog(this);
+        _calibrating = false;
+        if (result == DialogResult.OK)
         {
-            if (v <= Curve[i].v)
-            {
-                var (v0, p0) = Curve[i - 1];
-                var (v1, p1) = Curve[i];
-                return p0 + (double)(v - v0) / (v1 - v0) * (p1 - p0);
-            }
+            ApplyCalibration(_left, dlg.LeftCal);
+            ApplyCalibration(_right, dlg.RightCal);
+            SaveSettings();
         }
-        return Curve[^1].pct;
+        // Re-push the current position to the devices now that we're live again.
+        _left.LastApplied = _right.LastApplied = -1;
+        Render(_left);
+        Render(_right);
+    }
+
+    void ApplyCalibration(Axis a, Calibration c)
+    {
+        a.Cal = c;
+        a.Curve = c.BuildCurve();
+        a.LastApplied = -1;
     }
 
     // ---- HID --------------------------------------------------------------
@@ -715,7 +740,7 @@ public class MainForm : Form
         if (a.Sm < 0) return;
 
         int v = (int)Math.Round(a.Sm);
-        double faderPct = ValueToPercent(v);
+        double faderPct = Calibration.Eval(a.Curve, v);
         int cap = (int)a.Limit.Value;
         double pf = Math.Clamp(faderPct * cap / 100.0, 0, 100);
 
@@ -730,6 +755,7 @@ public class MainForm : Form
 
         if (applied == a.LastApplied) return;
         a.LastApplied = applied;
+        if (_calibrating) return;   // visualize, but don't drive the device while calibrating
         if (a.Combo.SelectedItem is DeviceItem di)
         {
             try { di.Device.AudioEndpointVolume.MasterVolumeLevelScalar = applied / 100f; }
