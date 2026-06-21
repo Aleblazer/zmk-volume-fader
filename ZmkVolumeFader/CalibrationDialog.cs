@@ -49,7 +49,7 @@ sealed class CalibrationDialog : Form
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(430, 504);
+        ClientSize = new Size(430, 568);
         BackColor = _t.Window;
 
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(14), BackColor = Color.Transparent };
@@ -85,7 +85,7 @@ sealed class CalibrationDialog : Form
     Panel BuildFader(int i, string name)
     {
         int idx = i;
-        var card = new Panel { Width = 398, Height = 172, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
+        var card = new Panel { Width = 398, Height = 200, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
 
         var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 5, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -116,7 +116,7 @@ sealed class CalibrationDialog : Form
         for (int k = 0; k < 5; k++)
         {
             int kk = k;
-            var b = new Button { Size = new Size(66, 38), FlatStyle = FlatStyle.Flat, Margin = new Padding(0, 0, 4, 0), BackColor = _t.CtlBg, ForeColor = _t.Text, TextAlign = ContentAlignment.MiddleCenter };
+            var b = new Button { Size = new Size(66, 42), FlatStyle = FlatStyle.Flat, Margin = new Padding(0, 0, 4, 0), BackColor = _t.CtlBg, ForeColor = _t.Text, TextAlign = ContentAlignment.MiddleCenter };
             b.FlatAppearance.BorderColor = _t.CtlBorder;
             b.Click += (_, _) => CapturePoint(idx, kk);
             _capBtn[i][k] = b;
