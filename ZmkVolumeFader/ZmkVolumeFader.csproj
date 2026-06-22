@@ -25,6 +25,9 @@
     <!-- Embed the icon so the form and tray can load it at runtime. -->
     <None Remove="app.ico" />
     <EmbeddedResource Include="app.ico" />
+    <!-- Split Logic logo for the Options about row (white keyed to transparent). -->
+    <None Remove="assets\splitlogic.png" />
+    <EmbeddedResource Include="assets\splitlogic.png" />
   </ItemGroup>
 
 </Project>

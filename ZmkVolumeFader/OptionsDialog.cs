@@ -114,6 +114,19 @@ sealed class OptionsDialog : Form
         };
         _tip.SetToolTip(gh, "View the project on GitHub");
         icons.Controls.Add(gh);
+
+        var logo = Icons.LoadEmbedded("splitlogic.png");
+        if (logo != null)
+        {
+            var sl = new LinkIcon("https://www.splitlogic.xyz", logo)
+            {
+                Height = 24, Width = (int)Math.Round(24.0 * logo.Width / logo.Height),
+                Margin = new Padding(6, 0, 6, 0), BackColor = _t.Window,
+            };
+            _tip.SetToolTip(sl, "Split Logic Keyboards — splitlogic.xyz");
+            icons.Controls.Add(sl);
+        }
+
         t.Controls.Add(icons, 0, 1);
         return t;
     }
