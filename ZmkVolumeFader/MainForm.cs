@@ -8,8 +8,8 @@ using NAudio.CoreAudioApi;
 namespace ZmkVolumeFader;
 
 /// <summary>
-/// Reads a ZMK dongle's hid-io fader joystick (report id 2: two signed
-/// 16-bit LE axes, [1..2]=left [3..4]=right, raw wiper mV ~0..3300) and drives
+/// Reads a ZMK dongle's hid-io fader report (vendor page 0xFF00, report id 2:
+/// two signed 16-bit LE axes, [1..2]=left [3..4]=right, raw wiper mV ~0..3300) and drives
 /// the volume of two chosen Windows output devices. Each fader has its own
 /// max-volume cap: the throw scales into 0..cap (top = cap, middle = cap/2).
 /// The UI follows the OS light/dark theme with a green accent.
@@ -647,7 +647,7 @@ public class MainForm : Form
 
     // ---- HID --------------------------------------------------------------
 
-    const uint JoystickUsage = 0x00010004;   // Generic Desktop / Joystick
+    const uint FaderUsage = 0xFF000001;   // vendor-defined fader page (0xFF00, usage 0x01)
 
     static SortedSet<uint> Usages(HidDevice d)
     {
@@ -668,11 +668,11 @@ public class MainForm : Form
             .Where(d => d.VendorID == VID && d.ProductID == PID)
             .ToArray();
 
-        var joy = mine.FirstOrDefault(d => Usages(d).Contains(JoystickUsage));
-        if (joy != null) return joy;
+        var fader = mine.FirstOrDefault(d => Usages(d).Contains(FaderUsage));
+        if (fader != null) return fader;
 
         return mine
-            .Where(d => Usages(d).Any(u => (u >> 16) == 0x0001))
+            .Where(d => Usages(d).Any(u => (u >> 16) == 0xFF00))
             .OrderBy(d => d.GetMaxInputReportLength())
             .FirstOrDefault();
     }
