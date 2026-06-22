@@ -54,12 +54,12 @@ sealed class OptionsDialog : Form
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(430, 560);
+        ClientSize = new Size(430, 600);
         BackColor = _t.Window;
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Padding = new Padding(14), BackColor = Color.Transparent };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 6, Padding = new Padding(14), BackColor = Color.Transparent };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int r = 0; r < 5; r++) root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        for (int r = 0; r < 6; r++) root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         root.Controls.Add(BuildGeneral(themeMode, startWithWindows), 0, 0);
         root.Controls.Add(new Label
@@ -78,6 +78,15 @@ sealed class OptionsDialog : Form
         btnRow.Controls.Add(save);
         btnRow.Controls.Add(cancel);
         root.Controls.Add(btnRow, 0, 4);
+
+        var ver = GetType().Assembly.GetName().Version;
+        root.Controls.Add(new Label
+        {
+            Text = (ver is null ? "ZMK Volume Fader" : $"ZMK Volume Fader  v{ver.Major}.{ver.Minor}.{ver.Build}")
+                 + "\nVibecoded by Aleblazer of Split Logic Keyboards",
+            AutoSize = false, Dock = DockStyle.Fill, Height = 36, TextAlign = ContentAlignment.MiddleCenter,
+            ForeColor = _t.Subtle, Font = new Font("Segoe UI", 8.25f), Margin = new Padding(0, 10, 0, 0),
+        }, 0, 5);
 
         Controls.Add(root);
         AcceptButton = save;
