@@ -7,6 +7,9 @@ using NAudio.CoreAudioApi;
 
 namespace ZmkVolumeFader;
 
+/// <summary>How the UI picks its palette: follow Windows, or force one.</summary>
+internal enum ThemeMode { Auto, Light, Dark }
+
 /// <summary>
 /// Reads a ZMK dongle's hid-io fader report (vendor page 0xFF00, report id 2:
 /// two signed 16-bit LE axes, [1..2]=left [3..4]=right, raw wiper mV ~0..3300) and drives
@@ -46,6 +49,7 @@ public class MainForm : Form
         CtlBg: Hex(0xFF, 0xFF, 0xFF), CtlBorder: Hex(0xD2, 0xD5, 0xDA));
 
     Theme _theme = LightTheme;
+    ThemeMode _themeMode = ThemeMode.Auto;   // Auto follows the OS; Light/Dark force it
 
     // ---- custom controls --------------------------------------------------
 
@@ -252,6 +256,7 @@ public class MainForm : Form
         public int RightMax { get; set; } = 100;
         public Calibration? LeftCal { get; set; }
         public Calibration? RightCal { get; set; }
+        public ThemeMode ThemeMode { get; set; } = ThemeMode.Auto;
     }
 
     static string SettingsPath => Path.Combine(
@@ -273,7 +278,7 @@ public class MainForm : Form
     readonly Stepper _limLeft = new() { Minimum = 1, Maximum = 100, Value = 100 };
     readonly Stepper _limRight = new() { Minimum = 1, Maximum = 100, Value = 100 };
     readonly Button _btnRefresh = new() { Text = "Refresh devices", AutoSize = true, FlatStyle = FlatStyle.Flat, Padding = new Padding(10, 5, 10, 5), Margin = new Padding(0) };
-    readonly Button _btnCalibrate = new() { Text = "Calibrate", AutoSize = true, FlatStyle = FlatStyle.Flat, Padding = new Padding(10, 5, 10, 5), Margin = new Padding(8, 0, 0, 0) };
+    readonly Button _btnOptions = new() { Text = "Options", AutoSize = true, FlatStyle = FlatStyle.Flat, Padding = new Padding(10, 5, 10, 5), Margin = new Padding(8, 0, 0, 0) };
     readonly Label _status = new() { Text = "Starting…", AutoSize = true, Anchor = AnchorStyles.Left };
     readonly Label _statusDot = new() { Text = "●", AutoSize = true, Font = new Font("Segoe UI", 8f), Margin = new Padding(0, 3, 6, 0) };
 
@@ -320,10 +325,10 @@ public class MainForm : Form
         _footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         _footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         _btnRefresh.Click += (_, _) => LoadDevices();
-        _btnCalibrate.Click += (_, _) => OpenCalibration();
+        _btnOptions.Click += (_, _) => OpenOptions();
         var leftBtns = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0) };
         leftBtns.Controls.Add(_btnRefresh);
-        leftBtns.Controls.Add(_btnCalibrate);
+        leftBtns.Controls.Add(_btnOptions);
         _footer.Controls.Add(leftBtns, 0, 0);
         var statusFlow = new FlowLayoutPanel { AutoSize = true, Anchor = AnchorStyles.Right, BackColor = Color.Transparent, Margin = new Padding(0, 6, 0, 0) };
         statusFlow.Controls.Add(_statusDot);
@@ -402,7 +407,46 @@ public class MainForm : Form
         return true;
     }
 
-    static Theme CurrentTheme() => OsLightTheme() ? LightTheme : DarkTheme;
+    Theme CurrentTheme() => _themeMode switch
+    {
+        ThemeMode.Light => LightTheme,
+        ThemeMode.Dark => DarkTheme,
+        _ => OsLightTheme() ? LightTheme : DarkTheme,   // Auto
+    };
+
+    // ---- "start with Windows" (HKCU Run key) ------------------------------
+
+    const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    const string RunValueName = "ZMK Volume Fader";
+
+    static bool GetStartWithWindows()
+    {
+        try
+        {
+            using var k = Registry.CurrentUser.OpenSubKey(RunKeyPath);
+            return k?.GetValue(RunValueName) != null;
+        }
+        catch { return false; }
+    }
+
+    static void SetStartWithWindows(bool on)
+    {
+        try
+        {
+            using var k = Registry.CurrentUser.CreateSubKey(RunKeyPath);
+            if (k == null) return;
+            if (on)
+            {
+                var exe = Environment.ProcessPath;
+                if (exe != null) k.SetValue(RunValueName, $"\"{exe}\"");
+            }
+            else if (k.GetValue(RunValueName) != null)
+            {
+                k.DeleteValue(RunValueName, throwOnMissingValue: false);
+            }
+        }
+        catch { }
+    }
 
     void ApplyTheme(Theme t)
     {
@@ -421,7 +465,7 @@ public class MainForm : Form
             c.Invalidate();
         }
         foreach (var u in new[] { _limLeft, _limRight }) { u.BackColor = t.CtlBg; u.ForeColor = t.Text; u.BorderColor = t.CtlBorder; u.ChevronColor = t.Subtle; u.Surround = t.Card; u.Invalidate(); }
-        foreach (var btn in new[] { _btnRefresh, _btnCalibrate })
+        foreach (var btn in new[] { _btnRefresh, _btnOptions })
         {
             btn.BackColor = t.CtlBg;
             btn.ForeColor = t.Text;
@@ -591,6 +635,8 @@ public class MainForm : Form
             _limRight.Value = ClampLimit(s.RightMax);
             if (s.LeftCal != null) ApplyCalibration(_left, s.LeftCal);
             if (s.RightCal != null) ApplyCalibration(_right, s.RightCal);
+            _themeMode = s.ThemeMode;
+            ApplyTheme(CurrentTheme());
         }
         catch { }
         finally { _loadingSettings = false; }
@@ -608,6 +654,7 @@ public class MainForm : Form
                 RightMax = (int)_limRight.Value,
                 LeftCal = _left.Cal,
                 RightCal = _right.Cal,
+                ThemeMode = _themeMode,
             };
             Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
             File.WriteAllText(SettingsPath, JsonSerializer.Serialize(s));
@@ -617,11 +664,12 @@ public class MainForm : Form
 
     static int ClampLimit(int pct) => Math.Clamp(pct, 1, 100);
 
-    // ---- calibration ------------------------------------------------------
+    // ---- options ----------------------------------------------------------
 
-    void OpenCalibration()
+    void OpenOptions()
     {
-        using var dlg = new CalibrationDialog(_theme, _left.Cal.Clone(), _right.Cal.Clone(),
+        using var dlg = new OptionsDialog(_theme, _themeMode, GetStartWithWindows(),
+            _left.Cal.Clone(), _right.Cal.Clone(),
             () => _left.LastRaw, () => _right.LastRaw);
         _calibrating = true;                 // stop driving devices while sweeping
         var result = dlg.ShowDialog(this);
@@ -630,6 +678,9 @@ public class MainForm : Form
         {
             ApplyCalibration(_left, dlg.LeftCal);
             ApplyCalibration(_right, dlg.RightCal);
+            _themeMode = dlg.SelectedTheme;
+            ApplyTheme(CurrentTheme());
+            SetStartWithWindows(dlg.StartWithWindows);
             SaveSettings();
         }
         // Re-push the current position to the devices now that we're live again.

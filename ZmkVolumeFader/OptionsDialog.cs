@@ -3,15 +3,18 @@ using System.Runtime.InteropServices;
 namespace ZmkVolumeFader;
 
 /// <summary>
-/// Modal calibration dialog. Per fader: record the raw min/max by sweeping, then
-/// pick the taper preset that matches the pot. A live preview shows the resulting
-/// volume as you move it. The edited <see cref="LeftCal"/>/<see cref="RightCal"/>
-/// calibrations are read back by the owner on a Save result.
+/// Modal options dialog. A General section toggles "start with Windows" and the
+/// light/dark/auto theme; below it, each fader records its raw min/max and picks
+/// the taper preset that matches the pot, with a live preview as you move it.
+/// The owner reads back <see cref="SelectedTheme"/>, <see cref="StartWithWindows"/>,
+/// and the edited <see cref="LeftCal"/>/<see cref="RightCal"/> on a Save result.
 /// </summary>
-sealed class CalibrationDialog : Form
+sealed class OptionsDialog : Form
 {
     public Calibration LeftCal => _cal[0];
     public Calibration RightCal => _cal[1];
+    public bool StartWithWindows => _startup.Checked;
+    public ThemeMode SelectedTheme => (ThemeMode)Math.Clamp(_themeCombo.SelectedIndex, 0, 2);
 
     readonly Calibration[] _cal;
     readonly Func<int>[] _raw;
@@ -25,41 +28,47 @@ sealed class CalibrationDialog : Form
     readonly Panel[] _barFill = new Panel[2];
     readonly bool[] _recording = new bool[2];
 
+    readonly CheckBox _startup = new() { Text = "Start with Windows", AutoSize = true, FlatStyle = FlatStyle.Standard, Margin = new Padding(0, 0, 0, 0) };
+    readonly ComboBox _themeCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 190 };
+
     readonly System.Windows.Forms.Timer _tick = new() { Interval = 50 };
 
     static readonly string[] TaperItems = { "Linear pot", "Audio pot", "Straight" };
+    static readonly string[] ThemeItems = { "Auto (follow Windows)", "Light", "Dark" };
 
     [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
     static extern int SetWindowTheme(IntPtr hWnd, string? subApp, string? subId);
     [DllImport("dwmapi.dll")]
     static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
-    public CalibrationDialog(MainForm.Theme theme, Calibration left, Calibration right, Func<int> rawL, Func<int> rawR)
+    public OptionsDialog(MainForm.Theme theme, ThemeMode themeMode, bool startWithWindows,
+        Calibration left, Calibration right, Func<int> rawL, Func<int> rawR)
     {
         _t = theme;
         _cal = new[] { left, right };
         _raw = new[] { rawL, rawR };
 
-        Text = "Calibrate faders";
+        Text = "Options";
         Font = new Font("Segoe UI", 9.75f);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(430, 460);
+        ClientSize = new Size(430, 560);
         BackColor = _t.Window;
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(14), BackColor = Color.Transparent };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Padding = new Padding(14), BackColor = Color.Transparent };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int r = 0; r < 4; r++) root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        for (int r = 0; r < 5; r++) root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
+        root.Controls.Add(BuildGeneral(themeMode, startWithWindows), 0, 0);
         root.Controls.Add(new Label
         {
-            Text = "Hit Record, sweep the fader fully end-to-end, then stop. Then pick the taper that matches your pot. The preview updates as you move it.",
-            AutoSize = true, MaximumSize = new Size(398, 0), ForeColor = _t.Subtle, Margin = new Padding(2, 0, 2, 10),
-        }, 0, 0);
-        root.Controls.Add(BuildFader(0, "Left fader"), 0, 1);
-        root.Controls.Add(BuildFader(1, "Right fader"), 0, 2);
+            Text = "Calibration — hit Record, sweep the fader fully end-to-end, then stop. Then pick the taper that matches your pot. The preview updates as you move it.",
+            AutoSize = true, MaximumSize = new Size(398, 0), ForeColor = _t.Subtle, Margin = new Padding(2, 4, 2, 10),
+        }, 0, 1);
+        root.Controls.Add(BuildFader(0, "Left fader"), 0, 2);
+        root.Controls.Add(BuildFader(1, "Right fader"), 0, 3);
 
         var btnRow = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, BackColor = Color.Transparent, Margin = new Padding(0, 8, 0, 0) };
         var save = MakeButton("Save", accent: true);
@@ -68,7 +77,7 @@ sealed class CalibrationDialog : Form
         cancel.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
         btnRow.Controls.Add(save);
         btnRow.Controls.Add(cancel);
-        root.Controls.Add(btnRow, 0, 3);
+        root.Controls.Add(btnRow, 0, 4);
 
         Controls.Add(root);
         AcceptButton = save;
@@ -77,6 +86,32 @@ sealed class CalibrationDialog : Form
         _tick.Tick += (_, _) => { Tick(0); Tick(1); };
         Load += (_, _) => { ApplyDark(); _tick.Start(); };
         FormClosing += (_, _) => _tick.Stop();
+    }
+
+    Panel BuildGeneral(ThemeMode mode, bool startup)
+    {
+        var card = new Panel { Width = 398, Height = 90, Margin = new Padding(0, 0, 0, 4), Padding = new Padding(12), BackColor = _t.Card };
+
+        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, BackColor = Color.Transparent };
+        t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        for (int r = 0; r < 2; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        _startup.ForeColor = _t.Text;
+        _startup.BackColor = Color.Transparent;
+        _startup.Checked = startup;
+        t.Controls.Add(_startup, 0, 0);
+
+        var themeRow = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 8, 0, 0) };
+        themeRow.Controls.Add(new Label { Text = "Theme", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(0, 6, 8, 0) });
+        _themeCombo.BackColor = _t.CtlBg;
+        _themeCombo.ForeColor = _t.Text;
+        _themeCombo.Items.AddRange(ThemeItems);
+        _themeCombo.SelectedIndex = Math.Clamp((int)mode, 0, ThemeItems.Length - 1);
+        themeRow.Controls.Add(_themeCombo);
+        t.Controls.Add(themeRow, 0, 1);
+
+        card.Controls.Add(t);
+        return card;
     }
 
     Panel BuildFader(int i, string name)
@@ -177,5 +212,6 @@ sealed class CalibrationDialog : Form
             DwmSetWindowAttribute(Handle, 19, ref v, sizeof(int));
         foreach (var c in _taper)
             if (c.IsHandleCreated) SetWindowTheme(c.Handle, _t.Dark ? "DarkMode_CFD" : null, null);
+        if (_themeCombo.IsHandleCreated) SetWindowTheme(_themeCombo.Handle, _t.Dark ? "DarkMode_CFD" : null, null);
     }
 }
