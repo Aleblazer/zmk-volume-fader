@@ -53,15 +53,20 @@ public class MainForm : Form
 
     // ---- custom controls --------------------------------------------------
 
-    // Flat rounded volume bar (replaces the segmented system ProgressBar).
+    // Console-style fader: a tick-scaled track with a knob at the current level,
+    // -/+ ends, and a green->yellow->red colored fill. Display-only (the position
+    // is driven by the physical fader), styled to match it.
     sealed class FaderBar : Control
     {
         int _value;
         public int Value { get => _value; set { int v = Math.Clamp(value, 0, 100); if (v != _value) { _value = v; Invalidate(); } } }
-        public Color Track { get; set; } = Color.Gray;
-        public Color Fill { get; set; } = Color.LimeGreen;   // green stop (low volume)
+        public Color Track { get; set; } = Color.Gray;       // unfilled groove
+        public Color Fill { get; set; } = Color.LimeGreen;   // green (low)
         public Color Mid { get; set; } = Color.FromArgb(0xF2, 0xC4, 0x3D);   // yellow (mid)
         public Color Hot { get; set; } = Color.FromArgb(0xE0, 0x4F, 0x4F);   // red (high)
+        public Color Knob { get; set; } = Color.White;
+        public Color KnobEdge { get; set; } = Color.Gray;
+        public Color Tick { get; set; } = Color.Gray;
 
         public FaderBar() => SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
                                       | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
@@ -71,57 +76,79 @@ public class MainForm : Form
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.Clear(BackColor);
-            if (Width < 2 || Height < 2) return;
+            int w = Width, h = Height;
+            if (w < 16 || h < 12) return;
 
-            // Track: filled, then an inner bevel (dark along the top, light along the
-            // bottom) so the groove reads as recessed.
-            using (var tp = Pill(new RectangleF(0, 0, Width, Height)))
+            float cy = h / 2f;
+            float knobR = Math.Max(6f, Math.Min(10f, h / 2f - 4f));
+            float thk = Math.Max(4f, knobR * 0.7f);
+            const float symW = 12f;                                  // -/+ glyph zone
+            float left = symW + knobR, right = w - symW - knobR;     // knob-centre travel
+            if (right - left < 4) return;
+            float f = Math.Clamp(_value / 100f, 0f, 1f);
+            float kx = left + (right - left) * f;
+
+            // Tick scale above and below the track (longer every 5th).
+            const int N = 21;
+            float gap = thk / 2f + 3f;
+            for (int i = 0; i < N; i++)
             {
-                using (var tb = new SolidBrush(Track)) g.FillPath(tb, tp);
-                Emboss(g, tp, new RectangleF(0, 0, Width, Height), raised: false);
+                float x = left + (right - left) * i / (N - 1);
+                float tl = (i % 5 == 0) ? 7f : 4f;
+                using var tp = new Pen(Color.FromArgb(i % 5 == 0 ? 150 : 90, Tick), 1f);
+                g.DrawLine(tp, x, cy - gap - tl, x, cy - gap);
+                g.DrawLine(tp, x, cy + gap, x, cy + gap + tl);
             }
 
-            float fw = Width * (_value / 100f);
-            if (fw >= 2)
+            // Unfilled groove, then the colored fill up to the knob (gradient mapped
+            // across the full travel so the leading edge's hue tracks the level).
+            using (var tb = new SolidBrush(Track))
+            using (var tpath = Pill(new RectangleF(left, cy - thk / 2f, right - left, thk)))
+                g.FillPath(tb, tpath);
+            if (kx - left >= thk * 0.5f)
             {
-                var r = new RectangleF(0, 0, fw, Height);
-                using var fp = Pill(r);
-                // Gradient mapped across the FULL width (green->yellow->red), then
-                // clipped to the filled portion, so the leading edge's color tracks
-                // the actual volume level rather than compressing into the fill.
-                using (var grad = new LinearGradientBrush(new RectangleF(0, 0, Width, Height),
+                using var fpath = Pill(new RectangleF(left, cy - thk / 2f, kx - left, thk));
+                using var grad = new LinearGradientBrush(new RectangleF(left, cy - thk / 2f, right - left, thk),
                     Fill, Hot, LinearGradientMode.Horizontal)
                 {
-                    InterpolationColors = new ColorBlend
-                    {
-                        Colors = new[] { Fill, Mid, Hot },
-                        Positions = new[] { 0f, 0.5f, 1f },
-                    },
-                })
-                    g.FillPath(grad, fp);
-                // Raised bevel: glossy highlight on the top half, shadow on the bottom.
-                Emboss(g, fp, r, raised: true);
+                    InterpolationColors = new ColorBlend { Colors = new[] { Fill, Mid, Hot }, Positions = new[] { 0f, 0.5f, 1f } },
+                };
+                g.FillPath(grad, fpath);
             }
+
+            // -/+ end glyphs (accent), like a physical fader's scale ends.
+            using (var sp = new Pen(Fill, 2f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+            {
+                g.DrawLine(sp, 3f, cy, 3f + 7f, cy);                 // minus
+                float px = w - 7f;
+                g.DrawLine(sp, px - 3.5f, cy, px + 3.5f, cy);        // plus (horizontal)
+                g.DrawLine(sp, px, cy - 3.5f, px, cy + 3.5f);        // plus (vertical)
+            }
+
+            // Knob: soft shadow, light body, themed edge, center dot tinted to level.
+            using (var sh = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
+                g.FillEllipse(sh, kx - knobR, cy - knobR + 1.5f, knobR * 2, knobR * 2);
+            using (var kb = new SolidBrush(Knob))
+                g.FillEllipse(kb, kx - knobR, cy - knobR, knobR * 2, knobR * 2);
+            using (var ke = new Pen(KnobEdge, 1.4f))
+                g.DrawEllipse(ke, kx - knobR, cy - knobR, knobR * 2, knobR * 2);
+            float dotR = knobR * 0.42f;
+            using (var cd = new SolidBrush(ColorAt(f)))
+                g.FillEllipse(cd, kx - dotR, cy - dotR, dotR * 2, dotR * 2);
         }
 
-        // Overlay a soft vertical highlight/shadow clipped to <path> to fake a bevel.
-        // raised: light top + dark bottom (the colored fill reads as raised/glossy);
-        // !raised: dark top + light bottom (the track reads as a sunken groove).
-        static void Emboss(Graphics g, GraphicsPath path, RectangleF r, bool raised)
+        // Green->yellow->red at fraction f, matching the fill gradient.
+        Color ColorAt(float f) =>
+            f <= 0 ? Fill : f >= 1 ? Hot :
+            f < 0.5f ? Lerp(Fill, Mid, f / 0.5f) : Lerp(Mid, Hot, (f - 0.5f) / 0.5f);
+
+        static Color Lerp(Color a, Color b, float t)
         {
-            if (r.Height < 3 || r.Width < 1) return;
-            var state = g.Save();
-            g.SetClip(path);
-            float h = r.Height, mid = r.Y + h / 2f;
-            Color top = raised ? Color.FromArgb(70, 255, 255, 255) : Color.FromArgb(55, 0, 0, 0);
-            Color bot = raised ? Color.FromArgb(55, 0, 0, 0) : Color.FromArgb(38, 255, 255, 255);
-            using (var tb = new LinearGradientBrush(new RectangleF(r.X, r.Y - 1, r.Width, h / 2f + 1),
-                    top, Color.Transparent, LinearGradientMode.Vertical))
-                g.FillRectangle(tb, r.X, r.Y, r.Width, h / 2f);
-            using (var bb = new LinearGradientBrush(new RectangleF(r.X, mid, r.Width, h / 2f + 1),
-                    Color.Transparent, bot, LinearGradientMode.Vertical))
-                g.FillRectangle(bb, r.X, mid, r.Width, h / 2f);
-            g.Restore(state);
+            t = Math.Clamp(t, 0f, 1f);
+            return Color.FromArgb(
+                (int)(a.R + (b.R - a.R) * t),
+                (int)(a.G + (b.G - a.G) * t),
+                (int)(a.B + (b.B - a.B) * t));
         }
 
         static GraphicsPath Pill(RectangleF r)
@@ -321,8 +348,8 @@ public class MainForm : Form
     readonly Label _status = new() { Text = "Starting…", AutoSize = true, Anchor = AnchorStyles.Left };
     readonly Label _statusDot = new() { Text = "●", AutoSize = true, Font = new Font("Segoe UI", 8f), Margin = new Padding(0, 3, 6, 0) };
 
-    readonly CardPanel _cardL = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 114, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
-    readonly CardPanel _cardR = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 114, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
+    readonly CardPanel _cardL = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 134, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
+    readonly CardPanel _cardR = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 134, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
     TableLayoutPanel _tlL = null!, _tlR = null!, _footer = null!;
     FlowLayoutPanel _maxL = null!, _maxR = null!;
 
@@ -343,7 +370,7 @@ public class MainForm : Form
         Text = "ZMK Volume Fader";
         Icon = LoadAppIcon();
         Font = new Font("Segoe UI", 9.75f);
-        ClientSize = new Size(460, 324);
+        ClientSize = new Size(460, 364);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
@@ -407,7 +434,7 @@ public class MainForm : Form
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // name / pct
-        t.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));  // bar
+        t.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));  // fader (track + ticks + knob)
         t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // combo / max
 
         t.Controls.Add(name, 0, 0);
@@ -493,7 +520,14 @@ public class MainForm : Form
         foreach (var card in new[] { _cardL, _cardR }) card.BackColor = t.Card;
         foreach (var tl in new Control[] { _tlL, _tlR, _maxL, _maxR }) tl.BackColor = Color.Transparent;
 
-        foreach (var b in new[] { _barLeft, _barRight }) { b.Track = t.Inset; b.Fill = t.Accent; b.BackColor = t.Card; b.Invalidate(); }
+        foreach (var b in new[] { _barLeft, _barRight })
+        {
+            b.Track = t.Inset; b.Fill = t.Accent; b.BackColor = t.Card;
+            b.Knob = t.Dark ? Hex(0xE6, 0xE8, 0xEB) : Hex(0xFF, 0xFF, 0xFF);
+            b.KnobEdge = t.Dark ? Hex(0x0E, 0x10, 0x14) : Hex(0xC2, 0xC6, 0xCC);
+            b.Tick = t.Subtle;
+            b.Invalidate();
+        }
         foreach (var c in new[] { _cbLeft, _cbRight })
         {
             c.BackColor = t.CtlBg; c.ForeColor = t.Text;
