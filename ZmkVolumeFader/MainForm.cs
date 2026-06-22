@@ -59,7 +59,9 @@ public class MainForm : Form
         int _value;
         public int Value { get => _value; set { int v = Math.Clamp(value, 0, 100); if (v != _value) { _value = v; Invalidate(); } } }
         public Color Track { get; set; } = Color.Gray;
-        public Color Fill { get; set; } = Color.LimeGreen;
+        public Color Fill { get; set; } = Color.LimeGreen;   // green stop (low volume)
+        public Color Mid { get; set; } = Color.FromArgb(0xF2, 0xC4, 0x3D);   // yellow (mid)
+        public Color Hot { get; set; } = Color.FromArgb(0xE0, 0x4F, 0x4F);   // red (high)
 
         public FaderBar() => SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
                                       | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
@@ -76,8 +78,19 @@ public class MainForm : Form
             if (fw >= 2)
             {
                 using var fp = Pill(new RectangleF(0, 0, fw, Height));
-                using var fb = new SolidBrush(Fill);
-                g.FillPath(fb, fp);
+                // Gradient mapped across the FULL width (green->yellow->red), then
+                // clipped to the filled portion, so the leading edge's color tracks
+                // the actual volume level rather than compressing into the fill.
+                using var grad = new LinearGradientBrush(new RectangleF(0, 0, Width, Height),
+                    Fill, Hot, LinearGradientMode.Horizontal)
+                {
+                    InterpolationColors = new ColorBlend
+                    {
+                        Colors = new[] { Fill, Mid, Hot },
+                        Positions = new[] { 0f, 0.5f, 1f },
+                    },
+                };
+                g.FillPath(grad, fp);
             }
         }
 
@@ -278,8 +291,8 @@ public class MainForm : Form
     readonly Label _status = new() { Text = "Starting…", AutoSize = true, Anchor = AnchorStyles.Left };
     readonly Label _statusDot = new() { Text = "●", AutoSize = true, Font = new Font("Segoe UI", 8f), Margin = new Padding(0, 3, 6, 0) };
 
-    readonly CardPanel _cardL = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 102, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
-    readonly CardPanel _cardR = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 102, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
+    readonly CardPanel _cardL = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 114, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
+    readonly CardPanel _cardR = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 114, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
     TableLayoutPanel _tlL = null!, _tlR = null!, _footer = null!;
     FlowLayoutPanel _maxL = null!, _maxR = null!;
 
@@ -300,7 +313,7 @@ public class MainForm : Form
         Text = "ZMK Volume Fader";
         Icon = LoadAppIcon();
         Font = new Font("Segoe UI", 9.75f);
-        ClientSize = new Size(460, 300);
+        ClientSize = new Size(460, 324);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
@@ -364,7 +377,7 @@ public class MainForm : Form
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // name / pct
-        t.RowStyles.Add(new RowStyle(SizeType.Absolute, 16));  // bar
+        t.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));  // bar
         t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // combo / max
 
         t.Controls.Add(name, 0, 0);
