@@ -3,11 +3,10 @@ using System.Runtime.InteropServices;
 namespace ZmkVolumeFader;
 
 /// <summary>
-/// Modal calibration dialog. Per fader: record the raw min/max by sweeping, pick
-/// a taper preset, or switch to "Custom (measure)" and capture the actual curve
-/// via the sweep wizard. A live preview shows the resulting volume as you move it.
-/// The edited <see cref="LeftCal"/>/<see cref="RightCal"/> calibrations are read
-/// back by the owner on a Save result.
+/// Modal calibration dialog. Per fader: record the raw min/max by sweeping, then
+/// pick the taper preset that matches the pot. A live preview shows the resulting
+/// volume as you move it. The edited <see cref="LeftCal"/>/<see cref="RightCal"/>
+/// calibrations are read back by the owner on a Save result.
 /// </summary>
 sealed class CalibrationDialog : Form
 {
@@ -24,14 +23,11 @@ sealed class CalibrationDialog : Form
     readonly Button[] _recordBtn = new Button[2];
     readonly ComboBox[] _taper = new ComboBox[2];
     readonly Panel[] _barFill = new Panel[2];
-    readonly FlowLayoutPanel[] _customRow = new FlowLayoutPanel[2];
-    readonly Button[] _measureBtn = new Button[2];
-    readonly Label[] _customStatus = new Label[2];
     readonly bool[] _recording = new bool[2];
 
     readonly System.Windows.Forms.Timer _tick = new() { Interval = 50 };
 
-    static readonly string[] TaperItems = { "Linear pot", "Audio pot", "Straight", "Custom (measure)" };
+    static readonly string[] TaperItems = { "Linear pot", "Audio pot", "Straight" };
 
     [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
     static extern int SetWindowTheme(IntPtr hWnd, string? subApp, string? subId);
@@ -50,7 +46,7 @@ sealed class CalibrationDialog : Form
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(430, 528);
+        ClientSize = new Size(430, 460);
         BackColor = _t.Window;
 
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(14), BackColor = Color.Transparent };
@@ -59,7 +55,7 @@ sealed class CalibrationDialog : Form
 
         root.Controls.Add(new Label
         {
-            Text = "Hit Record, sweep the fader fully end-to-end, then stop. Pick the taper that matches your pot — or Custom to capture points by hand. The preview updates as you move it.",
+            Text = "Hit Record, sweep the fader fully end-to-end, then stop. Then pick the taper that matches your pot. The preview updates as you move it.",
             AutoSize = true, MaximumSize = new Size(398, 0), ForeColor = _t.Subtle, Margin = new Padding(2, 0, 2, 10),
         }, 0, 0);
         root.Controls.Add(BuildFader(0, "Left fader"), 0, 1);
@@ -86,12 +82,12 @@ sealed class CalibrationDialog : Form
     Panel BuildFader(int i, string name)
     {
         int idx = i;
-        var card = new Panel { Width = 398, Height = 184, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
+        var card = new Panel { Width = 398, Height = 150, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
 
-        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 5, BackColor = Color.Transparent };
+        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        for (int r = 0; r < 5; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        for (int r = 0; r < 4; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         t.Controls.Add(new Label { Text = name, AutoSize = true, ForeColor = _t.Subtle, Anchor = AnchorStyles.Left, Margin = new Padding(0, 4, 0, 0) }, 0, 0);
         _rawLbl[i] = new Label { Text = "raw —", AutoSize = true, ForeColor = _t.Text, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 11f) };
@@ -107,31 +103,21 @@ sealed class CalibrationDialog : Form
         taperPanel.Controls.Add(new Label { Text = "Taper", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(0, 6, 8, 0) });
         _taper[i] = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150, BackColor = _t.CtlBg, ForeColor = _t.Text };
         _taper[i].Items.AddRange(TaperItems);
-        _taper[i].SelectedIndex = (int)_cal[i].Taper;
+        _taper[i].SelectedIndex = Math.Clamp((int)_cal[i].Taper, 0, TaperItems.Length - 1);
+        _cal[i].Taper = (TaperKind)_taper[i].SelectedIndex;   // normalize any stale value
         _taper[i].SelectedIndexChanged += (_, _) => OnTaperChanged(idx);
         taperPanel.Controls.Add(_taper[i]);
         t.Controls.Add(taperPanel, 0, 2);
         t.SetColumnSpan(taperPanel, 2);
 
-        _customRow[i] = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 2) };
-        _measureBtn[i] = MakeButton("Measure curve…", false);
-        _measureBtn[i].Click += (_, _) => OpenWizard(idx);
-        _customStatus[i] = new Label { AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(8, 6, 0, 0) };
-        _customRow[i].Controls.Add(_measureBtn[i]);
-        _customRow[i].Controls.Add(_customStatus[i]);
-        t.Controls.Add(_customRow[i], 0, 3);
-        t.SetColumnSpan(_customRow[i], 2);
-
-        var barBg = new Panel { Height = 8, BackColor = _t.Inset, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 9, 8, 2) };
+        var barBg = new Panel { Height = 8, BackColor = _t.Inset, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 12, 8, 2) };
         _barFill[i] = new Panel { Dock = DockStyle.Left, Width = 0, BackColor = _t.Accent };
         barBg.Controls.Add(_barFill[i]);
         _previewLbl[i] = new Label { Text = "0%", AutoSize = true, ForeColor = _t.Accent, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 11f) };
-        t.Controls.Add(barBg, 0, 4);
-        t.Controls.Add(_previewLbl[i], 1, 4);
+        t.Controls.Add(barBg, 0, 3);
+        t.Controls.Add(_previewLbl[i], 1, 3);
 
         card.Controls.Add(t);
-        UpdateCustomVisibility(i);
-        UpdateCustomStatus(i);
         return card;
     }
 
@@ -166,27 +152,7 @@ sealed class CalibrationDialog : Form
         }
     }
 
-    void OnTaperChanged(int i)
-    {
-        _cal[i].Taper = (TaperKind)_taper[i].SelectedIndex;
-        UpdateCustomVisibility(i);
-        UpdateCustomStatus(i);
-    }
-
-    void UpdateCustomVisibility(int i) => _customRow[i].Visible = _cal[i].Taper == TaperKind.Custom;
-
-    void UpdateCustomStatus(int i)
-    {
-        int n = _cal[i].CustomPoints?.Length ?? 0;
-        _customStatus[i].Text = n >= 2 ? $"curve: {n} points" : "not measured";
-    }
-
-    // Open the guided sweep wizard; it edits _cal[i] (Min/Max/Taper/CustomPoints) on Save.
-    void OpenWizard(int i)
-    {
-        using var w = new CurveCaptureDialog(_t, i == 0 ? "Left fader" : "Right fader", _raw[i], _cal[i]);
-        if (w.ShowDialog(this) == DialogResult.OK) UpdateCustomStatus(i);
-    }
+    void OnTaperChanged(int i) => _cal[i].Taper = (TaperKind)_taper[i].SelectedIndex;
 
     void Tick(int i)
     {

@@ -1,32 +1,17 @@
 namespace ZmkVolumeFader;
 
-internal enum TaperKind { Linear, Audio, Straight, Custom }
-
-internal sealed class CurvePoint
-{
-    public int V { get; set; }
-    public int Pct { get; set; }
-    public CurvePoint() { }
-    public CurvePoint(int v, int pct) { V = v; Pct = pct; }
-}
+internal enum TaperKind { Linear, Audio, Straight }
 
 /// <summary>
-/// Per-fader calibration: the captured raw range plus how the value maps to a
-/// volume percentage between the ends. <see cref="BuildCurve"/> turns it into the
-/// piecewise (raw -> %) table the app interpolates at runtime.
+/// Per-fader calibration: the captured raw range plus which taper preset maps the
+/// value to a volume percentage between the ends. <see cref="BuildCurve"/> turns it
+/// into the piecewise (raw -> %) table the app interpolates at runtime.
 /// </summary>
 internal sealed class Calibration
 {
     public int Min { get; set; } = 4;
     public int Max { get; set; } = 3215;
-    public TaperKind Taper { get; set; } = TaperKind.Custom;
-
-    // Custom (measured) curve: explicit (raw -> %) points captured by the curve
-    // wizard, low raw to high. Defaults to the previously hardcoded curve.
-    public CurvePoint[]? CustomPoints { get; set; } = new CurvePoint[]
-    {
-        new(4, 0), new(143, 25), new(1612, 50), new(3133, 75), new(3215, 100),
-    };
+    public TaperKind Taper { get; set; } = TaperKind.Linear;
 
     // Presets: inverse of the Bourns datasheet output-vs-travel curves
     // (value-fraction% -> volume%), so physical travel maps ~linearly to volume.
@@ -41,25 +26,17 @@ internal sealed class Calibration
         Min = Min,
         Max = Max,
         Taper = Taper,
-        CustomPoints = CustomPoints?.Select(p => new CurvePoint(p.V, p.Pct)).ToArray(),
     };
 
     public (int v, int pct)[] BuildCurve()
     {
-        if (Taper == TaperKind.Custom && CustomPoints is { Length: >= 2 })
-        {
-            var pts = new (int, int)[CustomPoints.Length];
-            for (int i = 0; i < pts.Length; i++) pts[i] = (CustomPoints[i].V, CustomPoints[i].Pct);
-            return Sanitize(pts);
-        }
-
         int lo = Math.Min(Min, Max), hi = Math.Max(Min, Max);
         if (hi - lo < 2) { lo = 0; hi = 3250; }   // guard against a degenerate range
         var shape = Taper switch
         {
             TaperKind.Audio => AudioShape,
             TaperKind.Straight => StraightShape,
-            _ => LinearShape,   // Linear, or Custom with no captured points
+            _ => LinearShape,   // Linear (also the fallback for any stale value)
         };
         var outp = new (int, int)[shape.Length];
         for (int i = 0; i < shape.Length; i++)
