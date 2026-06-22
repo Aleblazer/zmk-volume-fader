@@ -55,8 +55,9 @@ public class MainForm : Form
 
     // Console-style fader: a tick-scaled track with a knob at the current level,
     // -/+ ends, and a green->yellow->red colored fill. Display-only (the position
-    // is driven by the physical fader), styled to match it.
-    sealed class FaderBar : Control
+    // is driven by the physical fader), styled to match it. Reused (ticks off) for
+    // the Options dialog's live preview bars.
+    internal sealed class FaderBar : Control
     {
         int _value;
         public int Value { get => _value; set { int v = Math.Clamp(value, 0, 100); if (v != _value) { _value = v; Invalidate(); } } }
@@ -67,6 +68,7 @@ public class MainForm : Form
         public Color Knob { get; set; } = Color.White;
         public Color KnobEdge { get; set; } = Color.Gray;
         public Color Tick { get; set; } = Color.Gray;
+        public bool ShowTicks { get; set; } = true;
 
         public FaderBar() => SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
                                       | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
@@ -89,15 +91,18 @@ public class MainForm : Form
             float kx = left + (right - left) * f;
 
             // Tick scale above and below the track (longer every 5th).
-            const int N = 21;
-            float gap = thk / 2f + 3f;
-            for (int i = 0; i < N; i++)
+            if (ShowTicks)
             {
-                float x = left + (right - left) * i / (N - 1);
-                float tl = (i % 5 == 0) ? 7f : 4f;
-                using var tp = new Pen(Color.FromArgb(i % 5 == 0 ? 150 : 90, Tick), 1f);
-                g.DrawLine(tp, x, cy - gap - tl, x, cy - gap);
-                g.DrawLine(tp, x, cy + gap, x, cy + gap + tl);
+                const int N = 21;
+                float gap = thk / 2f + 3f;
+                for (int i = 0; i < N; i++)
+                {
+                    float x = left + (right - left) * i / (N - 1);
+                    float tl = (i % 5 == 0) ? 7f : 4f;
+                    using var tp = new Pen(Color.FromArgb(i % 5 == 0 ? 150 : 90, Tick), 1f);
+                    g.DrawLine(tp, x, cy - gap - tl, x, cy - gap);
+                    g.DrawLine(tp, x, cy + gap, x, cy + gap + tl);
+                }
             }
 
             // Unfilled groove, then the colored fill up to the knob (gradient mapped

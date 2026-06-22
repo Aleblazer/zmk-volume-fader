@@ -25,7 +25,7 @@ sealed class OptionsDialog : Form
     readonly Label[] _previewLbl = new Label[2];
     readonly Button[] _recordBtn = new Button[2];
     readonly ComboBox[] _taper = new ComboBox[2];
-    readonly Panel[] _barFill = new Panel[2];
+    readonly MainForm.FaderBar[] _bar = new MainForm.FaderBar[2];
     readonly bool[] _recording = new bool[2];
 
     readonly CheckBox _startup = new() { Text = "Start with Windows", AutoSize = true, FlatStyle = FlatStyle.Standard, Margin = new Padding(0, 0, 0, 0) };
@@ -55,7 +55,7 @@ sealed class OptionsDialog : Form
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(430, 624);
+        ClientSize = new Size(430, 652);
         BackColor = _t.Window;
 
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 6, Padding = new Padding(14), BackColor = Color.Transparent };
@@ -160,7 +160,7 @@ sealed class OptionsDialog : Form
     Panel BuildFader(int i, string name)
     {
         int idx = i;
-        var card = new Panel { Width = 398, Height = 150, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
+        var card = new Panel { Width = 398, Height = 164, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
 
         var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -188,11 +188,15 @@ sealed class OptionsDialog : Form
         t.Controls.Add(taperPanel, 0, 2);
         t.SetColumnSpan(taperPanel, 2);
 
-        var barBg = new Panel { Height = 8, BackColor = _t.Inset, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 12, 8, 2) };
-        _barFill[i] = new Panel { Dock = DockStyle.Left, Width = 0, BackColor = _t.Accent };
-        barBg.Controls.Add(_barFill[i]);
+        _bar[i] = new MainForm.FaderBar
+        {
+            Height = 22, ShowTicks = false, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 8, 8, 2),
+            Track = _t.Inset, Fill = _t.Accent, BackColor = _t.Card, Tick = _t.Subtle,
+            Knob = _t.Dark ? Color.FromArgb(0xE6, 0xE8, 0xEB) : Color.White,
+            KnobEdge = _t.Dark ? Color.FromArgb(0x0E, 0x10, 0x14) : Color.FromArgb(0xC2, 0xC6, 0xCC),
+        };
         _previewLbl[i] = new Label { Text = "0%", AutoSize = true, ForeColor = _t.Accent, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 11f) };
-        t.Controls.Add(barBg, 0, 3);
+        t.Controls.Add(_bar[i], 0, 3);
         t.Controls.Add(_previewLbl[i], 1, 3);
 
         card.Controls.Add(t);
@@ -245,7 +249,7 @@ sealed class OptionsDialog : Form
 
         int p = Math.Clamp((int)Math.Round(Calibration.Eval(_cal[i].BuildCurve(), v)), 0, 100);
         _previewLbl[i].Text = $"{p}%";
-        if (_barFill[i].Parent is { } bg) _barFill[i].Width = bg.ClientSize.Width * p / 100;
+        _bar[i].Value = p;
     }
 
     void ApplyDark()
