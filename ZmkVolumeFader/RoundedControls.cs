@@ -104,10 +104,10 @@ internal sealed class RoundedComboBox : ComboBox
             IntPtr hdc = BeginPaint(Handle, out var ps);
             try
             {
-                using var buf = new Bitmap(Math.Max(1, Width), Math.Max(1, Height));
-                using (var bg = Graphics.FromImage(buf)) PaintClosed(bg);
+                // Paint straight to the (opaque) DC so ClearType text stays crisp;
+                // an ARGB back-buffer makes dark-on-light text look bold/fringed.
                 using var g = Graphics.FromHdc(hdc);
-                g.DrawImageUnscaled(buf, 0, 0);
+                PaintClosed(g);
             }
             finally { EndPaint(Handle, ref ps); }
             m.Result = IntPtr.Zero;
@@ -127,7 +127,7 @@ internal sealed class RoundedComboBox : ComboBox
             using (var p = new Pen(BorderColor, 1f)) g.DrawPath(p, path);
         }
 
-        string text = SelectedIndex >= 0 ? GetItemText(SelectedItem) : Text;
+        string text = GetItemText(SelectedItem) ?? string.Empty;
         var textRect = new Rectangle(9, 0, Width - 9 - 22, Height);
         TextRenderer.DrawText(g, text, Font, textRect, ForeColor,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
