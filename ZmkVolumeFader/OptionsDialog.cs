@@ -23,13 +23,13 @@ sealed class OptionsDialog : Form
     readonly Label[] _rawLbl = new Label[2];
     readonly Label[] _rangeLbl = new Label[2];
     readonly Label[] _previewLbl = new Label[2];
-    readonly Button[] _recordBtn = new Button[2];
-    readonly ComboBox[] _taper = new ComboBox[2];
+    readonly RoundedButton[] _recordBtn = new RoundedButton[2];
+    readonly RoundedComboBox[] _taper = new RoundedComboBox[2];
     readonly MainForm.FaderBar[] _bar = new MainForm.FaderBar[2];
     readonly bool[] _recording = new bool[2];
 
     readonly CheckBox _startup = new() { Text = "Start with Windows", AutoSize = true, FlatStyle = FlatStyle.Standard, Margin = new Padding(0, 0, 0, 0) };
-    readonly ComboBox _themeCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 190 };
+    readonly RoundedComboBox _themeCombo = new() { Width = 190 };
 
     readonly System.Windows.Forms.Timer _tick = new() { Interval = 50 };
     readonly ToolTip _tip = new();
@@ -148,6 +148,7 @@ sealed class OptionsDialog : Form
         themeRow.Controls.Add(new Label { Text = "Theme", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(0, 6, 8, 0) });
         _themeCombo.BackColor = _t.CtlBg;
         _themeCombo.ForeColor = _t.Text;
+        _themeCombo.Surround = _t.Card; _themeCombo.BoxColor = _t.CtlBg; _themeCombo.BorderColor = _t.CtlBorder; _themeCombo.ChevronColor = _t.Subtle;
         _themeCombo.Items.AddRange(ThemeItems);
         _themeCombo.SelectedIndex = Math.Clamp((int)mode, 0, ThemeItems.Length - 1);
         themeRow.Controls.Add(_themeCombo);
@@ -172,14 +173,14 @@ sealed class OptionsDialog : Form
         t.Controls.Add(_rawLbl[i], 1, 0);
 
         _rangeLbl[i] = new Label { Text = "range —", AutoSize = true, ForeColor = _t.Text, Anchor = AnchorStyles.Left, Margin = new Padding(0, 8, 0, 0) };
-        _recordBtn[i] = MakeButton("Record", false);
+        _recordBtn[i] = MakeButton("Record", false, _t.Card);
         _recordBtn[i].Click += (_, _) => ToggleRecord(idx);
         t.Controls.Add(_rangeLbl[i], 0, 1);
         t.Controls.Add(_recordBtn[i], 1, 1);
 
         var taperPanel = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 6, 0, 4) };
         taperPanel.Controls.Add(new Label { Text = "Taper", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(0, 6, 8, 0) });
-        _taper[i] = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150, BackColor = _t.CtlBg, ForeColor = _t.Text };
+        _taper[i] = new RoundedComboBox { Width = 150, BackColor = _t.CtlBg, ForeColor = _t.Text, Surround = _t.Card, BoxColor = _t.CtlBg, BorderColor = _t.CtlBorder, ChevronColor = _t.Subtle };
         _taper[i].Items.AddRange(TaperItems);
         _taper[i].SelectedIndex = Math.Clamp((int)_cal[i].Taper, 0, TaperItems.Length - 1);
         _cal[i].Taper = (TaperKind)_taper[i].SelectedIndex;   // normalize any stale value
@@ -203,9 +204,9 @@ sealed class OptionsDialog : Form
         return card;
     }
 
-    Button MakeButton(string text, bool accent)
+    RoundedButton MakeButton(string text, bool accent, Color? surround = null)
     {
-        var b = new Button { Text = text, AutoSize = true, FlatStyle = FlatStyle.Flat, Padding = new Padding(10, 5, 10, 5), Margin = new Padding(6, 0, 0, 0) };
+        var b = new RoundedButton { Text = text, AutoSize = true, Padding = new Padding(12, 6, 12, 6), Margin = new Padding(6, 0, 0, 0), Surround = surround ?? _t.Window };
         if (accent) { b.BackColor = _t.Accent; b.ForeColor = AccentText(); b.FlatAppearance.BorderColor = _t.Accent; }
         else { b.BackColor = _t.CtlBg; b.ForeColor = _t.Text; b.FlatAppearance.BorderColor = _t.CtlBorder; }
         return b;

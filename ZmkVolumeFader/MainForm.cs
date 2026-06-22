@@ -338,8 +338,8 @@ public class MainForm : Form
 
     // ---- controls ---------------------------------------------------------
 
-    readonly ComboBox _cbLeft = new() { DropDownStyle = ComboBoxStyle.DropDownList, DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right };
-    readonly ComboBox _cbRight = new() { DropDownStyle = ComboBoxStyle.DropDownList, DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right };
+    readonly RoundedComboBox _cbLeft = new() { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right };
+    readonly RoundedComboBox _cbRight = new() { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right };
     readonly FaderBar _barLeft = new() { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
     readonly FaderBar _barRight = new() { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
     readonly Label _pctLeft = new() { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
@@ -348,8 +348,8 @@ public class MainForm : Form
     readonly Label _nameRight = new() { Text = "Right fader", AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
     readonly Stepper _limLeft = new() { Minimum = 1, Maximum = 100, Value = 100 };
     readonly Stepper _limRight = new() { Minimum = 1, Maximum = 100, Value = 100 };
-    readonly Button _btnRefresh = new() { Text = "Refresh devices", AutoSize = true, FlatStyle = FlatStyle.Flat, Padding = new Padding(10, 5, 10, 5), Margin = new Padding(0) };
-    readonly Button _btnOptions = new() { Text = "Options", AutoSize = true, FlatStyle = FlatStyle.Flat, Padding = new Padding(10, 5, 10, 5), Margin = new Padding(8, 0, 0, 0) };
+    readonly RoundedButton _btnRefresh = new() { Text = "Refresh devices", AutoSize = true, Padding = new Padding(12, 6, 12, 6), Margin = new Padding(0) };
+    readonly RoundedButton _btnOptions = new() { Text = "Options", AutoSize = true, Padding = new Padding(12, 6, 12, 6), Margin = new Padding(8, 0, 0, 0) };
     readonly Label _status = new() { Text = "Starting…", AutoSize = true, Anchor = AnchorStyles.Left };
     readonly Label _statusDot = new() { Text = "●", AutoSize = true, Font = new Font("Segoe UI", 8f), Margin = new Padding(0, 3, 6, 0) };
 
@@ -535,8 +535,9 @@ public class MainForm : Form
         }
         foreach (var c in new[] { _cbLeft, _cbRight })
         {
-            c.BackColor = t.CtlBg; c.ForeColor = t.Text;
-            // Win10+ dark combo: themes the drop button and the dropdown list.
+            c.BackColor = t.CtlBg; c.ForeColor = t.Text;            // popup list colours
+            c.Surround = t.Card; c.BoxColor = t.CtlBg; c.BorderColor = t.CtlBorder; c.ChevronColor = t.Subtle;
+            // Win10+ dark combo: themes the (still-native) dropdown list.
             if (c.IsHandleCreated) SetWindowTheme(c.Handle, t.Dark ? "DarkMode_CFD" : null, null);
             c.Invalidate();
         }
@@ -546,6 +547,8 @@ public class MainForm : Form
             btn.BackColor = t.CtlBg;
             btn.ForeColor = t.Text;
             btn.FlatAppearance.BorderColor = t.CtlBorder;
+            btn.Surround = t.Window;
+            btn.Invalidate();
         }
 
         // Most labels are muted; the big % is primary, the status dot is accent.
