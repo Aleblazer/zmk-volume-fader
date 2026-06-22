@@ -72,16 +72,24 @@ public class MainForm : Form
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.Clear(BackColor);
             if (Width < 2 || Height < 2) return;
+
+            // Track: filled, then an inner bevel (dark along the top, light along the
+            // bottom) so the groove reads as recessed.
             using (var tp = Pill(new RectangleF(0, 0, Width, Height)))
-            using (var tb = new SolidBrush(Track)) g.FillPath(tb, tp);
+            {
+                using (var tb = new SolidBrush(Track)) g.FillPath(tb, tp);
+                Emboss(g, tp, new RectangleF(0, 0, Width, Height), raised: false);
+            }
+
             float fw = Width * (_value / 100f);
             if (fw >= 2)
             {
-                using var fp = Pill(new RectangleF(0, 0, fw, Height));
+                var r = new RectangleF(0, 0, fw, Height);
+                using var fp = Pill(r);
                 // Gradient mapped across the FULL width (green->yellow->red), then
                 // clipped to the filled portion, so the leading edge's color tracks
                 // the actual volume level rather than compressing into the fill.
-                using var grad = new LinearGradientBrush(new RectangleF(0, 0, Width, Height),
+                using (var grad = new LinearGradientBrush(new RectangleF(0, 0, Width, Height),
                     Fill, Hot, LinearGradientMode.Horizontal)
                 {
                     InterpolationColors = new ColorBlend
@@ -89,9 +97,31 @@ public class MainForm : Form
                         Colors = new[] { Fill, Mid, Hot },
                         Positions = new[] { 0f, 0.5f, 1f },
                     },
-                };
-                g.FillPath(grad, fp);
+                })
+                    g.FillPath(grad, fp);
+                // Raised bevel: glossy highlight on the top half, shadow on the bottom.
+                Emboss(g, fp, r, raised: true);
             }
+        }
+
+        // Overlay a soft vertical highlight/shadow clipped to <path> to fake a bevel.
+        // raised: light top + dark bottom (the colored fill reads as raised/glossy);
+        // !raised: dark top + light bottom (the track reads as a sunken groove).
+        static void Emboss(Graphics g, GraphicsPath path, RectangleF r, bool raised)
+        {
+            if (r.Height < 3 || r.Width < 1) return;
+            var state = g.Save();
+            g.SetClip(path);
+            float h = r.Height, mid = r.Y + h / 2f;
+            Color top = raised ? Color.FromArgb(70, 255, 255, 255) : Color.FromArgb(55, 0, 0, 0);
+            Color bot = raised ? Color.FromArgb(55, 0, 0, 0) : Color.FromArgb(38, 255, 255, 255);
+            using (var tb = new LinearGradientBrush(new RectangleF(r.X, r.Y - 1, r.Width, h / 2f + 1),
+                    top, Color.Transparent, LinearGradientMode.Vertical))
+                g.FillRectangle(tb, r.X, r.Y, r.Width, h / 2f);
+            using (var bb = new LinearGradientBrush(new RectangleF(r.X, mid, r.Width, h / 2f + 1),
+                    Color.Transparent, bot, LinearGradientMode.Vertical))
+                g.FillRectangle(bb, r.X, mid, r.Width, h / 2f);
+            g.Restore(state);
         }
 
         static GraphicsPath Pill(RectangleF r)
