@@ -32,6 +32,7 @@ sealed class OptionsDialog : Form
     readonly ComboBox _themeCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 190 };
 
     readonly System.Windows.Forms.Timer _tick = new() { Interval = 50 };
+    readonly ToolTip _tip = new();
 
     static readonly string[] TaperItems = { "Linear pot", "Audio pot", "Straight" };
     static readonly string[] ThemeItems = { "Auto (follow Windows)", "Light", "Dark" };
@@ -54,7 +55,7 @@ sealed class OptionsDialog : Form
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(430, 600);
+        ClientSize = new Size(430, 624);
         BackColor = _t.Window;
 
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 6, Padding = new Padding(14), BackColor = Color.Transparent };
@@ -79,14 +80,7 @@ sealed class OptionsDialog : Form
         btnRow.Controls.Add(cancel);
         root.Controls.Add(btnRow, 0, 4);
 
-        var ver = GetType().Assembly.GetName().Version;
-        root.Controls.Add(new Label
-        {
-            Text = (ver is null ? "ZMK Volume Fader" : $"ZMK Volume Fader  v{ver.Major}.{ver.Minor}.{ver.Build}")
-                 + "\nVibecoded by Aleblazer of Split Logic Keyboards",
-            AutoSize = false, Dock = DockStyle.Fill, Height = 36, TextAlign = ContentAlignment.MiddleCenter,
-            ForeColor = _t.Subtle, Font = new Font("Segoe UI", 8.25f), Margin = new Padding(0, 10, 0, 0),
-        }, 0, 5);
+        root.Controls.Add(BuildAbout(), 0, 5);
 
         Controls.Add(root);
         AcceptButton = save;
@@ -95,6 +89,33 @@ sealed class OptionsDialog : Form
         _tick.Tick += (_, _) => { Tick(0); Tick(1); };
         Load += (_, _) => { ApplyDark(); _tick.Start(); };
         FormClosing += (_, _) => _tick.Stop();
+    }
+
+    Control BuildAbout()
+    {
+        var ver = GetType().Assembly.GetName().Version;
+        var t = new TableLayoutPanel { AutoSize = true, ColumnCount = 1, RowCount = 2, Dock = DockStyle.Fill, BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
+        t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        for (int r = 0; r < 2; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        t.Controls.Add(new Label
+        {
+            Text = (ver is null ? "ZMK Volume Fader" : $"ZMK Volume Fader  v{ver.Major}.{ver.Minor}.{ver.Build}")
+                 + "\nVibecoded by Aleblazer of Split Logic Keyboards",
+            AutoSize = false, Dock = DockStyle.Fill, Height = 34, TextAlign = ContentAlignment.MiddleCenter,
+            ForeColor = _t.Subtle, Font = new Font("Segoe UI", 8.25f), Margin = new Padding(0, 0, 0, 4),
+        }, 0, 0);
+
+        var icons = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Anchor = AnchorStyles.None, BackColor = Color.Transparent, Margin = new Padding(0) };
+        var gh = new LinkIcon("https://github.com/Aleblazer/zmk-volume-fader", Icons.Path(Icons.GitHub))
+        {
+            Width = 24, Height = 24, Margin = new Padding(6, 0, 6, 0),
+            BackColor = _t.Window, IconColor = _t.Subtle, HoverColor = _t.Text,
+        };
+        _tip.SetToolTip(gh, "View the project on GitHub");
+        icons.Controls.Add(gh);
+        t.Controls.Add(icons, 0, 1);
+        return t;
     }
 
     Panel BuildGeneral(ThemeMode mode, bool startup)
