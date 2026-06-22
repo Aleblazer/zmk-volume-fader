@@ -9,9 +9,9 @@
     <RootNamespace>ZmkVolumeFader</RootNamespace>
     <AssemblyName>ZmkVolumeFader</AssemblyName>
     <ApplicationIcon>app.ico</ApplicationIcon>
-    <Version>1.0.1</Version>
-    <FileVersion>1.0.1.0</FileVersion>
-    <AssemblyVersion>1.0.1.0</AssemblyVersion>
+    <Version>1.1.0</Version>
+    <FileVersion>1.1.0.0</FileVersion>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
     <Product>ZMK Volume Fader</Product>
     <Company>Aleblazer</Company>
   </PropertyGroup>
