@@ -238,14 +238,12 @@ public class MainForm : Form
         public required ComboBox Combo;
         public required FaderBar Bar;
         public required Label Pct;     // big "62%" readout
-        public required Label Raw;     // small "raw N (min-max)" calibration readout
         public required Stepper Limit;
         public Calibration Cal = new();                       // value->% mapping (persisted)
         public (int v, int pct)[] Curve = Array.Empty<(int, int)>();  // built from Cal
         public double Sm = -1;          // EMA state (smoothed raw value)
         public int LastRaw;             // last raw value (so a cap change can re-render)
         public int LastApplied = -1;    // last volume % pushed to the device (deadband)
-        public int RawMin = int.MaxValue, RawMax = int.MinValue;  // observed raw range
     }
 
     sealed class Settings
@@ -271,8 +269,6 @@ public class MainForm : Form
     readonly FaderBar _barRight = new() { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
     readonly Label _pctLeft = new() { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
     readonly Label _pctRight = new() { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
-    readonly Label _rawLeft = new() { Text = "", AutoSize = true, Anchor = AnchorStyles.Left, Font = new Font("Segoe UI", 8.25f) };
-    readonly Label _rawRight = new() { Text = "", AutoSize = true, Anchor = AnchorStyles.Left, Font = new Font("Segoe UI", 8.25f) };
     readonly Label _nameLeft = new() { Text = "Left fader", AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
     readonly Label _nameRight = new() { Text = "Right fader", AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
     readonly Stepper _limLeft = new() { Minimum = 1, Maximum = 100, Value = 100 };
@@ -282,8 +278,8 @@ public class MainForm : Form
     readonly Label _status = new() { Text = "Starting…", AutoSize = true, Anchor = AnchorStyles.Left };
     readonly Label _statusDot = new() { Text = "●", AutoSize = true, Font = new Font("Segoe UI", 8f), Margin = new Padding(0, 3, 6, 0) };
 
-    readonly CardPanel _cardL = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 122, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
-    readonly CardPanel _cardR = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 122, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
+    readonly CardPanel _cardL = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 102, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
+    readonly CardPanel _cardR = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 102, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
     TableLayoutPanel _tlL = null!, _tlR = null!, _footer = null!;
     FlowLayoutPanel _maxL = null!, _maxR = null!;
 
@@ -304,13 +300,13 @@ public class MainForm : Form
         Text = "ZMK Volume Fader";
         Icon = LoadAppIcon();
         Font = new Font("Segoe UI", 9.75f);
-        ClientSize = new Size(460, 340);
+        ClientSize = new Size(460, 300);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
 
-        _left = new Axis { Combo = _cbLeft, Bar = _barLeft, Pct = _pctLeft, Raw = _rawLeft, Limit = _limLeft };
-        _right = new Axis { Combo = _cbRight, Bar = _barRight, Pct = _pctRight, Raw = _rawRight, Limit = _limRight };
+        _left = new Axis { Combo = _cbLeft, Bar = _barLeft, Pct = _pctLeft, Limit = _limLeft };
+        _right = new Axis { Combo = _cbRight, Bar = _barRight, Pct = _pctRight, Limit = _limRight };
         _left.Curve = _left.Cal.BuildCurve();
         _right.Curve = _right.Cal.BuildCurve();
 
@@ -318,8 +314,8 @@ public class MainForm : Form
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         for (int i = 0; i < 3; i++) root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        _tlL = BuildCard(_cardL, _nameLeft, _pctLeft, _barLeft, _rawLeft, _cbLeft, out _maxL, _limLeft);
-        _tlR = BuildCard(_cardR, _nameRight, _pctRight, _barRight, _rawRight, _cbRight, out _maxR, _limRight);
+        _tlL = BuildCard(_cardL, _nameLeft, _pctLeft, _barLeft, _cbLeft, out _maxL, _limLeft);
+        _tlR = BuildCard(_cardR, _nameRight, _pctRight, _barRight, _cbRight, out _maxR, _limRight);
 
         _footer = new TableLayoutPanel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, AutoSize = true, ColumnCount = 2, RowCount = 1, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 0) };
         _footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -361,24 +357,22 @@ public class MainForm : Form
     }
 
     // Lay out one fader card; returns the inner table and (via out) the Max group.
-    TableLayoutPanel BuildCard(CardPanel card, Label name, Label pct, FaderBar bar, Label raw,
+    TableLayoutPanel BuildCard(CardPanel card, Label name, Label pct, FaderBar bar,
                                ComboBox combo, out FlowLayoutPanel maxGroup, Stepper limit)
     {
-        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4, BackColor = Color.Transparent };
+        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // name / pct
         t.RowStyles.Add(new RowStyle(SizeType.Absolute, 16));  // bar
-        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // raw readout
         t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // combo / max
 
         t.Controls.Add(name, 0, 0);
         t.Controls.Add(pct, 1, 0);
         t.Controls.Add(bar, 0, 1); t.SetColumnSpan(bar, 2);
-        t.Controls.Add(raw, 0, 2); t.SetColumnSpan(raw, 2);
-        t.Controls.Add(combo, 0, 3);
+        t.Controls.Add(combo, 0, 2);
         maxGroup = MaxCap(limit);
-        t.Controls.Add(maxGroup, 1, 3);
+        t.Controls.Add(maxGroup, 1, 2);
 
         card.Controls.Add(t);
         return t;
@@ -777,8 +771,6 @@ public class MainForm : Form
 
     void ApplyAxis(Axis a, int raw)
     {
-        if (raw < a.RawMin) a.RawMin = raw;
-        if (raw > a.RawMax) a.RawMax = raw;
         a.LastRaw = raw;
 
         // EMA smooth (16-bit value is finer but noisier, ~+/-15 counts).
@@ -802,7 +794,6 @@ public class MainForm : Form
 
         a.Bar.Value = applied;
         a.Pct.Text = $"{applied}%";
-        a.Raw.Text = $"raw {a.LastRaw}  ·  {a.RawMin}–{a.RawMax}";
 
         if (applied == a.LastApplied) return;
         a.LastApplied = applied;
