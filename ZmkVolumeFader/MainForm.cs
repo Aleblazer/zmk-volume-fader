@@ -110,11 +110,13 @@ public class MainForm : Form
         static void Emboss(Graphics g, GraphicsPath path, RectangleF r, bool raised)
         {
             if (r.Height < 3 || r.Width < 1) return;
+
+            // 1) Inner highlight/shadow fill (clipped to the shape).
             var state = g.Save();
             g.SetClip(path);
             float h = r.Height, mid = r.Y + h / 2f;
-            Color top = raised ? Color.FromArgb(70, 255, 255, 255) : Color.FromArgb(55, 0, 0, 0);
-            Color bot = raised ? Color.FromArgb(55, 0, 0, 0) : Color.FromArgb(38, 255, 255, 255);
+            Color top = raised ? Color.FromArgb(110, 255, 255, 255) : Color.FromArgb(95, 0, 0, 0);
+            Color bot = raised ? Color.FromArgb(90, 0, 0, 0) : Color.FromArgb(80, 255, 255, 255);
             using (var tb = new LinearGradientBrush(new RectangleF(r.X, r.Y - 1, r.Width, h / 2f + 1),
                     top, Color.Transparent, LinearGradientMode.Vertical))
                 g.FillRectangle(tb, r.X, r.Y, r.Width, h / 2f);
@@ -122,6 +124,16 @@ public class MainForm : Form
                     Color.Transparent, bot, LinearGradientMode.Vertical))
                 g.FillRectangle(bb, r.X, mid, r.Width, h / 2f);
             g.Restore(state);
+
+            // 2) Beveled rim: stroke the outline with a top->bottom gradient pen so
+            // the edge reads 3-D (dark-top/light-bottom = sunken groove; inverted =
+            // raised). Inset alignment keeps the 2 px stroke inside the shape.
+            using var edge = new LinearGradientBrush(new RectangleF(r.X, r.Y - 1, Math.Max(r.Width, 1), r.Height + 2),
+                raised ? Color.FromArgb(170, 255, 255, 255) : Color.FromArgb(160, 0, 0, 0),
+                raised ? Color.FromArgb(140, 0, 0, 0) : Color.FromArgb(150, 255, 255, 255),
+                LinearGradientMode.Vertical);
+            using var pen = new Pen(edge, 2f) { Alignment = PenAlignment.Inset };
+            g.DrawPath(pen, path);
         }
 
         static GraphicsPath Pill(RectangleF r)
