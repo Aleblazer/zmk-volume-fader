@@ -4,6 +4,7 @@ using System.Text.Json;
 using HidSharp;
 using Microsoft.Win32;
 using NAudio.CoreAudioApi;
+using NAudio.CoreAudioApi.Interfaces;
 
 namespace ZmkVolumeFader;
 
@@ -307,6 +308,20 @@ public class MainForm : Form
         public override string ToString() => Name;
     }
 
+    // Fires a callback whenever the set of audio endpoints changes (plug/unplug,
+    // enable/disable) so the app can re-pick each fader's active output live.
+    // Callbacks arrive on an MMDevice thread; the handler marshals to the UI.
+    sealed class DeviceNotify : IMMNotificationClient
+    {
+        readonly Action _changed;
+        public DeviceNotify(Action changed) => _changed = changed;
+        public void OnDeviceStateChanged(string deviceId, DeviceState newState) => _changed();
+        public void OnDeviceAdded(string pwstrDeviceId) => _changed();
+        public void OnDeviceRemoved(string deviceId) => _changed();
+        public void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId) { }
+        public void OnPropertyValueChanged(string pwstrDeviceId, PropertyKey key) { }
+    }
+
     /// <summary>Per-fader UI + filtering state.</summary>
     sealed class Axis
     {
@@ -319,18 +334,45 @@ public class MainForm : Form
         public double Sm = -1;          // EMA state (smoothed raw value)
         public int LastRaw;             // last raw value (so a cap change can re-render)
         public int LastApplied = -1;    // last volume % pushed to the device (deadband)
+
+        // Ranked output preferences (highest first). The active output is the
+        // top-most entry whose device is present; if a higher one (re)appears it
+        // takes back over. Override is a device manually picked on the main window,
+        // which wins while present until the user re-selects the auto target or
+        // re-ranks the list. ActiveId is the output currently being driven.
+        public List<OutputPref> Prefs = new();
+        public string? OverrideId;
+        public string? ActiveId;
     }
 
     sealed class Settings
     {
         public string? LeftDeviceId { get; set; }
         public string? RightDeviceId { get; set; }
-        public int LeftMax { get; set; } = 100;
-        public int RightMax { get; set; } = 100;
+        public int LeftMax { get; set; } = 100;   // legacy fallback (pre per-device caps)
+        public int RightMax { get; set; } = 100;  // legacy fallback
+        // Per-output max-volume cap, keyed by audio endpoint id. The Max % stepper
+        // tracks the device currently chosen on each fader, so switching outputs
+        // restores that output's remembered cap (e.g. Maxwell 85%, IEMs 60%).
+        public Dictionary<string, int> DeviceMax { get; set; } = new();
+        // Ranked output preferences per fader, plus any manual override.
+        public List<OutputPref> LeftOutputs { get; set; } = new();
+        public List<OutputPref> RightOutputs { get; set; } = new();
+        public string? LeftOverrideId { get; set; }
+        public string? RightOverrideId { get; set; }
         public Calibration? LeftCal { get; set; }
         public Calibration? RightCal { get; set; }
         public ThemeMode ThemeMode { get; set; } = ThemeMode.Auto;
     }
+
+    // Live copy of Settings.DeviceMax (endpoint id -> cap %). Persisted on change.
+    Dictionary<string, int> _deviceMax = new();
+
+    // Currently-present render endpoints (id -> item), rebuilt by LoadDevices.
+    readonly Dictionary<string, DeviceItem> _present = new();
+    // True while we set a combo's selection programmatically, so the
+    // SelectedIndexChanged handler doesn't mistake it for a manual override.
+    bool _applyingActive;
 
     static string SettingsPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -359,6 +401,7 @@ public class MainForm : Form
     FlowLayoutPanel _maxL = null!, _maxR = null!;
 
     readonly MMDeviceEnumerator _enum = new();
+    DeviceNotify? _notify;
 
     Axis _left = null!, _right = null!;
 
@@ -427,7 +470,7 @@ public class MainForm : Form
 
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) MinimizeToTray(); };
 
-        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); StartHid(); };
+        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); StartHid(); RegisterDeviceNotifications(); };
         FormClosing += OnFormClosing;
     }
 
@@ -642,6 +685,11 @@ public class MainForm : Form
         }
 
         _run = false;
+        if (_notify != null)
+        {
+            try { _enum.UnregisterEndpointNotificationCallback(_notify); } catch { }
+            _notify = null;
+        }
         _tray.Visible = false;
         _tray.Dispose();
     }
@@ -659,13 +707,13 @@ public class MainForm : Form
 
     void LoadDevices()
     {
-        string? prevLeft = (_cbLeft.SelectedItem as DeviceItem)?.Id;
-        string? prevRight = (_cbRight.SelectedItem as DeviceItem)?.Id;
-
         var items = _enum.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
             .Select(d => new DeviceItem { Id = d.ID, Name = d.FriendlyName, Device = d })
             .OrderBy(d => d.Name)
             .ToArray();
+
+        _present.Clear();
+        foreach (var it in items) _present[it.Id] = it;
 
         foreach (var cb in new[] { _cbLeft, _cbRight })
         {
@@ -674,29 +722,114 @@ public class MainForm : Form
             cb.Items.AddRange(items);
             cb.EndUpdate();
         }
-        SelectById(_cbLeft, prevLeft);
-        SelectById(_cbRight, prevRight);
+        // Re-pick the active output for each fader against the new device set.
+        ApplyActive(_left);
+        ApplyActive(_right);
     }
 
-    static void SelectById(ComboBox cb, string? id)
+    void RegisterDeviceNotifications()
     {
-        if (id == null) return;
-        for (int i = 0; i < cb.Items.Count; i++)
-            if (cb.Items[i] is DeviceItem di && di.Id == id) { cb.SelectedIndex = i; return; }
+        try
+        {
+            _notify = new DeviceNotify(OnAudioDevicesChanged);
+            _enum.RegisterEndpointNotificationCallback(_notify);
+        }
+        catch { }
+    }
+
+    // An endpoint appeared/vanished/changed state — refresh and re-pick actives.
+    void OnAudioDevicesChanged()
+    {
+        try { if (IsHandleCreated) BeginInvoke((Action)LoadDevices); }
+        catch { }
+    }
+
+    // All outputs we could rank, including unplugged/disabled ones, for the editor.
+    IReadOnlyList<OutputPref> AllKnownOutputs() =>
+        _enum.EnumerateAudioEndPoints(DataFlow.Render,
+                DeviceState.Active | DeviceState.Unplugged | DeviceState.Disabled)
+            .Select(d => new OutputPref { Id = d.ID, Name = d.FriendlyName })
+            .OrderBy(o => o.Name)
+            .ToList();
+
+    // The output the ranking alone would choose: highest-ranked present device.
+    string? AutoTarget(Axis a)
+    {
+        foreach (var p in a.Prefs)
+            if (_present.ContainsKey(p.Id)) return p.Id;
+        return null;
+    }
+
+    // The output to actually drive: a present manual override wins, else the
+    // ranking's auto target.
+    string? Resolve(Axis a) =>
+        a.OverrideId != null && _present.ContainsKey(a.OverrideId) ? a.OverrideId : AutoTarget(a);
+
+    // Resolve the active output for a fader and reflect it: select it in the combo
+    // (without tripping the override handler), load its remembered cap, and re-push.
+    void ApplyActive(Axis a)
+    {
+        string? id = Resolve(a);
+
+        _applyingActive = true;
+        SelectActiveInCombo(a.Combo, id);
+        _applyingActive = false;
+
+        if (id != a.ActiveId)
+        {
+            a.ActiveId = id;
+            bool prevLoad = _loadingSettings;
+            _loadingSettings = true;                 // setting the stepper isn't a manual cap edit
+            a.Limit.Value = MaxForDevice(id);
+            _loadingSettings = prevLoad;
+            a.LastApplied = -1;                      // force a re-push to the (possibly new) device
+        }
+        Render(a);
+    }
+
+    static void SelectActiveInCombo(ComboBox cb, string? id)
+    {
+        if (id != null)
+            for (int i = 0; i < cb.Items.Count; i++)
+                if (cb.Items[i] is DeviceItem di && di.Id == id)
+                { if (cb.SelectedIndex != i) cb.SelectedIndex = i; return; }
+        if (cb.SelectedIndex != -1) cb.SelectedIndex = -1;
     }
 
     void OnDevicePicked(Axis a)
     {
-        if (_loadingSettings) return;
+        if (_loadingSettings || _applyingActive) return;
+        // Manual pick from the main window. Picking the auto target (the device the
+        // ranking would choose) clears the override and returns to automatic; any
+        // other pick becomes an override that sticks until the user picks the auto
+        // target again or re-ranks the list in Options.
+        string? picked = (a.Combo.SelectedItem as DeviceItem)?.Id;
+        a.OverrideId = (picked != null && picked == AutoTarget(a)) ? null : picked;
+        ApplyActive(a);
         SaveSettings();
-        a.LastApplied = -1;
     }
 
     void OnLimitChanged(Axis a)
     {
-        if (!_loadingSettings) SaveSettings();
+        if (!_loadingSettings)
+        {
+            // Remember this cap against the output currently on this fader.
+            if ((a.Combo.SelectedItem as DeviceItem)?.Id is string id)
+                _deviceMax[id] = (int)a.Limit.Value;
+            SaveSettings();
+        }
         Render(a);
     }
+
+    // Remembered cap for an output (default 100% for outputs we haven't capped).
+    int MaxForDevice(string? id) =>
+        id != null && _deviceMax.TryGetValue(id, out int m) ? ClampLimit(m) : 100;
+
+    // Friendly name for an endpoint id if it's currently present, else the id.
+    string NameFor(string id) => _present.TryGetValue(id, out var di) ? di.Name : id;
+
+    static List<OutputPref> ClonePrefs(IEnumerable<OutputPref> src) =>
+        src.Select(p => new OutputPref { Id = p.Id, Name = p.Name }).ToList();
 
     // ---- settings ---------------------------------------------------------
 
@@ -708,14 +841,28 @@ public class MainForm : Form
             var s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(SettingsPath));
             if (s == null) return;
             _loadingSettings = true;
-            SelectById(_cbLeft, s.LeftDeviceId);
-            SelectById(_cbRight, s.RightDeviceId);
-            _limLeft.Value = ClampLimit(s.LeftMax);
-            _limRight.Value = ClampLimit(s.RightMax);
+            _deviceMax = s.DeviceMax != null ? new(s.DeviceMax) : new();
+            // Migrate the old single caps into the per-device map for the outputs
+            // they were last used with, so existing settings carry over.
+            if (s.LeftDeviceId != null && !_deviceMax.ContainsKey(s.LeftDeviceId)) _deviceMax[s.LeftDeviceId] = ClampLimit(s.LeftMax);
+            if (s.RightDeviceId != null && !_deviceMax.ContainsKey(s.RightDeviceId)) _deviceMax[s.RightDeviceId] = ClampLimit(s.RightMax);
+
+            // Ranked output lists (migrate the old single device id to a 1-entry list).
+            _left.Prefs = s.LeftOutputs != null ? new(s.LeftOutputs) : new();
+            _right.Prefs = s.RightOutputs != null ? new(s.RightOutputs) : new();
+            if (_left.Prefs.Count == 0 && s.LeftDeviceId != null) _left.Prefs.Add(new OutputPref { Id = s.LeftDeviceId, Name = NameFor(s.LeftDeviceId) });
+            if (_right.Prefs.Count == 0 && s.RightDeviceId != null) _right.Prefs.Add(new OutputPref { Id = s.RightDeviceId, Name = NameFor(s.RightDeviceId) });
+            _left.OverrideId = s.LeftOverrideId;
+            _right.OverrideId = s.RightOverrideId;
+
             if (s.LeftCal != null) ApplyCalibration(_left, s.LeftCal);
             if (s.RightCal != null) ApplyCalibration(_right, s.RightCal);
             _themeMode = s.ThemeMode;
             ApplyTheme(CurrentTheme());
+
+            // Drive the active output now that prefs/overrides are loaded.
+            ApplyActive(_left);
+            ApplyActive(_right);
         }
         catch { }
         finally { _loadingSettings = false; }
@@ -727,10 +874,15 @@ public class MainForm : Form
         {
             var s = new Settings
             {
-                LeftDeviceId = (_cbLeft.SelectedItem as DeviceItem)?.Id,
-                RightDeviceId = (_cbRight.SelectedItem as DeviceItem)?.Id,
+                LeftDeviceId = _left.ActiveId,    // legacy: the currently-driven output
+                RightDeviceId = _right.ActiveId,
                 LeftMax = (int)_limLeft.Value,
                 RightMax = (int)_limRight.Value,
+                DeviceMax = _deviceMax,
+                LeftOutputs = _left.Prefs,
+                RightOutputs = _right.Prefs,
+                LeftOverrideId = _left.OverrideId,
+                RightOverrideId = _right.OverrideId,
                 LeftCal = _left.Cal,
                 RightCal = _right.Cal,
                 ThemeMode = _themeMode,
@@ -749,7 +901,9 @@ public class MainForm : Form
     {
         using var dlg = new OptionsDialog(_theme, _themeMode, GetStartWithWindows(),
             _left.Cal.Clone(), _right.Cal.Clone(),
-            () => _left.LastRaw, () => _right.LastRaw);
+            () => _left.LastRaw, () => _right.LastRaw,
+            ClonePrefs(_left.Prefs), ClonePrefs(_right.Prefs),
+            AllKnownOutputs(), _present.Keys.ToArray());
         _calibrating = true;                 // stop driving devices while sweeping
         var result = dlg.ShowDialog(this);
         _calibrating = false;
@@ -757,6 +911,8 @@ public class MainForm : Form
         {
             ApplyCalibration(_left, dlg.LeftCal);
             ApplyCalibration(_right, dlg.RightCal);
+            ApplyOutputs(_left, dlg.LeftOutputs);
+            ApplyOutputs(_right, dlg.RightOutputs);
             _themeMode = dlg.SelectedTheme;
             ApplyTheme(CurrentTheme());
             SetStartWithWindows(dlg.StartWithWindows);
@@ -764,8 +920,17 @@ public class MainForm : Form
         }
         // Re-push the current position to the devices now that we're live again.
         _left.LastApplied = _right.LastApplied = -1;
-        Render(_left);
-        Render(_right);
+        ApplyActive(_left);
+        ApplyActive(_right);
+    }
+
+    // Adopt an edited ranked list. Re-ranking returns the fader to automatic
+    // (drops any manual override), per the agreed behaviour.
+    void ApplyOutputs(Axis a, List<OutputPref> prefs)
+    {
+        bool changed = !a.Prefs.Select(p => p.Id).SequenceEqual(prefs.Select(p => p.Id));
+        a.Prefs = prefs;
+        if (changed) a.OverrideId = null;
     }
 
     void ApplyCalibration(Axis a, Calibration c)

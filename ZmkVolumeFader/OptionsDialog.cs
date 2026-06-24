@@ -15,9 +15,14 @@ sealed class OptionsDialog : Form
     public Calibration RightCal => _cal[1];
     public bool StartWithWindows => _startup.Checked;
     public ThemeMode SelectedTheme => (ThemeMode)Math.Clamp(_themeCombo.SelectedIndex, 0, 2);
+    public List<OutputPref> LeftOutputs => _outputs[0];
+    public List<OutputPref> RightOutputs => _outputs[1];
 
     readonly Calibration[] _cal;
     readonly Func<int>[] _raw;
+    readonly List<OutputPref>[] _outputs;
+    readonly IReadOnlyList<OutputPref> _known;
+    readonly string[] _presentIds;
     readonly MainForm.Theme _t;
 
     readonly Label[] _rawLbl = new Label[2];
@@ -43,11 +48,16 @@ sealed class OptionsDialog : Form
     static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
     public OptionsDialog(MainForm.Theme theme, ThemeMode themeMode, bool startWithWindows,
-        Calibration left, Calibration right, Func<int> rawL, Func<int> rawR)
+        Calibration left, Calibration right, Func<int> rawL, Func<int> rawR,
+        List<OutputPref> leftOut, List<OutputPref> rightOut,
+        IReadOnlyList<OutputPref> known, IEnumerable<string> presentIds)
     {
         _t = theme;
         _cal = new[] { left, right };
         _raw = new[] { rawL, rawR };
+        _outputs = new[] { leftOut, rightOut };
+        _known = known;
+        _presentIds = presentIds.ToArray();
 
         Text = "Options";
         Font = new Font("Segoe UI", 9.75f);
@@ -55,7 +65,7 @@ sealed class OptionsDialog : Form
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(430, 652);
+        ClientSize = new Size(430, 694);
         BackColor = _t.Window;
 
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 6, Padding = new Padding(14), BackColor = Color.Transparent };
@@ -133,11 +143,11 @@ sealed class OptionsDialog : Form
 
     Panel BuildGeneral(ThemeMode mode, bool startup)
     {
-        var card = new Panel { Width = 398, Height = 90, Margin = new Padding(0, 0, 0, 4), Padding = new Padding(12), BackColor = _t.Card };
+        var card = new Panel { Width = 398, Height = 132, Margin = new Padding(0, 0, 0, 4), Padding = new Padding(12), BackColor = _t.Card };
 
-        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, BackColor = Color.Transparent };
+        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int r = 0; r < 2; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        for (int r = 0; r < 3; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         _startup.ForeColor = _t.Text;
         _startup.BackColor = Color.Transparent;
@@ -154,8 +164,24 @@ sealed class OptionsDialog : Form
         themeRow.Controls.Add(_themeCombo);
         t.Controls.Add(themeRow, 0, 1);
 
+        // Opens the ranked output-fallback editor for both faders.
+        var outBtn = MakeButton("Set Default Outputs…", accent: false, surround: _t.Card);
+        outBtn.Margin = new Padding(0, 10, 0, 0);
+        outBtn.Click += (_, _) => OpenOutputs();
+        t.Controls.Add(outBtn, 0, 2);
+
         card.Controls.Add(t);
         return card;
+    }
+
+    void OpenOutputs()
+    {
+        using var dlg = new OutputsDialog(_t, _outputs[0], _outputs[1], _known, _presentIds);
+        if (dlg.ShowDialog(this) == DialogResult.OK)
+        {
+            _outputs[0] = dlg.LeftOutputs;
+            _outputs[1] = dlg.RightOutputs;
+        }
     }
 
     Panel BuildFader(int i, string name)
