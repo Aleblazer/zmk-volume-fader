@@ -349,28 +349,54 @@ public class MainForm : Form
         public string? ActiveId;
     }
 
+    // One slider within a device profile (persisted). Max lives per-output in
+    // DeviceMax, not here.
+    sealed class SliderConfig
+    {
+        public int AxisIndex { get; set; }
+        public string Label { get; set; } = "";
+        public Calibration Cal { get; set; } = new();
+        public List<OutputPref> Outputs { get; set; } = new();
+        public string? OverrideId { get; set; }
+    }
+
+    // Everything remembered for one physical fader unit (its sliders, in order).
+    sealed class DeviceProfile
+    {
+        public string Name { get; set; } = "";
+        public List<SliderConfig> Sliders { get; set; } = new();
+    }
+
     sealed class Settings
     {
+        // Per-device layouts keyed by device identity (serial, else VID:PID).
+        public Dictionary<string, DeviceProfile> Devices { get; set; } = new();
+        // Per-output max-volume cap, keyed by audio endpoint id (global across
+        // devices — a given output's cap is the same whoever drives it).
+        public Dictionary<string, int> DeviceMax { get; set; } = new();
+        public ThemeMode ThemeMode { get; set; } = ThemeMode.Auto;
+
+        // Legacy pre-multi-slider flat fields, read once to migrate settings.json.
         public string? LeftDeviceId { get; set; }
         public string? RightDeviceId { get; set; }
-        public int LeftMax { get; set; } = 100;   // legacy fallback (pre per-device caps)
-        public int RightMax { get; set; } = 100;  // legacy fallback
-        // Per-output max-volume cap, keyed by audio endpoint id. The Max % stepper
-        // tracks the device currently chosen on each fader, so switching outputs
-        // restores that output's remembered cap (e.g. Maxwell 85%, IEMs 60%).
-        public Dictionary<string, int> DeviceMax { get; set; } = new();
-        // Ranked output preferences per fader, plus any manual override.
-        public List<OutputPref> LeftOutputs { get; set; } = new();
-        public List<OutputPref> RightOutputs { get; set; } = new();
+        public int LeftMax { get; set; } = 100;
+        public int RightMax { get; set; } = 100;
+        public List<OutputPref>? LeftOutputs { get; set; }
+        public List<OutputPref>? RightOutputs { get; set; }
         public string? LeftOverrideId { get; set; }
         public string? RightOverrideId { get; set; }
         public Calibration? LeftCal { get; set; }
         public Calibration? RightCal { get; set; }
-        public ThemeMode ThemeMode { get; set; } = ThemeMode.Auto;
     }
 
     // Live copy of Settings.DeviceMax (endpoint id -> cap %). Persisted on change.
     Dictionary<string, int> _deviceMax = new();
+    // Per-device profiles + the identity of the connected device whose profile is
+    // applied to the sliders. _legacyProfile seeds the first device from migrated
+    // old settings.
+    Dictionary<string, DeviceProfile> _devices = new();
+    string? _activeKey;
+    DeviceProfile? _legacyProfile;
 
     // Currently-present render endpoints (id -> item), rebuilt by LoadDevices.
     readonly Dictionary<string, DeviceItem> _present = new();
@@ -378,9 +404,12 @@ public class MainForm : Form
     // SelectedIndexChanged handler doesn't mistake it for a manual override.
     bool _applyingActive;
 
-    static string SettingsPath => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "ZmkVolumeFader", "settings.json");
+    static string SettingsDir => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ZmkVolumeFader");
+    // Multi-slider build uses its own file so it can't clobber the release build's
+    // settings.json; the old file is read once to migrate.
+    static string SettingsPath => Path.Combine(SettingsDir, "settings.v2.json");
+    static string LegacySettingsPath => Path.Combine(SettingsDir, "settings.json");
 
     // ---- controls ---------------------------------------------------------
 
@@ -886,64 +915,142 @@ public class MainForm : Form
     {
         try
         {
-            if (!File.Exists(SettingsPath)) return;
-            var s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(SettingsPath));
-            if (s == null) return;
             _loadingSettings = true;
+            // Prefer the multi-slider file; fall back to the release build's
+            // settings.json to migrate an existing setup on first run.
+            Settings? s = null;
+            if (File.Exists(SettingsPath)) s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(SettingsPath));
+            else if (File.Exists(LegacySettingsPath)) s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(LegacySettingsPath));
+            if (s == null) return;
+
             _deviceMax = s.DeviceMax != null ? new(s.DeviceMax) : new();
-            // Migrate the old single caps into the per-device map for the outputs
-            // they were last used with, so existing settings carry over.
-            if (s.LeftDeviceId != null && !_deviceMax.ContainsKey(s.LeftDeviceId)) _deviceMax[s.LeftDeviceId] = ClampLimit(s.LeftMax);
-            if (s.RightDeviceId != null && !_deviceMax.ContainsKey(s.RightDeviceId)) _deviceMax[s.RightDeviceId] = ClampLimit(s.RightMax);
-
-            // Ranked output lists (migrate the old single device id to a 1-entry list).
-            _left.Prefs = s.LeftOutputs != null ? new(s.LeftOutputs) : new();
-            _right.Prefs = s.RightOutputs != null ? new(s.RightOutputs) : new();
-            if (_left.Prefs.Count == 0 && s.LeftDeviceId != null) _left.Prefs.Add(new OutputPref { Id = s.LeftDeviceId, Name = NameFor(s.LeftDeviceId) });
-            if (_right.Prefs.Count == 0 && s.RightDeviceId != null) _right.Prefs.Add(new OutputPref { Id = s.RightDeviceId, Name = NameFor(s.RightDeviceId) });
-            _left.OverrideId = s.LeftOverrideId;
-            _right.OverrideId = s.RightOverrideId;
-
-            if (s.LeftCal != null) ApplyCalibration(_left, s.LeftCal);
-            if (s.RightCal != null) ApplyCalibration(_right, s.RightCal);
+            _devices = s.Devices != null ? new(s.Devices) : new();
             _themeMode = s.ThemeMode;
-            ApplyTheme(CurrentTheme());
 
-            // Drive the active output now that prefs/overrides are loaded.
-            ApplyActive(_left);
-            ApplyActive(_right);
+            // No per-device profiles yet but old flat settings present -> build a
+            // seed profile to apply to the first device that connects.
+            if (_devices.Count == 0 && (s.LeftOutputs != null || s.LeftDeviceId != null || s.LeftCal != null))
+                _legacyProfile = LegacyToProfile(s);
+
+            ApplyTheme(CurrentTheme());
         }
         catch { }
         finally { _loadingSettings = false; }
+    }
+
+    // Turn old flat Left/Right settings into a 2-slider profile (and carry the
+    // old per-output caps into DeviceMax).
+    DeviceProfile LegacyToProfile(Settings s)
+    {
+        SliderConfig Make(int axis, string label, string? devId, List<OutputPref>? outs, string? over, Calibration? cal, int max)
+        {
+            var cfg = new SliderConfig { AxisIndex = axis, Label = label, Cal = cal ?? new(), Outputs = outs != null ? new(outs) : new(), OverrideId = over };
+            if (cfg.Outputs.Count == 0 && devId != null) cfg.Outputs.Add(new OutputPref { Id = devId, Name = NameFor(devId) });
+            if (devId != null && !_deviceMax.ContainsKey(devId)) _deviceMax[devId] = ClampLimit(max);
+            return cfg;
+        }
+        return new DeviceProfile
+        {
+            Sliders =
+            {
+                Make(0, "Left fader", s.LeftDeviceId, s.LeftOutputs, s.LeftOverrideId, s.LeftCal, s.LeftMax),
+                Make(1, "Right fader", s.RightDeviceId, s.RightOutputs, s.RightOverrideId, s.RightCal, s.RightMax),
+            }
+        };
     }
 
     void SaveSettings()
     {
         try
         {
-            var s = new Settings
+            // Snapshot the live sliders into the connected device's profile.
+            if (_activeKey != null)
             {
-                LeftDeviceId = _left.ActiveId,    // legacy: the currently-driven output
-                RightDeviceId = _right.ActiveId,
-                LeftMax = (int)_left.Limit.Value,
-                RightMax = (int)_right.Limit.Value,
-                DeviceMax = _deviceMax,
-                LeftOutputs = _left.Prefs,
-                RightOutputs = _right.Prefs,
-                LeftOverrideId = _left.OverrideId,
-                RightOverrideId = _right.OverrideId,
-                LeftCal = _left.Cal,
-                RightCal = _right.Cal,
-                ThemeMode = _themeMode,
-            };
-            Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
+                string name = _devices.TryGetValue(_activeKey, out var ex) ? ex.Name : "";
+                _devices[_activeKey] = new DeviceProfile
+                {
+                    Name = name,
+                    Sliders = _sliders.Select(s => new SliderConfig
+                    {
+                        AxisIndex = s.AxisIndex,
+                        Label = s.Name.Text,
+                        Cal = s.Cal,
+                        Outputs = s.Prefs,
+                        OverrideId = s.OverrideId,
+                    }).ToList(),
+                };
+            }
+
+            var s = new Settings { Devices = _devices, DeviceMax = _deviceMax, ThemeMode = _themeMode };
+            Directory.CreateDirectory(SettingsDir);
             // Write to a temp file then swap it in, so a crash mid-write can't
-            // leave a half-written (corrupt) settings.json behind.
+            // leave a half-written (corrupt) file behind.
             string tmp = SettingsPath + ".tmp";
             File.WriteAllText(tmp, JsonSerializer.Serialize(s));
             File.Move(tmp, SettingsPath, overwrite: true);
         }
         catch { }
+    }
+
+    // ---- per-device profiles ----------------------------------------------
+
+    static string DeviceKey(HidDevice d)
+    {
+        string? serial = null;
+        try { serial = d.GetSerialNumber(); } catch { }
+        string vp = $"{d.VendorID:X4}:{d.ProductID:X4}";
+        return string.IsNullOrWhiteSpace(serial) ? vp : $"{vp}:{serial}";
+    }
+
+    // From the HID thread: a device connected. Switch to its profile on the UI.
+    void OnDeviceConnected(string key, string name)
+    {
+        if (!IsHandleCreated) return;
+        try { BeginInvoke(() => ActivateDevice(key, name)); }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
+    }
+
+    void ActivateDevice(string key, string name)
+    {
+        if (key == _activeKey) return;   // same unit reconnecting — keep state
+        _activeKey = key;
+        if (!_devices.TryGetValue(key, out var profile))
+        {
+            // First time we've seen this unit: seed from migrated settings, else
+            // a default two-slider layout. (The setup wizard refines this later.)
+            profile = _legacyProfile ?? new DeviceProfile { Sliders = DefaultSliders() };
+            _legacyProfile = null;
+            profile.Name = name;
+            _devices[key] = profile;
+        }
+        ApplyProfile(profile);
+        SaveSettings();
+    }
+
+    static List<SliderConfig> DefaultSliders() => new()
+    {
+        new SliderConfig { AxisIndex = 0, Label = "Left fader" },
+        new SliderConfig { AxisIndex = 1, Label = "Right fader" },
+    };
+
+    // Push a profile onto the live sliders. (Phase 2 keeps the slider count fixed
+    // at two; the wizard will rebuild the host to the profile's count.)
+    void ApplyProfile(DeviceProfile profile)
+    {
+        _loadingSettings = true;
+        int n = Math.Min(_sliders.Length, profile.Sliders.Count);
+        for (int i = 0; i < n; i++)
+        {
+            var cfg = profile.Sliders[i];
+            var s = _sliders[i];
+            s.AxisIndex = cfg.AxisIndex;
+            if (!string.IsNullOrEmpty(cfg.Label)) s.Name.Text = cfg.Label;
+            s.Prefs = ClonePrefs(cfg.Outputs);
+            s.OverrideId = cfg.OverrideId;
+            ApplyCalibration(s, cfg.Cal);
+        }
+        _loadingSettings = false;
+        foreach (var s in _sliders) ApplyActive(s);   // stepper cap comes from DeviceMax
     }
 
     static int ClampLimit(int pct) => Math.Clamp(pct, 1, 100);
@@ -1045,6 +1152,7 @@ public class MainForm : Form
             if (!dev.TryOpen(out HidStream stream)) { SetStatus("Found dongle, but couldn't open it", false); Thread.Sleep(1500); continue; }
 
             string devName; try { devName = dev.GetProductName(); } catch { devName = "ZMK keyboard"; }
+            OnDeviceConnected(DeviceKey(dev), devName);   // load this unit's profile
             SetStatus($"Connected to {devName}", true);
             using (stream)
             {
