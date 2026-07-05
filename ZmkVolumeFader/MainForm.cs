@@ -326,10 +326,12 @@ public class MainForm : Form
     /// <summary>Per-fader UI + filtering state.</summary>
     sealed class Axis
     {
-        public required ComboBox Combo;
+        public required RoundedComboBox Combo;
         public required FaderBar Bar;
         public required Label Pct;     // big "62%" readout
+        public required Label Name;    // "Left fader" heading
         public required Stepper Limit;
+        public required CardPanel Card;
         public int AxisIndex;                                 // which HID report axis (0..5) drives this slider
         public Calibration Cal = new();                       // value->% mapping (persisted)
         public (int v, int pct)[] Curve = Array.Empty<(int, int)>();  // built from Cal
@@ -382,25 +384,13 @@ public class MainForm : Form
 
     // ---- controls ---------------------------------------------------------
 
-    readonly RoundedComboBox _cbLeft = new() { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right };
-    readonly RoundedComboBox _cbRight = new() { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right };
-    readonly FaderBar _barLeft = new() { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
-    readonly FaderBar _barRight = new() { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
-    readonly Label _pctLeft = new() { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
-    readonly Label _pctRight = new() { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
-    readonly Label _nameLeft = new() { Text = "Left fader", AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
-    readonly Label _nameRight = new() { Text = "Right fader", AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
-    readonly Stepper _limLeft = new() { Minimum = 1, Maximum = 100, Value = 100 };
-    readonly Stepper _limRight = new() { Minimum = 1, Maximum = 100, Value = 100 };
     readonly RoundedButton _btnRefresh = new() { Text = "Refresh devices", AutoSize = true, Padding = new Padding(12, 6, 12, 6), Margin = new Padding(0) };
     readonly RoundedButton _btnOptions = new() { Text = "Options", AutoSize = true, Padding = new Padding(12, 6, 12, 6), Margin = new Padding(8, 0, 0, 0) };
     readonly Label _status = new() { Text = "Starting…", AutoSize = true, Anchor = AnchorStyles.Left };
     readonly Label _statusDot = new() { Text = "●", AutoSize = true, Font = new Font("Segoe UI", 8f), Margin = new Padding(0, 3, 6, 0) };
 
-    readonly CardPanel _cardL = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 134, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
-    readonly CardPanel _cardR = new() { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 134, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
-    TableLayoutPanel _tlL = null!, _tlR = null!, _footer = null!;
-    FlowLayoutPanel _maxL = null!, _maxR = null!;
+    // Slider cards are built dynamically into this scrollable host (one row each).
+    TableLayoutPanel _sliderHost = null!, _footer = null!;
 
     readonly MMDeviceEnumerator _enum = new();
     DeviceNotify? _notify;
@@ -432,20 +422,18 @@ public class MainForm : Form
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
 
-        _left = new Axis { Combo = _cbLeft, Bar = _barLeft, Pct = _pctLeft, Limit = _limLeft, AxisIndex = 0 };
-        _right = new Axis { Combo = _cbRight, Bar = _barRight, Pct = _pctRight, Limit = _limRight, AxisIndex = 1 };
-        _left.Curve = _left.Cal.BuildCurve();
-        _right.Curve = _right.Cal.BuildCurve();
-        _sliders = new[] { _left, _right };
+        // Build the sliders. The list is what makes the count arbitrary; a later
+        // phase sets it per device from the setup wizard. Two for now.
+        _sliders = new[] { BuildSlider(0, "Left fader"), BuildSlider(1, "Right fader") };
+        _left = _sliders[0];
+        _right = _sliders[1];
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(14), BackColor = Color.Transparent };
-        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int i = 0; i < 3; i++) root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        // Slider cards stack in a scrollable host; the footer stays pinned below.
+        _sliderHost = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, AutoScroll = true, BackColor = Color.Transparent, Margin = new Padding(0), Padding = new Padding(0) };
+        _sliderHost.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        PopulateSliderHost();
 
-        _tlL = BuildCard(_cardL, _nameLeft, _pctLeft, _barLeft, _cbLeft, out _maxL, _limLeft);
-        _tlR = BuildCard(_cardR, _nameRight, _pctRight, _barRight, _cbRight, out _maxR, _limRight);
-
-        _footer = new TableLayoutPanel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, AutoSize = true, ColumnCount = 2, RowCount = 1, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 0) };
+        _footer = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, RowCount = 1, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 0) };
         _footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         _footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         _btnRefresh.Click += (_, _) => LoadDevices();
@@ -459,18 +447,13 @@ public class MainForm : Form
         statusFlow.Controls.Add(_status);
         _footer.Controls.Add(statusFlow, 1, 0);
 
-        root.Controls.Add(_cardL, 0, 0);
-        root.Controls.Add(_cardR, 0, 1);
-        root.Controls.Add(_footer, 0, 2);
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Padding = new Padding(14), BackColor = Color.Transparent };
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));   // slider host (scrolls if needed)
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));       // footer (pinned)
+        root.Controls.Add(_sliderHost, 0, 0);
+        root.Controls.Add(_footer, 0, 1);
         Controls.Add(root);
-
-        _cbLeft.Placeholder = _cbRight.Placeholder = "No output selected";
-        _cbLeft.SelectedIndexChanged += (_, _) => OnDevicePicked(_left);
-        _cbRight.SelectedIndexChanged += (_, _) => OnDevicePicked(_right);
-        _cbLeft.DrawItem += OnComboDrawItem;
-        _cbRight.DrawItem += OnComboDrawItem;
-        _limLeft.ValueChanged += (_, _) => OnLimitChanged(_left);
-        _limRight.ValueChanged += (_, _) => OnLimitChanged(_right);
 
         var trayMenu = new ContextMenuStrip();
         trayMenu.Items.Add("Open", null, (_, _) => RestoreFromTray());
@@ -485,26 +468,52 @@ public class MainForm : Form
         FormClosing += OnFormClosing;
     }
 
-    // Lay out one fader card; returns the inner table and (via out) the Max group.
-    TableLayoutPanel BuildCard(CardPanel card, Label name, Label pct, FaderBar bar,
-                               ComboBox combo, out FlowLayoutPanel maxGroup, Stepper limit)
+    // (Re)build the slider host with one row per slider. Called on construction
+    // and whenever the slider set changes.
+    void PopulateSliderHost()
     {
+        _sliderHost.SuspendLayout();
+        _sliderHost.Controls.Clear();
+        _sliderHost.RowStyles.Clear();
+        _sliderHost.RowCount = _sliders.Length;
+        for (int i = 0; i < _sliders.Length; i++)
+        {
+            _sliderHost.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _sliderHost.Controls.Add(_sliders[i].Card, 0, i);
+        }
+        _sliderHost.ResumeLayout();
+    }
+
+    // Build one slider: its card, controls, and wiring, for the given HID axis.
+    Axis BuildSlider(int axisIndex, string name)
+    {
+        var combo = new RoundedComboBox { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right, Placeholder = "No output selected" };
+        var bar = new FaderBar { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
+        var pct = new Label { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
+        var nameLbl = new Label { Text = name, AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
+        var limit = new Stepper { Minimum = 1, Maximum = 100, Value = 100 };
+        var card = new CardPanel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 134, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
+
         var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // name / pct
         t.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));  // fader (track + ticks + knob)
         t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // combo / max
-
-        t.Controls.Add(name, 0, 0);
+        t.Controls.Add(nameLbl, 0, 0);
         t.Controls.Add(pct, 1, 0);
         t.Controls.Add(bar, 0, 1); t.SetColumnSpan(bar, 2);
         t.Controls.Add(combo, 0, 2);
-        maxGroup = MaxCap(limit);
-        t.Controls.Add(maxGroup, 1, 2);
-
+        t.Controls.Add(MaxCap(limit), 1, 2);
         card.Controls.Add(t);
-        return t;
+
+        var axis = new Axis { AxisIndex = axisIndex, Combo = combo, Bar = bar, Pct = pct, Name = nameLbl, Limit = limit, Card = card };
+        axis.Curve = axis.Cal.BuildCurve();
+
+        combo.SelectedIndexChanged += (_, _) => OnDevicePicked(axis);
+        combo.DrawItem += OnComboDrawItem;
+        limit.ValueChanged += (_, _) => OnLimitChanged(axis);
+        return axis;
     }
 
     static FlowLayoutPanel MaxCap(Stepper n)
@@ -576,27 +585,29 @@ public class MainForm : Form
         _theme = t;
         BackColor = t.Window;
         _footer.BackColor = Color.Transparent;
-        foreach (var card in new[] { _cardL, _cardR }) card.BackColor = t.Card;
-        foreach (var tl in new Control[] { _tlL, _tlR, _maxL, _maxR }) tl.BackColor = Color.Transparent;
 
-        foreach (var b in new[] { _barLeft, _barRight })
+        foreach (var s in _sliders)
         {
+            s.Card.BackColor = t.Card;
+
+            var b = s.Bar;
             b.Track = t.Inset; b.Fill = t.Accent; b.BackColor = t.Card;
             b.Knob = t.Dark ? Hex(0xE6, 0xE8, 0xEB) : Hex(0xFF, 0xFF, 0xFF);
             b.KnobEdge = t.Dark ? Hex(0x0E, 0x10, 0x14) : Hex(0xC2, 0xC6, 0xCC);
             b.Tick = t.Subtle;
             b.Invalidate();
-        }
-        foreach (var c in new[] { _cbLeft, _cbRight })
-        {
+
+            var c = s.Combo;
             c.BackColor = t.CtlBg; c.ForeColor = t.Text;            // popup list colours
             c.Surround = t.Card; c.BoxColor = t.CtlBg; c.BorderColor = t.CtlBorder; c.ChevronColor = t.Subtle;
             c.PlaceholderColor = t.Subtle;
             // Win10+ dark combo: themes the (still-native) dropdown list.
             if (c.IsHandleCreated) SetWindowTheme(c.Handle, t.Dark ? "DarkMode_CFD" : null, null);
             c.Invalidate();
+
+            var u = s.Limit;
+            u.BackColor = t.CtlBg; u.ForeColor = t.Text; u.BorderColor = t.CtlBorder; u.ChevronColor = t.Subtle; u.Surround = t.Card; u.Invalidate();
         }
-        foreach (var u in new[] { _limLeft, _limRight }) { u.BackColor = t.CtlBg; u.ForeColor = t.Text; u.BorderColor = t.CtlBorder; u.ChevronColor = t.Subtle; u.Surround = t.Card; u.Invalidate(); }
         foreach (var btn in new[] { _btnRefresh, _btnOptions })
         {
             btn.BackColor = t.CtlBg;
@@ -608,7 +619,7 @@ public class MainForm : Form
 
         // Most labels are muted; the big % is primary, the status dot is accent.
         WalkLabels(this, l => { l.ForeColor = t.Subtle; l.BackColor = Color.Transparent; });
-        _pctLeft.ForeColor = _pctRight.ForeColor = t.Text;
+        foreach (var s in _sliders) s.Pct.ForeColor = t.Text;
         _statusDot.ForeColor = t.Accent;
 
         SetTitleBarDark(t.Dark);
@@ -742,8 +753,9 @@ public class MainForm : Form
         // SelectedIndexChanged -> OnDevicePicked with no selection, wiping the
         // manual override. Suppress that here; ApplyActive re-selects deliberately.
         _applyingActive = true;
-        foreach (var cb in new[] { _cbLeft, _cbRight })
+        foreach (var s in _sliders)
         {
+            var cb = s.Combo;
             cb.BeginUpdate();
             cb.Items.Clear();
             cb.Items.AddRange(items);
@@ -752,8 +764,7 @@ public class MainForm : Form
         _applyingActive = false;
 
         // Re-pick the active output for each fader against the new device set.
-        ApplyActive(_left);
-        ApplyActive(_right);
+        foreach (var s in _sliders) ApplyActive(s);
 
         foreach (var it in stale) { try { it.Device.Dispose(); } catch { } }
     }
@@ -914,8 +925,8 @@ public class MainForm : Form
             {
                 LeftDeviceId = _left.ActiveId,    // legacy: the currently-driven output
                 RightDeviceId = _right.ActiveId,
-                LeftMax = (int)_limLeft.Value,
-                RightMax = (int)_limRight.Value,
+                LeftMax = (int)_left.Limit.Value,
+                RightMax = (int)_right.Limit.Value,
                 DeviceMax = _deviceMax,
                 LeftOutputs = _left.Prefs,
                 RightOutputs = _right.Prefs,
