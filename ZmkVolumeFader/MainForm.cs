@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -11,6 +12,9 @@ namespace ZmkVolumeFader;
 
 /// <summary>How the UI picks its palette: follow Windows, or force one.</summary>
 internal enum ThemeMode { Auto, Light, Dark }
+
+/// <summary>What a slider controls: an output device's volume, or an app's.</summary>
+internal enum TargetKind { Output, App }
 
 /// <summary>
 /// Reads a ZMK dongle's hid-io fader report (vendor page 0xFF00, report id 2:
@@ -333,6 +337,17 @@ public class MainForm : Form
         public override string ToString() => Name;
     }
 
+    // A target that is an application's volume (a Windows mixer session), keyed by
+    // executable/process name (or "#system" for System Sounds).
+    sealed class AppItem
+    {
+        public required string Key;
+        public required string Name;
+        public override string ToString() => Name;
+    }
+
+    const string SystemAppKey = "#system";
+
     // Fires a callback whenever the set of audio endpoints changes (plug/unplug,
     // enable/disable) so the app can re-pick each fader's active output live.
     // Callbacks arrive on an MMDevice thread; the handler marshals to the UI.
@@ -371,6 +386,11 @@ public class MainForm : Form
         public List<OutputPref> Prefs = new();
         public string? OverrideId;
         public string? ActiveId;
+
+        // Output vs app target. When App, AppKey names the app (process name) and
+        // the ranked-output machinery above is unused.
+        public TargetKind Target;
+        public string? AppKey;
     }
 
     // One slider within a device profile (persisted). Max lives per-output in
@@ -382,6 +402,9 @@ public class MainForm : Form
         public Calibration Cal { get; set; } = new();
         public List<OutputPref> Outputs { get; set; } = new();
         public string? OverrideId { get; set; }
+        public TargetKind Target { get; set; }
+        public string? AppKey { get; set; }
+        public int Max { get; set; } = 100;   // per-slider cap (used for app targets)
     }
 
     // Everything remembered for one physical fader unit (its sliders, in order).
@@ -398,6 +421,9 @@ public class MainForm : Form
         // Per-output max-volume cap, keyed by audio endpoint id (global across
         // devices — a given output's cap is the same whoever drives it).
         public Dictionary<string, int> DeviceMax { get; set; } = new();
+        // Every app ever seen in the mixer (process-name key -> display name), so
+        // an app can be assigned to a slider even while it's closed.
+        public Dictionary<string, string> KnownApps { get; set; } = new();
         public ThemeMode ThemeMode { get; set; } = ThemeMode.Auto;
 
         // Legacy pre-multi-slider flat fields, read once to migrate settings.json.
@@ -421,6 +447,14 @@ public class MainForm : Form
     Dictionary<string, DeviceProfile> _devices = new();
     string? _activeKey;
     DeviceProfile? _legacyProfile;
+
+    // App-volume tracking. _knownApps is every app ever seen in the mixer
+    // (persisted, keyed by process name); _appSessions is the live sessions per
+    // app, refreshed by the poll timer; the target combos list both outputs and
+    // known apps.
+    readonly Dictionary<string, string> _knownApps = new();
+    Dictionary<string, List<AudioSessionControl>> _appSessions = new();
+    readonly System.Windows.Forms.Timer _sessionPoll = new() { Interval = 1000 };
 
     // Currently-present render endpoints (id -> item), rebuilt by LoadDevices.
     readonly Dictionary<string, DeviceItem> _present = new();
@@ -524,7 +558,7 @@ public class MainForm : Form
 
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) MinimizeToTray(); };
 
-        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); StartHid(); RegisterDeviceNotifications(); };
+        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); };
         FormClosing += OnFormClosing;
     }
 
@@ -547,7 +581,7 @@ public class MainForm : Form
     // Build one slider: its card, controls, and wiring, for the given HID axis.
     Axis BuildSlider(int axisIndex, string name)
     {
-        var combo = new RoundedComboBox { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right, Placeholder = "No output selected" };
+        var combo = new RoundedComboBox { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right, Placeholder = "No target selected" };
         var bar = new FaderBar { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
         var pct = new Label { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
         var nameLbl = new Label { Text = name, AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
@@ -707,8 +741,17 @@ public class MainForm : Form
         using (var b = new SolidBrush(bg)) e.Graphics.FillRectangle(b, e.Bounds);
         if (e.Index >= 0)
         {
+            var item = cb.Items[e.Index];
             var r = new Rectangle(e.Bounds.X + 4, e.Bounds.Y, e.Bounds.Width - 6, e.Bounds.Height);
-            TextRenderer.DrawText(e.Graphics, cb.GetItemText(cb.Items[e.Index]), cb.Font, r, fg,
+            // Tag app entries so they're distinguishable from output devices.
+            if (item is AppItem)
+            {
+                Color tag = hi ? fg : _theme.Subtle;
+                TextRenderer.DrawText(e.Graphics, "app", cb.Font, r, tag,
+                    TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
+                r.Width -= 30;
+            }
+            TextRenderer.DrawText(e.Graphics, cb.GetItemText(item), cb.Font, r, fg,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
         }
     }
@@ -777,6 +820,8 @@ public class MainForm : Form
         }
         _deviceDebounce.Stop();
         _deviceDebounce.Dispose();
+        _sessionPoll.Stop();
+        _sessionPoll.Dispose();
         // Release the audio COM wrappers we're holding.
         foreach (var it in _present.Values) { try { it.Device.Dispose(); } catch { } }
         _present.Clear();
@@ -809,24 +854,35 @@ public class MainForm : Form
         _present.Clear();
         foreach (var it in items) _present[it.Id] = it;
 
-        // Clearing the items resets the combo selection and would otherwise fire
-        // SelectedIndexChanged -> OnDevicePicked with no selection, wiping the
-        // manual override. Suppress that here; ApplyActive re-selects deliberately.
+        PopulateCombos();
+
+        foreach (var it in stale) { try { it.Device.Dispose(); } catch { } }
+    }
+
+    // Fill each slider's target combo with present output devices, then every
+    // known app, and re-select each slider's active target. Rebuilt on device or
+    // app changes.
+    void PopulateCombos()
+    {
+        var devs = _present.Values.OrderBy(d => d.Name).Cast<object>().ToArray();
+        var apps = _knownApps.OrderBy(k => k.Value, StringComparer.OrdinalIgnoreCase)
+            .Select(k => (object)new AppItem { Key = k.Key, Name = k.Value }).ToArray();
+
+        // Clearing items resets the combo selection and would otherwise fire
+        // OnDevicePicked with no selection; suppress that (ApplyActive re-selects).
         _applyingActive = true;
         foreach (var s in _sliders)
         {
             var cb = s.Combo;
             cb.BeginUpdate();
             cb.Items.Clear();
-            cb.Items.AddRange(items);
+            cb.Items.AddRange(devs);
+            cb.Items.AddRange(apps);
             cb.EndUpdate();
         }
         _applyingActive = false;
 
-        // Re-pick the active output for each fader against the new device set.
         foreach (var s in _sliders) ApplyActive(s);
-
-        foreach (var it in stale) { try { it.Device.Dispose(); } catch { } }
     }
 
     void RegisterDeviceNotifications()
@@ -861,6 +917,82 @@ public class MainForm : Form
             .OrderBy(o => o.Name)
             .ToList();
 
+    // ---- app volume (audio sessions) --------------------------------------
+
+    void StartSessionPoll()
+    {
+        _sessionPoll.Tick += (_, _) => PollSessions();
+        _sessionPoll.Start();
+        PollSessions();
+    }
+
+    // Enumerate every render endpoint's audio sessions, group live sessions by
+    // app, and learn any app we haven't seen before (persisted). Refreshes the
+    // target combos and re-drives app sliders when the app set changes.
+    void PollSessions()
+    {
+        var byApp = new Dictionary<string, List<AudioSessionControl>>();
+        bool learned = false;
+        foreach (var di in _present.Values)
+        {
+            SessionCollection sessions;
+            try
+            {
+                var mgr = di.Device.AudioSessionManager;
+                mgr.RefreshSessions();
+                sessions = mgr.Sessions;
+            }
+            catch { continue; }
+
+            for (int i = 0; i < sessions.Count; i++)
+            {
+                string key, name;
+                try
+                {
+                    var sc = sessions[i];
+                    if (sc.State == AudioSessionState.AudioSessionStateExpired) continue;
+                    if (sc.IsSystemSoundsSession) { key = SystemAppKey; name = "System sounds"; }
+                    else
+                    {
+                        var k = AppKeyForPid((int)sc.GetProcessID, out name);
+                        if (k == null) continue;
+                        key = k;
+                    }
+                    if (!byApp.TryGetValue(key, out var list)) byApp[key] = list = new();
+                    list.Add(sc);
+                }
+                catch { continue; }
+                if (!_knownApps.ContainsKey(key)) { _knownApps[key] = name; learned = true; }
+            }
+        }
+        _appSessions = byApp;
+
+        if (learned) { SaveSettings(); PopulateCombos(); }
+        // Push app-targeted sliders in case their sessions just (re)appeared.
+        foreach (var s in _sliders)
+            if (s.Target == TargetKind.App) { s.LastApplied = -1; Render(s); }
+    }
+
+    // App identity key (lowercased process name) + a friendly display name.
+    static string? AppKeyForPid(int pid, out string name)
+    {
+        name = "";
+        if (pid <= 0) return null;
+        try
+        {
+            using var p = Process.GetProcessById(pid);
+            name = p.ProcessName;
+            try
+            {
+                var fd = p.MainModule?.FileVersionInfo.FileDescription;
+                if (!string.IsNullOrWhiteSpace(fd)) name = fd!;
+            }
+            catch { }
+            return p.ProcessName.ToLowerInvariant();
+        }
+        catch { return null; }
+    }
+
     // The output the ranking alone would choose: highest-ranked present device.
     string? AutoTarget(Axis a)
     {
@@ -874,10 +1006,20 @@ public class MainForm : Form
     string? Resolve(Axis a) =>
         a.OverrideId != null && _present.ContainsKey(a.OverrideId) ? a.OverrideId : AutoTarget(a);
 
-    // Resolve the active output for a fader and reflect it: select it in the combo
-    // (without tripping the override handler), load its remembered cap, and re-push.
+    // Reflect a slider's active target in its combo and re-push. App targets just
+    // select the app; output targets resolve the ranked list and load the cap.
     void ApplyActive(Axis a)
     {
+        if (a.Target == TargetKind.App)
+        {
+            _applyingActive = true;
+            SelectAppInCombo(a.Combo, a.AppKey);
+            _applyingActive = false;
+            a.ActiveId = null;
+            Render(a);
+            return;
+        }
+
         string? id = Resolve(a);
 
         _applyingActive = true;
@@ -905,14 +1047,32 @@ public class MainForm : Form
         if (cb.SelectedIndex != -1) cb.SelectedIndex = -1;
     }
 
+    static void SelectAppInCombo(ComboBox cb, string? key)
+    {
+        if (key != null)
+            for (int i = 0; i < cb.Items.Count; i++)
+                if (cb.Items[i] is AppItem ai && ai.Key == key)
+                { if (cb.SelectedIndex != i) cb.SelectedIndex = i; return; }
+        if (cb.SelectedIndex != -1) cb.SelectedIndex = -1;
+    }
+
     void OnDevicePicked(Axis a)
     {
         if (_loadingSettings || _applyingActive) return;
-        // Manual pick from the main window. Picking the auto target (the device the
-        // ranking would choose) clears the override and returns to automatic; any
-        // other pick becomes an override that sticks until the user picks the auto
-        // target again or re-ranks the list in Options.
-        string? picked = (a.Combo.SelectedItem as DeviceItem)?.Id;
+        var item = a.Combo.SelectedItem;
+        if (item is AppItem app)
+        {
+            // Switch this slider to controlling an app's volume (everywhere it plays).
+            a.Target = TargetKind.App;
+            a.AppKey = app.Key;
+            ApplyActive(a);
+            SaveSettings();
+            return;
+        }
+        // Output pick. Picking the auto target (the device the ranking would
+        // choose) clears the override; any other pick becomes an override.
+        a.Target = TargetKind.Output;
+        string? picked = (item as DeviceItem)?.Id;
         a.OverrideId = (picked != null && picked == AutoTarget(a)) ? null : picked;
         ApplyActive(a);
         SaveSettings();
@@ -922,8 +1082,9 @@ public class MainForm : Form
     {
         if (!_loadingSettings)
         {
-            // Remember this cap against the output currently on this fader.
-            if ((a.Combo.SelectedItem as DeviceItem)?.Id is string id)
+            // Output sliders remember the cap per output; app sliders keep it in
+            // the slider's own config (persisted via SaveSettings).
+            if (a.Target == TargetKind.Output && (a.Combo.SelectedItem as DeviceItem)?.Id is string id)
                 _deviceMax[id] = (int)a.Limit.Value;
             SaveSettings();
         }
@@ -956,6 +1117,8 @@ public class MainForm : Form
 
             _deviceMax = s.DeviceMax != null ? new(s.DeviceMax) : new();
             _devices = s.Devices != null ? new(s.Devices) : new();
+            _knownApps.Clear();
+            if (s.KnownApps != null) foreach (var kv in s.KnownApps) _knownApps[kv.Key] = kv.Value;
             _themeMode = s.ThemeMode;
 
             // No per-device profiles yet but old flat settings present -> build a
@@ -1008,11 +1171,14 @@ public class MainForm : Form
                         Cal = s.Cal,
                         Outputs = s.Prefs,
                         OverrideId = s.OverrideId,
+                        Target = s.Target,
+                        AppKey = s.AppKey,
+                        Max = (int)s.Limit.Value,
                     }).ToList(),
                 };
             }
 
-            var s = new Settings { Devices = _devices, DeviceMax = _deviceMax, ThemeMode = _themeMode };
+            var s = new Settings { Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), ThemeMode = _themeMode };
             Directory.CreateDirectory(SettingsDir);
             // Write to a temp file then swap it in, so a crash mid-write can't
             // leave a half-written (corrupt) file behind.
@@ -1084,10 +1250,13 @@ public class MainForm : Form
             if (!string.IsNullOrEmpty(cfg.Label)) s.Name.Text = cfg.Label;
             s.Prefs = ClonePrefs(cfg.Outputs);
             s.OverrideId = cfg.OverrideId;
+            s.Target = cfg.Target;
+            s.AppKey = cfg.AppKey;
+            if (cfg.Target == TargetKind.App) s.Limit.Value = ClampLimit(cfg.Max);
             ApplyCalibration(s, cfg.Cal);
         }
         _loadingSettings = false;
-        foreach (var s in _sliders) ApplyActive(s);   // stepper cap comes from DeviceMax
+        foreach (var s in _sliders) ApplyActive(s);   // output cap comes from DeviceMax
     }
 
     // Rebuild the on-screen sliders from a profile's slider set (count, axes,
@@ -1101,6 +1270,9 @@ public class MainForm : Form
             var a = BuildSlider(c.AxisIndex, string.IsNullOrEmpty(c.Label) ? $"Fader {i + 1}" : c.Label);
             a.Prefs = ClonePrefs(c.Outputs);
             a.OverrideId = c.OverrideId;
+            a.Target = c.Target;
+            a.AppKey = c.AppKey;
+            if (c.Target == TargetKind.App) { _loadingSettings = true; a.Limit.Value = ClampLimit(c.Max); _loadingSettings = false; }
             ApplyCalibration(a, c.Cal);
             return a;
         }).ToArray();
@@ -1326,16 +1498,24 @@ public class MainForm : Form
 
         if (applied == a.LastApplied) return;
         a.LastApplied = applied;
-        if (_calibrating) return;   // visualize, but don't drive the device while calibrating
-        // Each fader drives the volume of its own active output. Nothing stops
-        // both faders from resolving to the *same* endpoint (e.g. both lists top
-        // out at the same device); if that happens they both write that device's
-        // volume and the most recent move wins. That's intentional/by-design — the
-        // faders are independent controllers, so point them at different outputs
-        // to use them independently.
-        if (a.Combo.SelectedItem is DeviceItem di)
+        if (_calibrating) return;   // visualize, but don't drive anything while calibrating
+
+        float scalar = applied / 100f;
+        if (a.Target == TargetKind.App)
         {
-            try { di.Device.AudioEndpointVolume.MasterVolumeLevelScalar = applied / 100f; }
+            // Drive the app's volume on every output it's currently playing to.
+            // Nothing is driven when the app has no live session (it takes effect
+            // as soon as one appears — see PollSessions).
+            if (a.AppKey != null && _appSessions.TryGetValue(a.AppKey, out var list))
+                foreach (var sc in list)
+                { try { sc.SimpleAudioVolume.Volume = scalar; } catch { } }
+        }
+        // Each fader drives its own active output. If two sliders resolve to the
+        // same endpoint they both write its volume (last move wins) — by design,
+        // so point them at different outputs to use them independently.
+        else if (a.Combo.SelectedItem is DeviceItem di)
+        {
+            try { di.Device.AudioEndpointVolume.MasterVolumeLevelScalar = scalar; }
             catch { }
         }
     }
