@@ -17,6 +17,8 @@ sealed class OptionsDialog : Form
     public ThemeMode SelectedTheme => (ThemeMode)Math.Clamp(_themeCombo.SelectedIndex, 0, 2);
     public List<OutputPref> LeftOutputs => _outputs[0];
     public List<OutputPref> RightOutputs => _outputs[1];
+    // Set when the user clicks "Set up sliders…"; the owner runs the wizard.
+    public bool SetupRequested { get; private set; }
 
     readonly Calibration[] _cal;
     readonly Func<int>[] _raw;
@@ -163,11 +165,17 @@ sealed class OptionsDialog : Form
         themeRow.Controls.Add(_themeCombo);
         t.Controls.Add(themeRow, 0, 1);
 
-        // Opens the ranked output-fallback editor for both faders.
+        // Setup wizard + the ranked output-fallback editor, side by side.
+        var btnRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
+        var setupBtn = MakeButton("Set up sliders…", accent: false, surround: _t.Card);
+        setupBtn.Margin = new Padding(0);
+        setupBtn.Click += (_, _) => { SetupRequested = true; DialogResult = DialogResult.OK; Close(); };
         var outBtn = MakeButton("Set Default Outputs…", accent: false, surround: _t.Card);
-        outBtn.Margin = new Padding(0, 10, 0, 0);
+        outBtn.Margin = new Padding(8, 0, 0, 0);
         outBtn.Click += (_, _) => OpenOutputs();
-        t.Controls.Add(outBtn, 0, 2);
+        btnRow.Controls.Add(setupBtn);
+        btnRow.Controls.Add(outBtn);
+        t.Controls.Add(btnRow, 0, 2);
 
         card.Controls.Add(t);
         return card;

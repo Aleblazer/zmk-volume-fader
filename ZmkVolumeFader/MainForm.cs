@@ -451,9 +451,11 @@ public class MainForm : Form
     readonly System.Windows.Forms.Timer _deviceDebounce = new() { Interval = 250 };
 
     Axis _left = null!, _right = null!;
-    // All sliders in axis order. Phase 1 keeps the fixed two; later phases make
-    // this list dynamic (per-device count from the setup wizard).
+    // All sliders in axis order (count comes from the active device profile).
     Axis[] _sliders = Array.Empty<Axis>();
+    // Latest raw value per HID axis (0..5), independent of the slider mapping —
+    // the setup wizard reads this to detect which fader is being moved.
+    readonly int[] _lastAxisRaw = new int[MaxAxes];
 
     Thread? _hidThread;
     volatile bool _run;
@@ -1043,17 +1045,23 @@ public class MainForm : Form
     {
         if (key == _activeKey) return;   // same unit reconnecting — keep state
         _activeKey = key;
+        bool freshDefault = false;
         if (!_devices.TryGetValue(key, out var profile))
         {
-            // First time we've seen this unit: seed from migrated settings, else
-            // a default two-slider layout. (The setup wizard refines this later.)
-            profile = _legacyProfile ?? new DeviceProfile { Sliders = DefaultSliders() };
-            _legacyProfile = null;
+            // First time we've seen this unit: seed from migrated settings, else a
+            // default two-slider layout that the setup wizard can refine.
+            if (_legacyProfile != null) { profile = _legacyProfile; _legacyProfile = null; }
+            else { profile = new DeviceProfile { Sliders = DefaultSliders() }; freshDefault = true; }
             profile.Name = name;
             _devices[key] = profile;
         }
-        ApplyProfile(profile);
+        // Rebuild the cards if this unit's slider count differs from what's shown.
+        if (profile.Sliders.Count > 0 && profile.Sliders.Count != _sliders.Length)
+            RebuildSliders(profile.Sliders);
+        else
+            ApplyProfile(profile);
         SaveSettings();
+        if (freshDefault) PromptSetup(name);
     }
 
     static List<SliderConfig> DefaultSliders() => new()
@@ -1082,6 +1090,69 @@ public class MainForm : Form
         foreach (var s in _sliders) ApplyActive(s);   // stepper cap comes from DeviceMax
     }
 
+    // Rebuild the on-screen sliders from a profile's slider set (count, axes,
+    // labels, calibration, outputs). Used by the setup wizard and when a connected
+    // unit's layout differs from what's shown.
+    void RebuildSliders(List<SliderConfig> configs)
+    {
+        var old = _sliders;
+        _sliders = configs.Select((c, i) =>
+        {
+            var a = BuildSlider(c.AxisIndex, string.IsNullOrEmpty(c.Label) ? $"Fader {i + 1}" : c.Label);
+            a.Prefs = ClonePrefs(c.Outputs);
+            a.OverrideId = c.OverrideId;
+            ApplyCalibration(a, c.Cal);
+            return a;
+        }).ToArray();
+        if (_sliders.Length == 0) _sliders = new[] { BuildSlider(0, "Fader 1") };
+        _left = _sliders[0];
+        _right = _sliders.Length > 1 ? _sliders[1] : _sliders[0];
+
+        PopulateSliderHost();
+        ApplyTheme(CurrentTheme());
+
+        // Grow the window to fit the cards, up to a cap (the host scrolls beyond).
+        const int per = 146, chrome = 70;   // card+margin, footer+padding
+        ClientSize = new Size(ClientSize.Width, Math.Clamp(_sliders.Length * per + chrome, 280, 720));
+
+        LoadDevices();   // repopulate combos + re-pick active outputs
+        foreach (var s in old) s.Card.Dispose();
+    }
+
+    // Run the guided setup: move each fader to detect its axis and capture travel.
+    void RunSetupWizard()
+    {
+        bool prev = _calibrating;
+        _calibrating = true;   // don't drive outputs mid-sweep
+        using (var dlg = new SetupDialog(_theme, () => (int[])_lastAxisRaw.Clone()))
+        {
+            var result = dlg.ShowDialog(this);
+            _calibrating = prev;
+            if (result == DialogResult.OK && dlg.Result.Count > 0)
+            {
+                var configs = dlg.Result.Select((r, i) => new SliderConfig
+                {
+                    AxisIndex = r.Axis,
+                    Label = $"Fader {i + 1}",
+                    Cal = new Calibration { Min = r.Min, Max = r.Max, Taper = TaperKind.Linear },
+                }).ToList();
+                if (_activeKey != null && _devices.TryGetValue(_activeKey, out var p)) p.Sliders = configs;
+                RebuildSliders(configs);
+                SaveSettings();
+            }
+        }
+        foreach (var s in _sliders) { s.LastApplied = -1; ApplyActive(s); }
+    }
+
+    void PromptSetup(string name)
+    {
+        var r = MessageBox.Show(this,
+            $"New fader device “{name}” detected.\n\nRun setup to map its faders? " +
+            "You'll move each fader fully bottom-to-top so the app can detect it and capture its range.",
+            "ZMK Volume Fader", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (r == DialogResult.Yes) RunSetupWizard();
+    }
+
     static int ClampLimit(int pct) => Math.Clamp(pct, 1, 100);
 
     // ---- options ----------------------------------------------------------
@@ -1106,11 +1177,10 @@ public class MainForm : Form
             ApplyTheme(CurrentTheme());
             SetStartWithWindows(dlg.StartWithWindows);
             SaveSettings();
+            if (dlg.SetupRequested) { RunSetupWizard(); return; }
         }
         // Re-push the current position to the devices now that we're live again.
-        _left.LastApplied = _right.LastApplied = -1;
-        ApplyActive(_left);
-        ApplyActive(_right);
+        foreach (var s in _sliders) { s.LastApplied = -1; ApplyActive(s); }
     }
 
     // Adopt an edited ranked list. Re-ranking returns the fader to automatic
@@ -1220,6 +1290,7 @@ public class MainForm : Form
         {
             BeginInvoke(() =>
             {
+                for (int i = 0; i < axes.Length && i < MaxAxes; i++) _lastAxisRaw[i] = axes[i];
                 foreach (var s in _sliders)
                     if (s.AxisIndex < axes.Length) ApplyAxis(s, axes[s.AxisIndex]);
             });
