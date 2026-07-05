@@ -421,9 +421,11 @@ public class MainForm : Form
         // Per-output max-volume cap, keyed by audio endpoint id (global across
         // devices — a given output's cap is the same whoever drives it).
         public Dictionary<string, int> DeviceMax { get; set; } = new();
-        // Every app ever seen in the mixer (process-name key -> display name), so
-        // an app can be assigned to a slider even while it's closed.
+        // process-name key -> display name for every app we've seen a session for.
         public Dictionary<string, string> KnownApps { get; set; } = new();
+        // Subset actually shown as targets: apps that have presented in the mixer
+        // (rendered audio / system sounds), so background-only sessions are hidden.
+        public List<string> MixerApps { get; set; } = new();
         public ThemeMode ThemeMode { get; set; } = ThemeMode.Auto;
 
         // Legacy pre-multi-slider flat fields, read once to migrate settings.json.
@@ -453,6 +455,7 @@ public class MainForm : Form
     // app, refreshed by the poll timer; the target combos list both outputs and
     // known apps.
     readonly Dictionary<string, string> _knownApps = new();
+    readonly HashSet<string> _mixerApps = new();   // apps that have presented in the mixer
     Dictionary<string, List<AudioSessionControl>> _appSessions = new();
     readonly System.Windows.Forms.Timer _sessionPoll = new() { Interval = 1000 };
 
@@ -865,8 +868,13 @@ public class MainForm : Form
     void PopulateCombos()
     {
         var devs = _present.Values.OrderBy(d => d.Name).Cast<object>().ToArray();
-        var apps = _knownApps.OrderBy(k => k.Value, StringComparer.OrdinalIgnoreCase)
-            .Select(k => (object)new AppItem { Key = k.Key, Name = k.Value }).ToArray();
+        // Show mixer apps plus any app already assigned to a slider (so an
+        // assignment never disappears even if the app isn't presenting right now).
+        var assigned = _sliders.Where(s => s.Target == TargetKind.App && s.AppKey != null).Select(s => s.AppKey!);
+        var apps = _mixerApps.Concat(assigned).Distinct()
+            .Select(k => new AppItem { Key = k, Name = _knownApps.TryGetValue(k, out var nm) ? nm : k })
+            .OrderBy(a => a.Name, StringComparer.OrdinalIgnoreCase)
+            .Cast<object>().ToArray();
 
         // Clearing items resets the combo selection and would otherwise fire
         // OnDevicePicked with no selection; suppress that (ApplyActive re-selects).
@@ -932,7 +940,7 @@ public class MainForm : Form
     void PollSessions()
     {
         var byApp = new Dictionary<string, List<AudioSessionControl>>();
-        bool learned = false;
+        bool changed = false;
         foreach (var di in _present.Values)
         {
             SessionCollection sessions;
@@ -946,28 +954,37 @@ public class MainForm : Form
 
             for (int i = 0; i < sessions.Count; i++)
             {
-                string key, name;
                 try
                 {
                     var sc = sessions[i];
                     if (sc.State == AudioSessionState.AudioSessionStateExpired) continue;
-                    if (sc.IsSystemSoundsSession) { key = SystemAppKey; name = "System sounds"; }
+
+                    string key, name;
+                    bool system = sc.IsSystemSoundsSession;
+                    if (system) { key = SystemAppKey; name = "System sounds"; }
                     else
                     {
                         var k = AppKeyForPid((int)sc.GetProcessID, out name);
                         if (k == null) continue;
                         key = k;
                     }
+
                     if (!byApp.TryGetValue(key, out var list)) byApp[key] = list = new();
                     list.Add(sc);
+                    _knownApps[key] = name;   // remember the display name
+
+                    // Only apps that present in the mixer (system, or that have
+                    // actually rendered audio) become selectable targets — this
+                    // filters pure background/capture sessions.
+                    if ((system || sc.State == AudioSessionState.AudioSessionStateActive) && _mixerApps.Add(key))
+                        changed = true;
                 }
                 catch { continue; }
-                if (!_knownApps.ContainsKey(key)) { _knownApps[key] = name; learned = true; }
             }
         }
         _appSessions = byApp;
 
-        if (learned) { SaveSettings(); PopulateCombos(); }
+        if (changed) { SaveSettings(); PopulateCombos(); }
         // Push app-targeted sliders in case their sessions just (re)appeared.
         foreach (var s in _sliders)
             if (s.Target == TargetKind.App) { s.LastApplied = -1; Render(s); }
@@ -1119,6 +1136,8 @@ public class MainForm : Form
             _devices = s.Devices != null ? new(s.Devices) : new();
             _knownApps.Clear();
             if (s.KnownApps != null) foreach (var kv in s.KnownApps) _knownApps[kv.Key] = kv.Value;
+            _mixerApps.Clear();
+            if (s.MixerApps != null) foreach (var k in s.MixerApps) _mixerApps.Add(k);
             _themeMode = s.ThemeMode;
 
             // No per-device profiles yet but old flat settings present -> build a
@@ -1178,7 +1197,7 @@ public class MainForm : Form
                 };
             }
 
-            var s = new Settings { Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), ThemeMode = _themeMode };
+            var s = new Settings { Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), MixerApps = _mixerApps.ToList(), ThemeMode = _themeMode };
             Directory.CreateDirectory(SettingsDir);
             // Write to a temp file then swap it in, so a crash mid-write can't
             // leave a half-written (corrupt) file behind.
