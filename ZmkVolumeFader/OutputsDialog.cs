@@ -4,40 +4,43 @@ using NAudio.CoreAudioApi;
 namespace ZmkVolumeFader;
 
 /// <summary>
-/// Ranked output editor reached from Options ("Set Default Outputs…"). Each fader
+/// Ranked output editor reached from Options ("Set Default Outputs…"). Each slider
 /// gets an ordered list of outputs; the app drives the highest one that's plugged
 /// in and switches automatically as devices come and go. Reorder with the arrows,
 /// remove with ✕, and add from the picker (which lists every known output,
-/// including ones that aren't currently connected). The owner reads <see cref="Left"/>
-/// and <see cref="Right"/> back on a Save result.
+/// including ones not currently connected). The list scrolls for many sliders. The
+/// owner reads <see cref="Result"/> (one list per slider) back on a Save result.
 /// </summary>
 sealed class OutputsDialog : Form
 {
-    public List<OutputPref> LeftOutputs { get; private set; }
-    public List<OutputPref> RightOutputs { get; private set; }
+    public List<OutputPref>[] Result { get; private set; }
 
+    readonly int _n;
+    readonly string[] _labels;
     readonly MainForm.Theme _t;
     IReadOnlyList<OutputPref> _known;
     HashSet<string> _present;
     readonly MMDeviceEnumerator _enum = new();
 
-    readonly ListBox[] _list = new ListBox[2];
-    readonly RoundedComboBox[] _add = new RoundedComboBox[2];
-    readonly RoundedButton[] _addBtn = new RoundedButton[2];
+    readonly ListBox[] _list;
+    readonly RoundedComboBox[] _add;
+    readonly RoundedButton[] _addBtn;
 
     [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
     static extern int SetWindowTheme(IntPtr hWnd, string? subApp, string? subId);
     [DllImport("dwmapi.dll")]
     static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
-    public OutputsDialog(MainForm.Theme t, List<OutputPref> left, List<OutputPref> right,
+    public OutputsDialog(MainForm.Theme t, string[] labels, List<OutputPref>[] outs,
         IReadOnlyList<OutputPref> known, IEnumerable<string> presentIds)
     {
         _t = t;
-        LeftOutputs = Clone(left);
-        RightOutputs = Clone(right);
+        _n = outs.Length;
+        _labels = labels;
+        Result = outs.Select(Clone).ToArray();
         _known = known;
         _present = new HashSet<string>(presentIds);
+        _list = new ListBox[_n]; _add = new RoundedComboBox[_n]; _addBtn = new RoundedButton[_n];
 
         Text = "Set Default Outputs";
         Font = new Font("Segoe UI", 9.75f);
@@ -45,30 +48,31 @@ sealed class OutputsDialog : Form
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(430, 604);
+        ClientSize = new Size(430, 640);
         BackColor = _t.Window;
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(14), BackColor = Color.Transparent };
+        int rows = 1 + _n;
+        var root = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Top, ColumnCount = 1, RowCount = rows, BackColor = Color.Transparent };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int r = 0; r < 4; r++) root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-
+        for (int r = 0; r < rows; r++) root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.Controls.Add(new Label
         {
-            Text = "Each fader drives the top output that's plugged in. If it's unplugged the app drops to the next one, and takes it back over when it returns. Use the arrows to rank them.",
-            AutoSize = true, MaximumSize = new Size(398, 0), ForeColor = _t.Subtle, Margin = new Padding(2, 0, 2, 10),
+            Text = "Each slider drives the top output that's plugged in. If it's unplugged the app drops to the next one, and takes it back over when it returns. Use the arrows to rank them.",
+            AutoSize = true, MaximumSize = new Size(392, 0), ForeColor = _t.Subtle, Margin = new Padding(2, 0, 2, 10),
         }, 0, 0);
-        root.Controls.Add(BuildFader(0, "Left fader"), 0, 1);
-        root.Controls.Add(BuildFader(1, "Right fader"), 0, 2);
+        for (int i = 0; i < _n; i++) root.Controls.Add(BuildFader(i, _labels[i]), 0, 1 + i);
 
-        // Footer: Refresh on the left, Save/Cancel on the right.
-        var footer = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, RowCount = 1, BackColor = Color.Transparent, Margin = new Padding(0, 16, 0, 0) };
+        var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Color.Transparent, Padding = new Padding(14, 14, 14, 0) };
+        scroll.Controls.Add(root);
+
+        // Footer: Refresh on the left, Save/Cancel on the right — pinned below.
+        var footer = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, RowCount = 1, BackColor = Color.Transparent, Padding = new Padding(14, 10, 14, 12) };
         footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         var refresh = MakeButton("Refresh outputs", accent: false);
         refresh.Anchor = AnchorStyles.Left; refresh.Margin = new Padding(0);
         refresh.Click += (_, _) => RefreshDevices();
         footer.Controls.Add(refresh, 0, 0);
-
         var rightBtns = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Anchor = AnchorStyles.Right, BackColor = Color.Transparent, Margin = new Padding(0) };
         var save = MakeButton("Save", accent: true);
         save.Click += (_, _) => { CommitResults(); DialogResult = DialogResult.OK; Close(); };
@@ -77,24 +81,28 @@ sealed class OutputsDialog : Form
         rightBtns.Controls.Add(save);
         rightBtns.Controls.Add(cancel);
         footer.Controls.Add(rightBtns, 1, 0);
-        root.Controls.Add(footer, 0, 3);
 
-        Controls.Add(root);
+        var outer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, BackColor = Color.Transparent };
+        outer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        outer.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        outer.Controls.Add(scroll, 0, 0);
+        outer.Controls.Add(footer, 0, 1);
+        Controls.Add(outer);
+
         AcceptButton = save;
         CancelButton = cancel;
 
-        // Fill in friendly names for any entries remembered while disconnected.
-        ReconcileNames(0);
-        ReconcileNames(1);
+        for (int i = 0; i < _n; i++) ReconcileNames(i);
 
         Load += (_, _) =>
         {
             ApplyDark();
-            // Fit the dialog snugly to its content. Done here (not in the ctor) so
-            // it runs after DPI/font scaling, otherwise the form ends up taller
-            // than its content and leaves dead space below the footer.
-            int h = root.GetPreferredSize(new Size(ClientSize.Width, 0)).Height;
-            ClientSize = new Size(ClientSize.Width, h);
+            // Fit to content up to a cap (scrolls beyond); done here so it runs
+            // after DPI/font scaling.
+            int content = root.PreferredSize.Height + 14;
+            int foot = footer.PreferredSize.Height;
+            ClientSize = new Size(ClientSize.Width, Math.Clamp(content + foot, 300, 720));
         };
         FormClosed += (_, _) => _enum.Dispose();
     }
@@ -104,7 +112,7 @@ sealed class OutputsDialog : Form
 
     Panel BuildFader(int idx, string name)
     {
-        var card = new Panel { Width = 398, Height = 232, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
+        var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 232, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
 
         var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -129,7 +137,7 @@ sealed class OutputsDialog : Form
             Margin = new Padding(0, 0, 8, 0),
         };
         lb.DrawItem += (s, e) => DrawListItem(lb, e);
-        foreach (var p in (idx == 0 ? LeftOutputs : RightOutputs)) lb.Items.Add(p);
+        foreach (var p in Result[idx]) lb.Items.Add(p);
         _list[idx] = lb;
         t.Controls.Add(lb, 0, 1);
 
@@ -219,7 +227,7 @@ sealed class OutputsDialog : Form
         }
     }
 
-    // Repopulate a fader's add-picker with known outputs not already in its list.
+    // Repopulate a slider's add-picker with known outputs not already in its list.
     void RefreshAdd(int idx)
     {
         var lb = _list[idx];
@@ -236,8 +244,7 @@ sealed class OutputsDialog : Form
     }
 
     // Re-scan the system's outputs (e.g. after plugging something in) so the add
-    // pickers and the "(not connected)" markers are current, and fill in friendly
-    // names for entries that were remembered while their device was disconnected.
+    // pickers and the "(not connected)" markers are current.
     void RefreshDevices()
     {
         try
@@ -252,14 +259,10 @@ sealed class OutputsDialog : Form
         }
         catch { return; }
 
-        ReconcileNames(0);
-        ReconcileNames(1);
-        RefreshAdd(0);
-        RefreshAdd(1);
+        for (int i = 0; i < _n; i++) { ReconcileNames(i); RefreshAdd(i); }
     }
 
-    // Update list entries' display names from the known-device list (keeps a
-    // sensible label even for a device that was added while unplugged).
+    // Update a slider's list entries' display names from the known-device list.
     void ReconcileNames(int idx)
     {
         var lb = _list[idx];
@@ -274,13 +277,9 @@ sealed class OutputsDialog : Form
 
     void CommitResults()
     {
-        LeftOutputs = _list[0].Items.Cast<OutputPref>().ToList();
-        RightOutputs = _list[1].Items.Cast<OutputPref>().ToList();
+        for (int i = 0; i < _n; i++) Result[i] = _list[i].Items.Cast<OutputPref>().ToList();
     }
 
-    // surround fills the rounded corners — pass the colour of the container the
-    // button sits on (card vs. window) so the corners blend in instead of showing
-    // grey bits.
     RoundedButton MakeButton(string text, bool accent, Color? surround = null)
     {
         var b = new RoundedButton { Text = text, AutoSize = true, Padding = new Padding(12, 6, 12, 6), Margin = new Padding(6, 0, 0, 0), Surround = surround ?? _t.Window };

@@ -1350,20 +1350,22 @@ public class MainForm : Form
 
     void OpenOptions()
     {
+        var cals = _sliders.Select(s => s.Cal.Clone()).ToArray();
+        var raws = _sliders.Select(s => (Func<int>)(() => s.LastRaw)).ToArray();
+        var outs = _sliders.Select(s => ClonePrefs(s.Prefs)).ToArray();
+        var labels = _sliders.Select(s => s.Name.Text).ToArray();
         using var dlg = new OptionsDialog(_theme, _themeMode, GetStartWithWindows(),
-            _left.Cal.Clone(), _right.Cal.Clone(),
-            () => _left.LastRaw, () => _right.LastRaw,
-            ClonePrefs(_left.Prefs), ClonePrefs(_right.Prefs),
-            AllKnownOutputs(), _present.Keys.ToArray());
+            cals, raws, outs, labels, AllKnownOutputs(), _present.Keys.ToArray());
         _calibrating = true;                 // stop driving devices while sweeping
         var result = dlg.ShowDialog(this);
         _calibrating = false;
         if (result == DialogResult.OK)
         {
-            ApplyCalibration(_left, dlg.LeftCal);
-            ApplyCalibration(_right, dlg.RightCal);
-            ApplyOutputs(_left, dlg.LeftOutputs);
-            ApplyOutputs(_right, dlg.RightOutputs);
+            for (int i = 0; i < _sliders.Length; i++)
+            {
+                ApplyCalibration(_sliders[i], dlg.Cals[i]);
+                ApplyOutputs(_sliders[i], dlg.Outputs[i]);
+            }
             _themeMode = dlg.SelectedTheme;
             ApplyTheme(CurrentTheme());
             SetStartWithWindows(dlg.StartWithWindows);

@@ -4,42 +4,43 @@ namespace ZmkVolumeFader;
 
 /// <summary>
 /// Modal options dialog. A General section toggles "start with Windows" and the
-/// light/dark/auto theme; below it, each fader records its raw min/max and picks
-/// the taper preset that matches the pot, with a live preview as you move it.
-/// The owner reads back <see cref="SelectedTheme"/>, <see cref="StartWithWindows"/>,
-/// and the edited <see cref="LeftCal"/>/<see cref="RightCal"/> on a Save result.
+/// light/dark/auto theme; below it, each slider records its raw min/max and picks
+/// the taper preset that matches the pot, with a live preview as you move it. The
+/// fader list scrolls for many sliders; Save/Cancel stay pinned. The owner reads
+/// back <see cref="SelectedTheme"/>, <see cref="StartWithWindows"/>, and the edited
+/// <see cref="Cals"/>/<see cref="Outputs"/> on a Save result.
 /// </summary>
 sealed class OptionsDialog : Form
 {
-    public Calibration LeftCal => _cal[0];
-    public Calibration RightCal => _cal[1];
+    public Calibration[] Cals => _cal;
+    public List<OutputPref>[] Outputs => _outputs;
     public bool StartWithWindows => _startup.Checked;
     public ThemeMode SelectedTheme => (ThemeMode)Math.Clamp(_themeCombo.SelectedIndex, 0, 2);
-    public List<OutputPref> LeftOutputs => _outputs[0];
-    public List<OutputPref> RightOutputs => _outputs[1];
     // Set when the user clicks "Set up sliders…"; the owner runs the wizard.
     public bool SetupRequested { get; private set; }
 
+    readonly int _n;
     readonly Calibration[] _cal;
     readonly Func<int>[] _raw;
     readonly List<OutputPref>[] _outputs;
+    readonly string[] _labels;
     readonly IReadOnlyList<OutputPref> _known;
     readonly string[] _presentIds;
     readonly MainForm.Theme _t;
 
-    readonly Label[] _rawLbl = new Label[2];
-    readonly Label[] _rangeLbl = new Label[2];
-    readonly Label[] _previewLbl = new Label[2];
-    readonly RoundedButton[] _recordBtn = new RoundedButton[2];
-    readonly RoundedComboBox[] _taper = new RoundedComboBox[2];
-    readonly MainForm.FaderBar[] _bar = new MainForm.FaderBar[2];
-    readonly bool[] _recording = new bool[2];
+    readonly Label[] _rawLbl, _rangeLbl, _previewLbl;
+    readonly RoundedButton[] _recordBtn;
+    readonly RoundedComboBox[] _taper;
+    readonly MainForm.FaderBar[] _bar;
+    readonly bool[] _recording;
 
     readonly CheckBox _startup = new() { Text = "Start with Windows", AutoSize = true, FlatStyle = FlatStyle.Standard, Margin = new Padding(0, 0, 0, 0) };
     readonly RoundedComboBox _themeCombo = new() { Width = 190 };
 
     readonly System.Windows.Forms.Timer _tick = new() { Interval = 50 };
     readonly ToolTip _tip = new();
+    TableLayoutPanel _root = null!;
+    FlowLayoutPanel _btnRow = null!;
 
     static readonly string[] TaperItems = { "Linear pot", "Audio pot", "Straight" };
     static readonly string[] ThemeItems = { "Auto (follow Windows)", "Light", "Dark" };
@@ -50,16 +51,20 @@ sealed class OptionsDialog : Form
     static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
     public OptionsDialog(MainForm.Theme theme, ThemeMode themeMode, bool startWithWindows,
-        Calibration left, Calibration right, Func<int> rawL, Func<int> rawR,
-        List<OutputPref> leftOut, List<OutputPref> rightOut,
+        Calibration[] cals, Func<int>[] raws, List<OutputPref>[] outs, string[] labels,
         IReadOnlyList<OutputPref> known, IEnumerable<string> presentIds)
     {
         _t = theme;
-        _cal = new[] { left, right };
-        _raw = new[] { rawL, rawR };
-        _outputs = new[] { leftOut, rightOut };
+        _n = cals.Length;
+        _cal = cals;
+        _raw = raws;
+        _outputs = outs;
+        _labels = labels;
         _known = known;
         _presentIds = presentIds.ToArray();
+        _rawLbl = new Label[_n]; _rangeLbl = new Label[_n]; _previewLbl = new Label[_n];
+        _recordBtn = new RoundedButton[_n]; _taper = new RoundedComboBox[_n];
+        _bar = new MainForm.FaderBar[_n]; _recording = new bool[_n];
 
         Text = "Options";
         Font = new Font("Segoe UI", 9.75f);
@@ -67,45 +72,63 @@ sealed class OptionsDialog : Form
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(430, 694);
+        ClientSize = new Size(430, 700);
         BackColor = _t.Window;
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 6, Padding = new Padding(14), BackColor = Color.Transparent };
-        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int r = 0; r < 6; r++) root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        // Scrollable content (General + calibration label + N faders + About),
+        // with Save/Cancel pinned below.
+        int rows = 3 + _n;
+        _root = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Top, ColumnCount = 1, RowCount = rows, BackColor = Color.Transparent };
+        _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        for (int r = 0; r < rows; r++) _root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        root.Controls.Add(BuildGeneral(themeMode, startWithWindows), 0, 0);
-        root.Controls.Add(new Label
+        _root.Controls.Add(BuildGeneral(themeMode, startWithWindows), 0, 0);
+        _root.Controls.Add(new Label
         {
             Text = "Calibration — hit Record, sweep the fader fully end-to-end, then stop. Then pick the taper that matches your pot. The preview updates as you move it.",
-            AutoSize = true, MaximumSize = new Size(398, 0), ForeColor = _t.Subtle, Margin = new Padding(2, 4, 2, 10),
+            AutoSize = true, MaximumSize = new Size(392, 0), ForeColor = _t.Subtle, Margin = new Padding(2, 4, 2, 10),
         }, 0, 1);
-        root.Controls.Add(BuildFader(0, "Left fader"), 0, 2);
-        root.Controls.Add(BuildFader(1, "Right fader"), 0, 3);
+        for (int i = 0; i < _n; i++) _root.Controls.Add(BuildFader(i, _labels[i]), 0, 2 + i);
+        _root.Controls.Add(BuildAbout(), 0, 2 + _n);
 
-        var btnRow = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, BackColor = Color.Transparent, Margin = new Padding(0, 8, 0, 0) };
+        var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Color.Transparent, Padding = new Padding(14, 14, 14, 0) };
+        scroll.Controls.Add(_root);
+
+        _btnRow = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, FlowDirection = FlowDirection.RightToLeft, BackColor = Color.Transparent, Padding = new Padding(14, 8, 14, 12) };
         var save = MakeButton("Save", accent: true);
         save.Click += (_, _) => { DialogResult = DialogResult.OK; Close(); };
         var cancel = MakeButton("Cancel", accent: false);
         cancel.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
-        btnRow.Controls.Add(save);
-        btnRow.Controls.Add(cancel);
-        root.Controls.Add(btnRow, 0, 4);
+        _btnRow.Controls.Add(save);
+        _btnRow.Controls.Add(cancel);
 
-        root.Controls.Add(BuildAbout(), 0, 5);
+        var outer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, BackColor = Color.Transparent };
+        outer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        outer.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        outer.Controls.Add(scroll, 0, 0);
+        outer.Controls.Add(_btnRow, 0, 1);
+        Controls.Add(outer);
 
-        Controls.Add(root);
         AcceptButton = save;
         CancelButton = cancel;
 
-        _tick.Tick += (_, _) => { Tick(0); Tick(1); };
-        Load += (_, _) => { ApplyDark(); _tick.Start(); };
+        _tick.Tick += (_, _) => { for (int i = 0; i < _n; i++) Tick(i); };
+        Load += (_, _) => { ApplyDark(); FitHeight(); _tick.Start(); };
         FormClosing += (_, _) => _tick.Stop();
+    }
+
+    // Size the dialog to its content up to a cap; the fader list scrolls beyond.
+    void FitHeight()
+    {
+        int content = _root.PreferredSize.Height + 14;      // scroll padding
+        int buttons = _btnRow.PreferredSize.Height;
+        ClientSize = new Size(ClientSize.Width, Math.Clamp(content + buttons, 300, 720));
     }
 
     Control BuildAbout()
     {
-        var t = new TableLayoutPanel { AutoSize = true, ColumnCount = 1, RowCount = 2, Dock = DockStyle.Fill, BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
+        var t = new TableLayoutPanel { AutoSize = true, ColumnCount = 1, RowCount = 2, Anchor = AnchorStyles.Left | AnchorStyles.Right, BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         for (int r = 0; r < 2; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
@@ -144,7 +167,7 @@ sealed class OptionsDialog : Form
 
     Panel BuildGeneral(ThemeMode mode, bool startup)
     {
-        var card = new Panel { Width = 398, Height = 132, Margin = new Padding(0, 0, 0, 4), Padding = new Padding(12), BackColor = _t.Card };
+        var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 132, Margin = new Padding(0, 0, 0, 4), Padding = new Padding(12), BackColor = _t.Card };
 
         var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -183,18 +206,15 @@ sealed class OptionsDialog : Form
 
     void OpenOutputs()
     {
-        using var dlg = new OutputsDialog(_t, _outputs[0], _outputs[1], _known, _presentIds);
+        using var dlg = new OutputsDialog(_t, _labels, _outputs, _known, _presentIds);
         if (dlg.ShowDialog(this) == DialogResult.OK)
-        {
-            _outputs[0] = dlg.LeftOutputs;
-            _outputs[1] = dlg.RightOutputs;
-        }
+            for (int i = 0; i < _n; i++) _outputs[i] = dlg.Result[i];
     }
 
     Panel BuildFader(int i, string name)
     {
         int idx = i;
-        var card = new Panel { Width = 398, Height = 164, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
+        var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 164, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
 
         var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
