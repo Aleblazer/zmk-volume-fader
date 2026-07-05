@@ -558,7 +558,7 @@ public class MainForm : Form
 
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) MinimizeToTray(); };
 
-        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); };
+        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); PopulateCombos(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); };
         FormClosing += OnFormClosing;
     }
 
