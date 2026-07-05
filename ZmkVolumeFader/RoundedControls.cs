@@ -76,6 +76,9 @@ internal sealed class RoundedComboBox : ComboBox
     public Color BorderColor { get; set; } = Color.Gray;
     public Color ChevronColor { get; set; } = Color.Gray;
     public int Radius { get; set; } = 8;
+    // Shown (in PlaceholderColor) when nothing is selected.
+    public string? Placeholder { get; set; }
+    public Color PlaceholderColor { get; set; } = Color.Gray;
 
     const int WM_PAINT = 0x000F, WM_ERASEBKGND = 0x0014;
 
@@ -128,8 +131,14 @@ internal sealed class RoundedComboBox : ComboBox
         }
 
         string text = GetItemText(SelectedItem) ?? string.Empty;
+        Color textColor = ForeColor;
+        if (SelectedIndex < 0 && string.IsNullOrEmpty(text) && !string.IsNullOrEmpty(Placeholder))
+        {
+            text = Placeholder!;
+            textColor = PlaceholderColor;
+        }
         var textRect = new Rectangle(9, 0, Width - 9 - 22, Height);
-        TextRenderer.DrawText(g, text, Font, textRect, ForeColor,
+        TextRenderer.DrawText(g, text, Font, textRect, textColor,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
 
         float cxv = Width - 15, cyv = Height / 2f;

@@ -402,6 +402,8 @@ public class MainForm : Form
 
     readonly MMDeviceEnumerator _enum = new();
     DeviceNotify? _notify;
+    // Coalesces bursts of device notifications into a single refresh.
+    readonly System.Windows.Forms.Timer _deviceDebounce = new() { Interval = 250 };
 
     Axis _left = null!, _right = null!;
 
@@ -409,6 +411,8 @@ public class MainForm : Form
     volatile bool _run;
     bool _loadingSettings;
     bool _calibrating;   // true while the calibration dialog is open (don't drive devices)
+    string _connText = "Starting…";   // last dongle-connection status text
+    bool _connected;                  // dongle currently connected
 
     readonly NotifyIcon _tray = new() { Text = "ZMK Volume Fader", Icon = LoadAppIcon() };
     bool _exiting;
@@ -454,6 +458,7 @@ public class MainForm : Form
         root.Controls.Add(_footer, 0, 2);
         Controls.Add(root);
 
+        _cbLeft.Placeholder = _cbRight.Placeholder = "No output selected";
         _cbLeft.SelectedIndexChanged += (_, _) => OnDevicePicked(_left);
         _cbRight.SelectedIndexChanged += (_, _) => OnDevicePicked(_right);
         _cbLeft.DrawItem += OnComboDrawItem;
@@ -580,6 +585,7 @@ public class MainForm : Form
         {
             c.BackColor = t.CtlBg; c.ForeColor = t.Text;            // popup list colours
             c.Surround = t.Card; c.BoxColor = t.CtlBg; c.BorderColor = t.CtlBorder; c.ChevronColor = t.Subtle;
+            c.PlaceholderColor = t.Subtle;
             // Win10+ dark combo: themes the (still-native) dropdown list.
             if (c.IsHandleCreated) SetWindowTheme(c.Handle, t.Dark ? "DarkMode_CFD" : null, null);
             c.Invalidate();
@@ -600,6 +606,7 @@ public class MainForm : Form
         _statusDot.ForeColor = t.Accent;
 
         SetTitleBarDark(t.Dark);
+        RefreshStatus();   // recompute the dot/text colour for the current state
     }
 
     static void WalkLabels(Control root, Action<Label> apply)
@@ -685,11 +692,18 @@ public class MainForm : Form
         }
 
         _run = false;
+        // Stop new device callbacks first, then the debounce they feed.
         if (_notify != null)
         {
             try { _enum.UnregisterEndpointNotificationCallback(_notify); } catch { }
             _notify = null;
         }
+        _deviceDebounce.Stop();
+        _deviceDebounce.Dispose();
+        // Release the audio COM wrappers we're holding.
+        foreach (var it in _present.Values) { try { it.Device.Dispose(); } catch { } }
+        _present.Clear();
+        try { _enum.Dispose(); } catch { }
         _tray.Visible = false;
         _tray.Dispose();
     }
@@ -712,9 +726,16 @@ public class MainForm : Form
             .OrderBy(d => d.Name)
             .ToArray();
 
+        // Old MMDevice COM wrappers are about to be replaced; release them after
+        // the rebuild (the new active device gets a fresh instance below).
+        var stale = _present.Values.ToArray();
         _present.Clear();
         foreach (var it in items) _present[it.Id] = it;
 
+        // Clearing the items resets the combo selection and would otherwise fire
+        // SelectedIndexChanged -> OnDevicePicked with no selection, wiping the
+        // manual override. Suppress that here; ApplyActive re-selects deliberately.
+        _applyingActive = true;
         foreach (var cb in new[] { _cbLeft, _cbRight })
         {
             cb.BeginUpdate();
@@ -722,26 +743,37 @@ public class MainForm : Form
             cb.Items.AddRange(items);
             cb.EndUpdate();
         }
+        _applyingActive = false;
+
         // Re-pick the active output for each fader against the new device set.
         ApplyActive(_left);
         ApplyActive(_right);
+
+        foreach (var it in stale) { try { it.Device.Dispose(); } catch { } }
     }
 
     void RegisterDeviceNotifications()
     {
         try
         {
+            _deviceDebounce.Tick += (_, _) => { _deviceDebounce.Stop(); LoadDevices(); };
             _notify = new DeviceNotify(OnAudioDevicesChanged);
             _enum.RegisterEndpointNotificationCallback(_notify);
         }
         catch { }
     }
 
-    // An endpoint appeared/vanished/changed state — refresh and re-pick actives.
+    // An endpoint appeared/vanished/changed state. Callbacks arrive on a COM
+    // thread and often in bursts (e.g. one unplug raises several), so kick a
+    // short debounce on the UI thread and do a single LoadDevices when it settles.
     void OnAudioDevicesChanged()
     {
-        try { if (IsHandleCreated) BeginInvoke((Action)LoadDevices); }
-        catch { }
+        try
+        {
+            if (IsHandleCreated)
+                BeginInvoke((Action)(() => { _deviceDebounce.Stop(); _deviceDebounce.Start(); }));
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
     }
 
     // All outputs we could rank, including unplugged/disabled ones, for the editor.
@@ -888,7 +920,11 @@ public class MainForm : Form
                 ThemeMode = _themeMode,
             };
             Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath)!);
-            File.WriteAllText(SettingsPath, JsonSerializer.Serialize(s));
+            // Write to a temp file then swap it in, so a crash mid-write can't
+            // leave a half-written (corrupt) settings.json behind.
+            string tmp = SettingsPath + ".tmp";
+            File.WriteAllText(tmp, JsonSerializer.Serialize(s));
+            File.Move(tmp, SettingsPath, overwrite: true);
         }
         catch { }
     }
@@ -959,17 +995,21 @@ public class MainForm : Form
 
     static HidDevice? FindFader()
     {
-        var mine = DeviceList.Local.GetHidDevices()
-            .Where(d => d.VendorID == VID && d.ProductID == PID)
-            .ToArray();
+        var all = DeviceList.Local.GetHidDevices().ToArray();
 
-        var fader = mine.FirstOrDefault(d => Usages(d).Contains(FaderUsage));
-        if (fader != null) return fader;
+        // Match on our unique vendor fader usage (0xFF000001) rather than the
+        // exact VID/PID: over Bluetooth (HID-over-GATT) Windows can assign a
+        // different product id than the USB build, so keying off the usage lets
+        // the same app find the device on either transport. Prefer our VID when
+        // present, but don't require it.
+        var byUsage = all.Where(d => Usages(d).Contains(FaderUsage)).ToArray();
+        var hit = byUsage.FirstOrDefault(d => d.VendorID == VID) ?? byUsage.FirstOrDefault();
+        if (hit != null) return hit;
 
-        return mine
-            .Where(d => Usages(d).Any(u => (u >> 16) == 0xFF00))
-            .OrderBy(d => d.GetMaxInputReportLength())
-            .FirstOrDefault();
+        // Fallback: any device on our vendor usage page, preferring our VID.
+        var byPage = all.Where(d => Usages(d).Any(u => (u >> 16) == 0xFF00)).ToArray();
+        return byPage.FirstOrDefault(d => d.VendorID == VID)
+               ?? byPage.OrderBy(d => d.GetMaxInputReportLength()).FirstOrDefault();
     }
 
     void StartHid()
@@ -1012,11 +1052,17 @@ public class MainForm : Form
     void OnFaders(int left, int right)
     {
         if (!IsHandleCreated) return;
-        BeginInvoke(() =>
+        // The handle can be destroyed between the check and the post during
+        // shutdown; an unhandled throw here is on the HID thread and would crash.
+        try
         {
-            ApplyAxis(_left, left);
-            ApplyAxis(_right, right);
-        });
+            BeginInvoke(() =>
+            {
+                ApplyAxis(_left, left);
+                ApplyAxis(_right, right);
+            });
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
     }
 
     void ApplyAxis(Axis a, int raw)
@@ -1048,6 +1094,12 @@ public class MainForm : Form
         if (applied == a.LastApplied) return;
         a.LastApplied = applied;
         if (_calibrating) return;   // visualize, but don't drive the device while calibrating
+        // Each fader drives the volume of its own active output. Nothing stops
+        // both faders from resolving to the *same* endpoint (e.g. both lists top
+        // out at the same device); if that happens they both write that device's
+        // volume and the most recent move wins. That's intentional/by-design — the
+        // faders are independent controllers, so point them at different outputs
+        // to use them independently.
         if (a.Combo.SelectedItem is DeviceItem di)
         {
             try { di.Device.AudioEndpointVolume.MasterVolumeLevelScalar = applied / 100f; }
@@ -1058,10 +1110,24 @@ public class MainForm : Form
     void SetStatus(string text, bool connected)
     {
         if (!IsHandleCreated) return;
-        BeginInvoke(() =>
+        try
         {
-            _status.Text = text;
-            _statusDot.ForeColor = connected ? _theme.Accent : _theme.Subtle;
-        });
+            BeginInvoke(() =>
+            {
+                _connText = text;
+                _connected = connected;
+                RefreshStatus();
+            });
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
+    }
+
+    // Footer status reflects the dongle connection. (A fader with no output to
+    // drive is shown in-place via the dropdown's "No output selected" placeholder.)
+    void RefreshStatus()
+    {
+        if (!IsHandleCreated) return;
+        _status.Text = _connText;
+        _statusDot.ForeColor = _connected ? _theme.Accent : _theme.Subtle;
     }
 }
