@@ -21,6 +21,7 @@ internal enum ThemeMode { Auto, Light, Dark }
 public class MainForm : Form
 {
     const int VID = 0x1D50, PID = 0x615E;
+    const int MaxAxes = 6;   // hid-io joystick report carries up to six 16-bit axes
 
     // The per-fader value->% mapping lives in each Axis.Cal / Axis.Curve (see
     // Calibration). It's edited live via the Calibrate dialog and persisted to
@@ -329,6 +330,7 @@ public class MainForm : Form
         public required FaderBar Bar;
         public required Label Pct;     // big "62%" readout
         public required Stepper Limit;
+        public int AxisIndex;                                 // which HID report axis (0..5) drives this slider
         public Calibration Cal = new();                       // value->% mapping (persisted)
         public (int v, int pct)[] Curve = Array.Empty<(int, int)>();  // built from Cal
         public double Sm = -1;          // EMA state (smoothed raw value)
@@ -406,6 +408,9 @@ public class MainForm : Form
     readonly System.Windows.Forms.Timer _deviceDebounce = new() { Interval = 250 };
 
     Axis _left = null!, _right = null!;
+    // All sliders in axis order. Phase 1 keeps the fixed two; later phases make
+    // this list dynamic (per-device count from the setup wizard).
+    Axis[] _sliders = Array.Empty<Axis>();
 
     Thread? _hidThread;
     volatile bool _run;
@@ -427,10 +432,11 @@ public class MainForm : Form
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
 
-        _left = new Axis { Combo = _cbLeft, Bar = _barLeft, Pct = _pctLeft, Limit = _limLeft };
-        _right = new Axis { Combo = _cbRight, Bar = _barRight, Pct = _pctRight, Limit = _limRight };
+        _left = new Axis { Combo = _cbLeft, Bar = _barLeft, Pct = _pctLeft, Limit = _limLeft, AxisIndex = 0 };
+        _right = new Axis { Combo = _cbRight, Bar = _barRight, Pct = _pctRight, Limit = _limRight, AxisIndex = 1 };
         _left.Curve = _left.Cal.BuildCurve();
         _right.Curve = _right.Cal.BuildCurve();
+        _sliders = new[] { _left, _right };
 
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(14), BackColor = Color.Transparent };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -1039,8 +1045,16 @@ public class MainForm : Form
                     try { n = stream.Read(buf, 0, buf.Length); }
                     catch (TimeoutException) { continue; }
                     catch { break; }
-                    if (n >= 5 && buf[0] == 0x02)
-                        OnFaders(ReadAxis(buf, 1), ReadAxis(buf, 3));
+                    // Report id 2: up to six 16-bit LE axes at bytes 1.. (two
+                    // bytes each), then a button byte. Read whatever axes are
+                    // present so any number of sliders (1..6) can be driven.
+                    if (n >= 3 && buf[0] == 0x02)
+                    {
+                        int count = Math.Min(MaxAxes, (n - 1) / 2);
+                        var axes = new int[count];
+                        for (int i = 0; i < count; i++) axes[i] = ReadAxis(buf, 1 + 2 * i);
+                        OnFaders(axes);
+                    }
                 }
             }
             SetStatus("Reconnecting…", false);
@@ -1049,7 +1063,7 @@ public class MainForm : Form
 
     static int ReadAxis(byte[] b, int i) => (short)(b[i] | (b[i + 1] << 8));
 
-    void OnFaders(int left, int right)
+    void OnFaders(int[] axes)
     {
         if (!IsHandleCreated) return;
         // The handle can be destroyed between the check and the post during
@@ -1058,8 +1072,8 @@ public class MainForm : Form
         {
             BeginInvoke(() =>
             {
-                ApplyAxis(_left, left);
-                ApplyAxis(_right, right);
+                foreach (var s in _sliders)
+                    if (s.AxisIndex < axes.Length) ApplyAxis(s, axes[s.AxisIndex]);
             });
         }
         catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
