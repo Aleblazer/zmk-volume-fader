@@ -1,4 +1,5 @@
 using System.Drawing.Drawing2D;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using HidSharp;
@@ -22,6 +23,29 @@ public class MainForm : Form
 {
     const int VID = 0x1D50, PID = 0x615E;
     const int MaxAxes = 6;   // hid-io joystick report carries up to six 16-bit axes
+
+    // The git short hash the SetGitCommit build target embedded into
+    // AssemblyInformationalVersion ("1.1.0+<hash>"), or "" when unavailable.
+    static string CommitId()
+    {
+        var info = typeof(MainForm).Assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "";
+        int plus = info.IndexOf('+');
+        return plus >= 0 ? info[(plus + 1)..] : "";
+    }
+
+    // Build id shown in the UI: release builds show the clean version; dev
+    // (Debug) builds show the commit so you can tell dev builds apart.
+    public static string VersionText()
+    {
+#if DEBUG
+        string commit = CommitId();
+        return string.IsNullOrEmpty(commit) ? "dev build" : $"dev · {commit}";
+#else
+        var ver = typeof(MainForm).Assembly.GetName().Version;
+        return ver is null ? "" : $"v{ver.Major}.{ver.Minor}.{ver.Build}";
+#endif
+    }
 
     // The per-fader value->% mapping lives in each Axis.Cal / Axis.Curve (see
     // Calibration). It's edited live via the Calibrate dialog and persisted to
@@ -444,6 +468,11 @@ public class MainForm : Form
     public MainForm()
     {
         Text = "ZMK Volume Fader";
+#if DEBUG
+        // Dev builds carry the commit in the title so you can tell them apart.
+        var _cid = CommitId();
+        if (!string.IsNullOrEmpty(_cid)) Text += $" — {_cid}";
+#endif
         Icon = LoadAppIcon();
         Font = new Font("Segoe UI", 9.75f);
         ClientSize = new Size(460, 364);

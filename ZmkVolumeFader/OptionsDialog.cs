@@ -103,14 +103,13 @@ sealed class OptionsDialog : Form
 
     Control BuildAbout()
     {
-        var ver = GetType().Assembly.GetName().Version;
         var t = new TableLayoutPanel { AutoSize = true, ColumnCount = 1, RowCount = 2, Dock = DockStyle.Fill, BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         for (int r = 0; r < 2; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         t.Controls.Add(new Label
         {
-            Text = (ver is null ? "ZMK Volume Fader" : $"ZMK Volume Fader  v{ver.Major}.{ver.Minor}.{ver.Build}")
+            Text = $"ZMK Volume Fader  {MainForm.VersionText()}"
                  + "\nVibecoded by Aleblazer of Split Logic Keyboards",
             AutoSize = false, Dock = DockStyle.Fill, Height = 34, TextAlign = ContentAlignment.MiddleCenter,
             ForeColor = _t.Subtle, Font = new Font("Segoe UI", 8.25f), Margin = new Padding(0, 0, 0, 4),
