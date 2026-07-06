@@ -106,6 +106,11 @@ public class MainForm : Form
         public Color KnobEdge { get; set; } = Color.Gray;
         public Color Tick { get; set; } = Color.Gray;
         public bool ShowTicks { get; set; } = true;
+        // When true the fill/knob are drawn desaturated — the target isn't being
+        // driven right now (unit unplugged, or an app target that isn't playing).
+        bool _muted;
+        public bool Muted { get => _muted; set { if (v_set(ref _muted, value)) Invalidate(); } }
+        static bool v_set(ref bool f, bool v) { if (f == v) return false; f = v; return true; }
 
         public FaderBar() => SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
                                       | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
@@ -126,6 +131,10 @@ public class MainForm : Form
             if (right - left < 4) return;
             float f = Math.Clamp(_value / 100f, 0f, 1f);
             float kx = left + (right - left) * f;
+
+            // Muted (target not driven): flatten the green→red gradient to one grey.
+            Color grey = Lerp(Track, Knob, 0.45f);
+            Color cLo = _muted ? grey : Fill, cMid = _muted ? grey : Mid, cHi = _muted ? grey : Hot;
 
             // Tick scale above and below the track (longer every 5th).
             if (ShowTicks)
@@ -151,15 +160,15 @@ public class MainForm : Form
             {
                 using var fpath = Pill(new RectangleF(left, cy - thk / 2f, kx - left, thk));
                 using var grad = new LinearGradientBrush(new RectangleF(left, cy - thk / 2f, right - left, thk),
-                    Fill, Hot, LinearGradientMode.Horizontal)
+                    cLo, cHi, LinearGradientMode.Horizontal)
                 {
-                    InterpolationColors = new ColorBlend { Colors = new[] { Fill, Mid, Hot }, Positions = new[] { 0f, 0.5f, 1f } },
+                    InterpolationColors = new ColorBlend { Colors = new[] { cLo, cMid, cHi }, Positions = new[] { 0f, 0.5f, 1f } },
                 };
                 g.FillPath(grad, fpath);
             }
 
             // -/+ end glyphs (accent), like a physical fader's scale ends.
-            using (var sp = new Pen(Fill, 2f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+            using (var sp = new Pen(cLo, 2f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
             {
                 g.DrawLine(sp, 3f, cy, 3f + 7f, cy);                 // minus
                 float px = w - 7f;
@@ -175,7 +184,7 @@ public class MainForm : Form
             using (var ke = new Pen(KnobEdge, 1.4f))
                 g.DrawEllipse(ke, kx - knobR, cy - knobR, knobR * 2, knobR * 2);
             float dotR = knobR * 0.42f;
-            using (var cd = new SolidBrush(ColorAt(f)))
+            using (var cd = new SolidBrush(_muted ? grey : ColorAt(f)))
                 g.FillEllipse(cd, kx - dotR, cy - dotR, dotR * 2, dotR * 2);
         }
 
@@ -524,6 +533,8 @@ public class MainForm : Form
 
     readonly NotifyIcon _tray = new() { Text = "ZMK Volume Fader", Icon = LoadAppIcon() };
     bool _exiting;
+    bool _trayHintShown;   // one-time "still running in the tray" balloon
+    readonly ToolTip _tip = new() { AutoPopDelay = 8000, InitialDelay = 450, ReshowDelay = 150 };
 
     public MainForm()
     {
@@ -557,6 +568,8 @@ public class MainForm : Form
         _footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         _btnRefresh.Click += (_, _) => LoadDevices();
         _btnOptions.Click += (_, _) => OpenOptions();
+        _tip.SetToolTip(_btnRefresh, "Re-scan audio devices and apps");
+        _tip.SetToolTip(_btnOptions, "Calibration, sliders, categories, and preferences");
         var leftBtns = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0) };
         leftBtns.Controls.Add(_btnRefresh);
         leftBtns.Controls.Add(_btnOptions);
@@ -658,8 +671,58 @@ public class MainForm : Form
         combo.SelectedIndexChanged += (_, _) => OnDevicePicked(axis);
         combo.DrawItem += OnComboDrawItem;
         combo.DrawLeadingIcon = DrawComboIcon;
+
+        // Double-click the heading to rename the fader.
+        nameLbl.DoubleClick += (_, _) => BeginRename(axis);
+        nameLbl.Cursor = Cursors.Hand;
+        _tip.SetToolTip(nameLbl, "Double-click to rename");
+        _tip.SetToolTip(combo, "Pick what this fader controls");
+        _tip.SetToolTip(limit, "Maximum volume this fader can reach");
+        _tip.SetToolTip(tabs[0], "Control an output device's volume");
+        _tip.SetToolTip(tabs[1], "Control one app's volume");
+        _tip.SetToolTip(tabs[2], "Control a group of apps together");
         limit.ValueChanged += (_, _) => OnLimitChanged(axis);
         return axis;
+    }
+
+    // Inline rename: overlay a themed text box on the fader heading. Commit on
+    // Enter or focus-loss, cancel on Esc.
+    void BeginRename(Axis a)
+    {
+        var scr = a.Name.PointToScreen(Point.Empty);
+        var pt = a.Card.PointToClient(scr);
+        var box = new TextBox
+        {
+            Text = a.Name.Text,
+            BorderStyle = BorderStyle.FixedSingle,
+            BackColor = _theme.CtlBg,
+            ForeColor = _theme.Text,
+            Font = a.Name.Font,
+            Bounds = new Rectangle(pt.X, pt.Y - 1, 190, a.Name.Height + 4),
+        };
+        bool done = false;
+        void Commit(bool save)
+        {
+            if (done) return;
+            done = true;
+            if (save)
+            {
+                var nm = box.Text.Trim();
+                if (nm.Length > 0 && nm != a.Name.Text) { a.Name.Text = nm; SaveSettings(); }
+            }
+            a.Card.Controls.Remove(box);
+            box.Dispose();
+        }
+        box.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; Commit(true); }
+            else if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; Commit(false); }
+        };
+        box.Leave += (_, _) => Commit(true);
+        a.Card.Controls.Add(box);
+        box.BringToFront();
+        box.Focus();
+        box.SelectAll();
     }
 
     // Switch a slider's target type (which tab is active) and repopulate its combo.
@@ -948,7 +1011,16 @@ public class MainForm : Form
 
     // ---- tray -------------------------------------------------------------
 
-    void MinimizeToTray() => Hide();
+    void MinimizeToTray()
+    {
+        Hide();
+        if (!_trayHintShown)
+        {
+            _trayHintShown = true;
+            try { _tray.ShowBalloonTip(2500, "ZMK Volume Fader", "Still running in the tray — double-click to reopen.", ToolTipIcon.Info); }
+            catch { }
+        }
+    }
 
     void RestoreFromTray()
     {
@@ -1774,8 +1846,37 @@ public class MainForm : Form
         Render(a);
     }
 
+    // Is this slider actually driving something right now? False if the unit is
+    // unplugged, an output target isn't present, or an app/category target has no
+    // live session. Drives the muted (greyed) look on the fader bar.
+    bool Drivable(Axis a)
+    {
+        if (!_connected) return false;
+        switch (a.Target)
+        {
+            case TargetKind.App:
+                return a.AppKey != null && _appSessions.ContainsKey(a.AppKey);
+            case TargetKind.Category:
+                var c = _categories.FirstOrDefault(x => x.Name == a.CategoryName);
+                return c != null && c.AppKeys.Any(_appSessions.ContainsKey);
+            default:
+                return Resolve(a) != null;
+        }
+    }
+
+    // Refresh a slider's "active vs idle" visuals (muted bar + dimmed %).
+    void UpdateSliderState(Axis a)
+    {
+        bool live = Drivable(a);
+        a.Bar.Muted = !live;
+        a.Pct.ForeColor = live ? _theme.Text : _theme.Subtle;
+    }
+
+    void UpdateAllSliderStates() { foreach (var s in _sliders) UpdateSliderState(s); }
+
     void Render(Axis a)
     {
+        UpdateSliderState(a);
         if (a.Sm < 0) return;
 
         int v = (int)Math.Round(a.Sm);
@@ -1793,6 +1894,7 @@ public class MainForm : Form
 
         if (applied == a.LastApplied) return;
         a.LastApplied = applied;
+        UpdateTrayText();
         if (_calibrating) return;   // visualize, but don't drive anything while calibrating
 
         float scalar = applied / 100f;
@@ -1845,6 +1947,21 @@ public class MainForm : Form
     {
         if (!IsHandleCreated) return;
         _status.Text = _connText;
-        _statusDot.ForeColor = _connected ? _theme.Accent : _theme.Subtle;
+        _statusDot.ForeColor = _connected ? _theme.Accent : DisconnectColor;
+        UpdateAllSliderStates();
+        UpdateTrayText();
+    }
+
+    static readonly Color DisconnectColor = Color.FromArgb(0xE0, 0x4F, 0x4F);
+
+    // Tray tooltip: connection + each fader's current level (kept under the
+    // NotifyIcon 63-char limit).
+    void UpdateTrayText()
+    {
+        string body = _connected
+            ? string.Join(" · ", _sliders.Select(s => $"{s.Bar.Value}%"))
+            : "Disconnected";
+        string t = $"ZMK Volume Fader\n{body}";
+        _tray.Text = t.Length <= 63 ? t : t[..63];
     }
 }
