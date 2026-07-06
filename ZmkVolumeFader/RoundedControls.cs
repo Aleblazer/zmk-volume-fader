@@ -172,9 +172,10 @@ internal sealed class RoundedComboBox : ComboBox
         int textLeft = 9;
         if (DrawLeadingIcon != null && SelectedIndex >= 0 && SelectedItem != null)
         {
-            var ir = new Rectangle(8, (Height - 16) / 2, 16, 16);
+            int isz = LogicalToDeviceUnits(18);
+            var ir = new Rectangle(LogicalToDeviceUnits(8), (Height - isz) / 2, isz, isz);
             DrawLeadingIcon(g, ir, SelectedItem, textColor);
-            textLeft = ir.Right + 6;
+            textLeft = ir.Right + LogicalToDeviceUnits(6);
         }
         var textRect = new Rectangle(textLeft, 0, Width - textLeft - 22, Height);
         TextRenderer.DrawText(g, text, Font, textRect, textColor,

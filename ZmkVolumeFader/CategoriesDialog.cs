@@ -91,7 +91,13 @@ sealed class CategoriesDialog : Form
         CancelButton = cancel;
 
         if (Result.Count > 0) _catList.SelectedIndex = 0; else OnCatSelected();
-        Load += (_, _) => ApplyDark();
+        Load += (_, _) =>
+        {
+            ApplyDark();
+            // Row height tracks the DPI-scaled font so text isn't clipped at 125%+.
+            _catList.ItemHeight = _catList.Font.Height + LogicalToDeviceUnits(8);
+            _appList.ItemHeight = _appList.Font.Height + LogicalToDeviceUnits(8);
+        };
     }
 
     Category? Selected => _catList.SelectedIndex >= 0 ? Result[_catList.SelectedIndex] : null;
@@ -177,17 +183,18 @@ sealed class CategoriesDialog : Form
         using (var b = new SolidBrush(sel ? _t.Accent : _t.CtlBg)) e.Graphics.FillRectangle(b, e.Bounds);
         Color fg = sel ? AccentText() : _t.Text;
         // Checkbox glyph in a fixed lead column.
-        var boxRect = new Rectangle(e.Bounds.X + 6, e.Bounds.Y, 18, e.Bounds.Height);
+        var boxRect = new Rectangle(e.Bounds.X + LogicalToDeviceUnits(6), e.Bounds.Y, LogicalToDeviceUnits(20), e.Bounds.Height);
         TextRenderer.DrawText(e.Graphics, member ? "☑" : "☐", _appList.Font, boxRect, fg,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
-        int left = boxRect.Right + 2;
+        int left = boxRect.Right + LogicalToDeviceUnits(2);
         // App icon, if we have one.
         if (_appIcons != null && _appIcons.TryGetValue(_apps[e.Index].Key, out var img) && img != null)
         {
-            var ir = new Rectangle(left, e.Bounds.Y + (e.Bounds.Height - 16) / 2, 16, 16);
+            int isz = LogicalToDeviceUnits(18);
+            var ir = new Rectangle(left, e.Bounds.Y + (e.Bounds.Height - isz) / 2, isz, isz);
             e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
             e.Graphics.DrawImage(img, ir);
-            left = ir.Right + 5;
+            left = ir.Right + LogicalToDeviceUnits(5);
         }
         var r = new Rectangle(left, e.Bounds.Y, e.Bounds.Right - left - 2, e.Bounds.Height);
         TextRenderer.DrawText(e.Graphics, _apps[e.Index].Name, _appList.Font, r, fg,

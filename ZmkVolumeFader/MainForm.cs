@@ -610,10 +610,19 @@ public class MainForm : Form
     // Main-window height for N slider cards, capped (the host scrolls beyond).
     static int WindowHeightFor(int n) => Math.Clamp(n * 180 + 70, 300, 720);
 
+    // Owner-drawn combo rows use a fixed ItemHeight; size it to the (DPI-scaled)
+    // font so dropdown text isn't clipped at 125%+ scaling.
+    void TuneComboItemHeight()
+    {
+        foreach (var s in _sliders)
+            s.Combo.ItemHeight = s.Combo.Font.Height + LogicalToDeviceUnits(8);
+    }
+
     // Size the window to the cards' actual content. Fonts are point-based so this
     // is correct at any Windows display scaling; the host scrolls past the cap.
     void FitWindowHeight()
     {
+        TuneComboItemHeight();
         int total = 0;
         foreach (var s in _sliders)
         {
@@ -913,9 +922,10 @@ public class MainForm : Form
         if (e.Index >= 0)
         {
             var item = cb.Items[e.Index];
-            var ir = new Rectangle(e.Bounds.X + 5, e.Bounds.Y + (e.Bounds.Height - 16) / 2, 16, 16);
+            int isz = LogicalToDeviceUnits(18);
+            var ir = new Rectangle(e.Bounds.X + LogicalToDeviceUnits(5), e.Bounds.Y + (e.Bounds.Height - isz) / 2, isz, isz);
             DrawComboIcon(e.Graphics, ir, item, fg);
-            int left = ir.Right + 5;
+            int left = ir.Right + LogicalToDeviceUnits(5);
             var r = new Rectangle(left, e.Bounds.Y, e.Bounds.Right - left - 2, e.Bounds.Height);
             TextRenderer.DrawText(e.Graphics, cb.GetItemText(item), cb.Font, r, fg,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
@@ -1235,12 +1245,13 @@ public class MainForm : Form
                         var k = AppKeyForPid((int)sc.GetProcessID, out name, out var exePath);
                         if (k == null) continue;
                         key = k;
-                        // Grab the exe icon the first time (retry cheaply while null).
-                        if (!_appIcons.TryGetValue(key, out var have) || have == null)
+                        // Grab the exe icon the first time (retry cheaply while null,
+                        // and upgrade any low-res icon left by an older cache).
+                        if (!_appIcons.TryGetValue(key, out var have) || have == null || have.Width < IconStore)
                         {
                             var loaded = LoadExeIcon(exePath);
-                            _appIcons[key] = loaded;
-                            if (loaded != null) { iconsChanged = true; SaveIconFile(key, loaded); }
+                            if (loaded != null) { _appIcons[key] = loaded; iconsChanged = true; SaveIconFile(key, loaded); }
+                            else _appIcons.TryAdd(key, null);
                         }
                     }
 
@@ -1292,7 +1303,11 @@ public class MainForm : Form
         catch { return null; }
     }
 
-    // Extract a small icon from an exe, scaled to 16px. Returns null on failure.
+    // Icons are stored at this size and downscaled when drawn, so they stay crisp
+    // at high Windows display scaling (a fader row is ~16px at 100%, ~24px at 150%).
+    const int IconStore = 32;
+
+    // Extract an icon from an exe, normalized to IconStore px. Returns null on failure.
     static Image? LoadExeIcon(string? path)
     {
         if (string.IsNullOrEmpty(path)) return null;
@@ -1301,12 +1316,12 @@ public class MainForm : Form
             using var ic = Icon.ExtractAssociatedIcon(path!);
             if (ic == null) return null;
             using var raw = ic.ToBitmap();
-            var bmp = new Bitmap(16, 16);
+            var bmp = new Bitmap(IconStore, IconStore);
             using (var g = Graphics.FromImage(bmp))
             {
                 g.InterpolationMode = InterpolationMode.HighQualityBicubic;
                 g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                g.DrawImage(raw, new Rectangle(0, 0, 16, 16));
+                g.DrawImage(raw, new Rectangle(0, 0, IconStore, IconStore));
             }
             return bmp;
         }
