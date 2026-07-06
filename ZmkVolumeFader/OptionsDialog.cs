@@ -45,7 +45,7 @@ sealed class OptionsDialog : Form
     readonly ToolTip _tip = new();
     TableLayoutPanel _root = null!;
     FlowLayoutPanel _btnRow = null!;
-    Panel _scroll = null!;
+    RoundedScrollPanel _scroll = null!;
 
     static readonly string[] TaperItems = { "Linear pot", "Audio pot", "Straight" };
     static readonly string[] ThemeItems = { "Auto (follow Windows)", "Light", "Dark" };
@@ -90,7 +90,7 @@ sealed class OptionsDialog : Form
         // Scrollable content (General + calibration label + N faders + About),
         // with Save/Cancel pinned below.
         int rows = 3 + _n;
-        _root = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Top, ColumnCount = 1, RowCount = rows, BackColor = Color.Transparent };
+        _root = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, RowCount = rows, BackColor = Color.Transparent };
         _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         for (int r = 0; r < rows; r++) _root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
@@ -103,8 +103,12 @@ sealed class OptionsDialog : Form
         for (int i = 0; i < _n; i++) _root.Controls.Add(BuildFader(i, _labels[i]), 0, 2 + i);
         _root.Controls.Add(BuildAbout(), 0, 2 + _n);
 
-        _scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Color.Transparent, Padding = new Padding(14, 14, 14, 0) };
-        _scroll.Controls.Add(_root);
+        _scroll = new RoundedScrollPanel
+        {
+            Dock = DockStyle.Fill, BackColor = Color.Transparent, Padding = new Padding(14, 14, 14, 0),
+            ThumbColor = _t.CtlBorder, ThumbHoverColor = _t.Subtle,
+        };
+        _scroll.SetContent(_root);
 
         _btnRow = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, FlowDirection = FlowDirection.RightToLeft, BackColor = Color.Transparent, Padding = new Padding(14, 8, 14, 12) };
         var save = MakeButton("Save", accent: true);
@@ -202,21 +206,25 @@ sealed class OptionsDialog : Form
         themeRow.Controls.Add(_themeCombo);
         t.Controls.Add(themeRow, 0, 1);
 
-        // Setup wizard, ranked-output editor, and category editor (wraps to fit).
-        var btnRow = new FlowLayoutPanel { AutoSize = true, WrapContents = true, MaximumSize = new Size(392, 0), BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
+        // Setup wizard, ranked-output editor, and category editor. A 2-column
+        // table (not a wrapping FlowLayoutPanel — that mis-sizes its height inside
+        // an auto-size parent) keeps the card tight to its content.
+        var btnGrid = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, RowCount = 2, BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
+        btnGrid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        btnGrid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         var setupBtn = MakeButton("Set up sliders…", accent: false, surround: _t.Card);
         setupBtn.Margin = new Padding(0, 0, 6, 6);
         setupBtn.Click += (_, _) => { SetupRequested = true; DialogResult = DialogResult.OK; Close(); };
         var outBtn = MakeButton("Set Default Outputs…", accent: false, surround: _t.Card);
-        outBtn.Margin = new Padding(0, 0, 6, 6);
+        outBtn.Margin = new Padding(0, 0, 0, 6);
         outBtn.Click += (_, _) => OpenOutputs();
         var catBtn = MakeButton("Manage Categories…", accent: false, surround: _t.Card);
-        catBtn.Margin = new Padding(0, 0, 0, 6);
+        catBtn.Margin = new Padding(0, 0, 0, 0);
         catBtn.Click += (_, _) => OpenCategories();
-        btnRow.Controls.Add(setupBtn);
-        btnRow.Controls.Add(outBtn);
-        btnRow.Controls.Add(catBtn);
-        t.Controls.Add(btnRow, 0, 2);
+        btnGrid.Controls.Add(setupBtn, 0, 0);
+        btnGrid.Controls.Add(outBtn, 1, 0);
+        btnGrid.Controls.Add(catBtn, 0, 1);
+        t.Controls.Add(btnGrid, 0, 2);
 
         card.Controls.Add(t);
         return card;
@@ -338,7 +346,5 @@ sealed class OptionsDialog : Form
         foreach (var c in _taper)
             if (c.IsHandleCreated) SetWindowTheme(c.Handle, _t.Dark ? "DarkMode_CFD" : null, null);
         if (_themeCombo.IsHandleCreated) SetWindowTheme(_themeCombo.Handle, _t.Dark ? "DarkMode_CFD" : null, null);
-        // Theme the scroll container's scrollbar to match.
-        if (_scroll.IsHandleCreated) SetWindowTheme(_scroll.Handle, _t.Dark ? "DarkMode_Explorer" : "Explorer", null);
     }
 }

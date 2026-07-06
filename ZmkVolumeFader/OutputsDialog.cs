@@ -21,7 +21,7 @@ sealed class OutputsDialog : Form
     IReadOnlyList<OutputPref> _known;
     HashSet<string> _present;
     readonly MMDeviceEnumerator _enum = new();
-    Panel _scroll = null!;
+    RoundedScrollPanel _scroll = null!;
 
     readonly ListBox[] _list;
     readonly RoundedComboBox[] _add;
@@ -55,7 +55,7 @@ sealed class OutputsDialog : Form
         BackColor = _t.Window;
 
         int rows = 1 + _n;
-        var root = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Dock = DockStyle.Top, ColumnCount = 1, RowCount = rows, BackColor = Color.Transparent };
+        var root = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, RowCount = rows, BackColor = Color.Transparent };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         for (int r = 0; r < rows; r++) root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.Controls.Add(new Label
@@ -65,8 +65,12 @@ sealed class OutputsDialog : Form
         }, 0, 0);
         for (int i = 0; i < _n; i++) root.Controls.Add(BuildFader(i, _labels[i]), 0, 1 + i);
 
-        _scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Color.Transparent, Padding = new Padding(14, 14, 14, 0) };
-        _scroll.Controls.Add(root);
+        _scroll = new RoundedScrollPanel
+        {
+            Dock = DockStyle.Fill, BackColor = Color.Transparent, Padding = new Padding(14, 14, 14, 0),
+            ThumbColor = _t.CtlBorder, ThumbHoverColor = _t.Subtle,
+        };
+        _scroll.SetContent(root);
 
         // Footer: Refresh on the left, Save/Cancel on the right — pinned below.
         var footer = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, RowCount = 1, BackColor = Color.Transparent, Padding = new Padding(14, 10, 14, 12) };
@@ -307,6 +311,5 @@ sealed class OutputsDialog : Form
             if (lb.IsHandleCreated) SetWindowTheme(lb.Handle, _t.Dark ? "DarkMode_Explorer" : null, null);
         foreach (var c in _add)
             if (c.IsHandleCreated) SetWindowTheme(c.Handle, _t.Dark ? "DarkMode_CFD" : null, null);
-        if (_scroll.IsHandleCreated) SetWindowTheme(_scroll.Handle, _t.Dark ? "DarkMode_Explorer" : "Explorer", null);
     }
 }
