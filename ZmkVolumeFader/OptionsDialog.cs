@@ -45,6 +45,7 @@ sealed class OptionsDialog : Form
     readonly ToolTip _tip = new();
     TableLayoutPanel _root = null!;
     FlowLayoutPanel _btnRow = null!;
+    Panel _scroll = null!;
 
     static readonly string[] TaperItems = { "Linear pot", "Audio pot", "Straight" };
     static readonly string[] ThemeItems = { "Auto (follow Windows)", "Light", "Dark" };
@@ -102,8 +103,8 @@ sealed class OptionsDialog : Form
         for (int i = 0; i < _n; i++) _root.Controls.Add(BuildFader(i, _labels[i]), 0, 2 + i);
         _root.Controls.Add(BuildAbout(), 0, 2 + _n);
 
-        var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Color.Transparent, Padding = new Padding(14, 14, 14, 0) };
-        scroll.Controls.Add(_root);
+        _scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Color.Transparent, Padding = new Padding(14, 14, 14, 0) };
+        _scroll.Controls.Add(_root);
 
         _btnRow = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, FlowDirection = FlowDirection.RightToLeft, BackColor = Color.Transparent, Padding = new Padding(14, 8, 14, 12) };
         var save = MakeButton("Save", accent: true);
@@ -117,7 +118,7 @@ sealed class OptionsDialog : Form
         outer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         outer.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        outer.Controls.Add(scroll, 0, 0);
+        outer.Controls.Add(_scroll, 0, 0);
         outer.Controls.Add(_btnRow, 0, 1);
         Controls.Add(outer);
 
@@ -178,9 +179,11 @@ sealed class OptionsDialog : Form
 
     Panel BuildGeneral(ThemeMode mode, bool startup)
     {
-        var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 168, Margin = new Padding(0, 0, 0, 4), Padding = new Padding(12), BackColor = _t.Card };
+        // Auto-size so the wrapped button row (Set up / Set Default Outputs /
+        // Manage Categories) is never clipped at any scaling.
+        var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 4), Padding = new Padding(12), BackColor = _t.Card };
 
-        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, BackColor = Color.Transparent };
+        var t = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, RowCount = 3, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         for (int r = 0; r < 3; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
@@ -335,5 +338,7 @@ sealed class OptionsDialog : Form
         foreach (var c in _taper)
             if (c.IsHandleCreated) SetWindowTheme(c.Handle, _t.Dark ? "DarkMode_CFD" : null, null);
         if (_themeCombo.IsHandleCreated) SetWindowTheme(_themeCombo.Handle, _t.Dark ? "DarkMode_CFD" : null, null);
+        // Theme the scroll container's scrollbar to match.
+        if (_scroll.IsHandleCreated) SetWindowTheme(_scroll.Handle, _t.Dark ? "DarkMode_Explorer" : "Explorer", null);
     }
 }

@@ -920,6 +920,10 @@ public class MainForm : Form
         foreach (var s in _sliders) s.Pct.ForeColor = t.Text;
         _statusDot.ForeColor = t.Accent;
 
+        // Theme the scrollbar (shown when many sliders overflow the window).
+        if (_sliderHost.IsHandleCreated)
+            SetWindowTheme(_sliderHost.Handle, t.Dark ? "DarkMode_Explorer" : "Explorer", null);
+
         SetTitleBarDark(t.Dark);
         RefreshStatus();   // recompute the dot/text colour for the current state
     }

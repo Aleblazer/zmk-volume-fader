@@ -21,6 +21,7 @@ sealed class OutputsDialog : Form
     IReadOnlyList<OutputPref> _known;
     HashSet<string> _present;
     readonly MMDeviceEnumerator _enum = new();
+    Panel _scroll = null!;
 
     readonly ListBox[] _list;
     readonly RoundedComboBox[] _add;
@@ -64,8 +65,8 @@ sealed class OutputsDialog : Form
         }, 0, 0);
         for (int i = 0; i < _n; i++) root.Controls.Add(BuildFader(i, _labels[i]), 0, 1 + i);
 
-        var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Color.Transparent, Padding = new Padding(14, 14, 14, 0) };
-        scroll.Controls.Add(root);
+        _scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Color.Transparent, Padding = new Padding(14, 14, 14, 0) };
+        _scroll.Controls.Add(root);
 
         // Footer: Refresh on the left, Save/Cancel on the right — pinned below.
         var footer = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, RowCount = 1, BackColor = Color.Transparent, Padding = new Padding(14, 10, 14, 12) };
@@ -88,7 +89,7 @@ sealed class OutputsDialog : Form
         outer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         outer.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         outer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        outer.Controls.Add(scroll, 0, 0);
+        outer.Controls.Add(_scroll, 0, 0);
         outer.Controls.Add(footer, 0, 1);
         Controls.Add(outer);
 
@@ -306,5 +307,6 @@ sealed class OutputsDialog : Form
             if (lb.IsHandleCreated) SetWindowTheme(lb.Handle, _t.Dark ? "DarkMode_Explorer" : null, null);
         foreach (var c in _add)
             if (c.IsHandleCreated) SetWindowTheme(c.Handle, _t.Dark ? "DarkMode_CFD" : null, null);
+        if (_scroll.IsHandleCreated) SetWindowTheme(_scroll.Handle, _t.Dark ? "DarkMode_Explorer" : "Explorer", null);
     }
 }
