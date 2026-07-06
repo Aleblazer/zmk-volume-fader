@@ -583,7 +583,7 @@ public class MainForm : Form
 
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) MinimizeToTray(); };
 
-        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); PopulateCombos(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); };
+        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); LoadCachedIcons(); PopulateCombos(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); };
         FormClosing += OnFormClosing;
     }
 
@@ -631,14 +631,19 @@ public class MainForm : Form
         axis.Curve = axis.Cal.BuildCurve();
 
         // Target-type tabs: Output | Apps | Categories (index = (int)TargetKind).
+        // Explicit compact sizes — AutoSize in a percent-width cell blows them up.
         var tabRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 4) };
         var tabs = new RoundedButton[3];
         string[] tabNames = { "Output", "Apps", "Categories" };
         Action<Graphics, Rectangle, Color>[] tabIcons = { GlyphSpeaker, GlyphApps, GlyphTag };
+        var tabFont = new Font("Segoe UI", 8.25f);
+        const int tabIconSz = 11, tabH = 23;
         for (int k = 0; k < 3; k++)
         {
             int kind = k;
-            var b = new RoundedButton { Text = tabNames[k], AutoSize = true, Padding = new Padding(9, 3, 10, 3), Margin = new Padding(0, 0, 4, 0), Radius = 7, DrawIcon = tabIcons[k], IconSize = 13 };
+            int tw = TextRenderer.MeasureText(tabNames[k], tabFont).Width;
+            var b = new RoundedButton { Text = tabNames[k], AutoSize = false, Font = tabFont, Margin = new Padding(0, 0, 5, 0), Radius = 7, DrawIcon = tabIcons[k], IconSize = tabIconSz };
+            b.Size = new Size(tabIconSz + 6 + tw + 16, tabH);   // icon + gap + text + side padding
             b.Click += (_, _) => SetTab(axis, (TargetKind)kind);
             tabs[k] = b;
             tabRow.Controls.Add(b);
@@ -1137,7 +1142,7 @@ public class MainForm : Form
                         {
                             var loaded = LoadExeIcon(exePath);
                             _appIcons[key] = loaded;
-                            if (loaded != null) iconsChanged = true;
+                            if (loaded != null) { iconsChanged = true; SaveIconFile(key, loaded); }
                         }
                     }
 
@@ -1212,6 +1217,41 @@ public class MainForm : Form
 
     // The cached icon for an app (may be null if none could be extracted).
     Image? AppIcon(string key) => _appIcons.TryGetValue(key, out var img) ? img : null;
+
+    // Icons are cached to disk so a known app shows its real icon even when it
+    // isn't currently running (extracted while it was open, kept across restarts).
+    static string IconDir => Path.Combine(SettingsDir, "icons");
+    static string IconFile(string key) =>
+        Path.Combine(IconDir, string.Concat(key.Select(c => Array.IndexOf(Path.GetInvalidFileNameChars(), c) < 0 ? c : '_')) + ".png");
+
+    static void SaveIconFile(string key, Image img)
+    {
+        try { Directory.CreateDirectory(IconDir); img.Save(IconFile(key), System.Drawing.Imaging.ImageFormat.Png); }
+        catch { }
+    }
+
+    static Image? LoadIconFile(string path)
+    {
+        try
+        {
+            // Copy into a detached bitmap so the file isn't locked for the session.
+            using var fs = File.OpenRead(path);
+            using var img = Image.FromStream(fs);
+            return new Bitmap(img);
+        }
+        catch { return null; }
+    }
+
+    // Load any previously-cached app icons (for apps that may be closed now).
+    void LoadCachedIcons()
+    {
+        foreach (var key in _knownApps.Keys.ToArray())
+        {
+            if (_appIcons.ContainsKey(key)) continue;
+            var f = IconFile(key);
+            if (File.Exists(f) && LoadIconFile(f) is { } img) _appIcons[key] = img;
+        }
+    }
 
     // The output the ranking alone would choose: highest-ranked present device.
     string? AutoTarget(Axis a)
