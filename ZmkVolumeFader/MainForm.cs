@@ -538,6 +538,10 @@ public class MainForm : Form
 
     public MainForm()
     {
+        // Literal sizes below are authored at 96 dpi; scale them to the actual
+        // display so nothing clips at 125%/150%/… Windows scaling.
+        AutoScaleDimensions = new SizeF(96f, 96f);
+        AutoScaleMode = AutoScaleMode.Dpi;
         Text = "ZMK Volume Fader";
 #if DEBUG
         // Dev builds carry the commit in the title so you can tell them apart.
@@ -596,12 +600,29 @@ public class MainForm : Form
 
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) MinimizeToTray(); };
 
-        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); LoadCachedIcons(); PopulateCombos(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); };
+        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); };
         FormClosing += OnFormClosing;
     }
 
     // Main-window height for N slider cards, capped (the host scrolls beyond).
     static int WindowHeightFor(int n) => Math.Clamp(n * 180 + 70, 300, 720);
+
+    // Size the window to the cards' actual content. Fonts are point-based so this
+    // is correct at any Windows display scaling; the host scrolls past the cap.
+    void FitWindowHeight()
+    {
+        int total = 0;
+        foreach (var s in _sliders)
+        {
+            if (s.Card.Controls.Count > 0 && s.Card.Controls[0] is TableLayoutPanel inner)
+                s.Card.Height = inner.PreferredSize.Height + s.Card.Padding.Vertical;
+            total += s.Card.Height + s.Card.Margin.Vertical;
+        }
+        int chrome = _footer.PreferredSize.Height + LogicalToDeviceUnits(14) * 2 + LogicalToDeviceUnits(12);
+        int want = total + chrome;
+        int cap = Math.Min(LogicalToDeviceUnits(760), Screen.FromControl(this).WorkingArea.Height - LogicalToDeviceUnits(80));
+        ClientSize = new Size(ClientSize.Width, Math.Clamp(want, LogicalToDeviceUnits(300), cap));
+    }
 
     // (Re)build the slider host with one row per slider. Called on construction
     // and whenever the slider set changes.
@@ -1647,7 +1668,7 @@ public class MainForm : Form
 
         PopulateSliderHost();
         ApplyTheme(CurrentTheme());
-        ClientSize = new Size(ClientSize.Width, WindowHeightFor(_sliders.Length));
+        FitWindowHeight();
 
         LoadDevices();   // repopulate combos + re-pick active outputs
         foreach (var s in old) s.Card.Dispose();

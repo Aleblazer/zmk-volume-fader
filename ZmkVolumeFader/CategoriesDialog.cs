@@ -27,6 +27,8 @@ sealed class CategoriesDialog : Form
     public CategoriesDialog(MainForm.Theme t, List<Category> categories, IReadOnlyDictionary<string, string> knownApps,
         IReadOnlyDictionary<string, Image?>? appIcons = null)
     {
+        AutoScaleDimensions = new SizeF(96f, 96f);
+        AutoScaleMode = AutoScaleMode.Dpi;
         _t = t;
         _appIcons = appIcons;
         Result = categories.Select(c => new Category { Name = c.Name, AppKeys = new(c.AppKeys) }).ToList();

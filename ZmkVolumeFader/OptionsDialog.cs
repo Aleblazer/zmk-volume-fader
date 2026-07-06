@@ -60,6 +60,8 @@ sealed class OptionsDialog : Form
         List<Category> categories, IReadOnlyDictionary<string, string> knownApps,
         IReadOnlyDictionary<string, Image?>? appIcons = null)
     {
+        AutoScaleDimensions = new SizeF(96f, 96f);
+        AutoScaleMode = AutoScaleMode.Dpi;
         _appIcons = appIcons;
         _t = theme;
         _n = cals.Length;
@@ -130,9 +132,9 @@ sealed class OptionsDialog : Form
     // Size the dialog to its content up to a cap; the fader list scrolls beyond.
     void FitHeight()
     {
-        int content = _root.PreferredSize.Height + 14;      // scroll padding
+        int content = _root.PreferredSize.Height + LogicalToDeviceUnits(14);      // scroll padding
         int buttons = _btnRow.PreferredSize.Height;
-        ClientSize = new Size(ClientSize.Width, Math.Clamp(content + buttons, 300, 720));
+        ClientSize = new Size(ClientSize.Width, Math.Clamp(content + buttons, LogicalToDeviceUnits(300), LogicalToDeviceUnits(720)));
     }
 
     Control BuildAbout()

@@ -34,6 +34,8 @@ sealed class SetupDialog : Form
 
     public SetupDialog(MainForm.Theme t, Func<int[]> rawAxes)
     {
+        AutoScaleDimensions = new SizeF(96f, 96f);
+        AutoScaleMode = AutoScaleMode.Dpi;
         _t = t;
         _rawAxes = rawAxes;
 

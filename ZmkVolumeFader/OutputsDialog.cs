@@ -34,6 +34,8 @@ sealed class OutputsDialog : Form
     public OutputsDialog(MainForm.Theme t, string[] labels, List<OutputPref>[] outs,
         IReadOnlyList<OutputPref> known, IEnumerable<string> presentIds)
     {
+        AutoScaleDimensions = new SizeF(96f, 96f);
+        AutoScaleMode = AutoScaleMode.Dpi;
         _t = t;
         _n = outs.Length;
         _labels = labels;
@@ -100,9 +102,9 @@ sealed class OutputsDialog : Form
             ApplyDark();
             // Fit to content up to a cap (scrolls beyond); done here so it runs
             // after DPI/font scaling.
-            int content = root.PreferredSize.Height + 14;
+            int content = root.PreferredSize.Height + LogicalToDeviceUnits(14);
             int foot = footer.PreferredSize.Height;
-            ClientSize = new Size(ClientSize.Width, Math.Clamp(content + foot, 300, 720));
+            ClientSize = new Size(ClientSize.Width, Math.Clamp(content + foot, LogicalToDeviceUnits(300), LogicalToDeviceUnits(720)));
         };
         FormClosed += (_, _) => _enum.Dispose();
     }
