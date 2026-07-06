@@ -645,7 +645,9 @@ public class MainForm : Form
         foreach (var s in _sliders)
         {
             if (s.Card.Controls.Count > 0 && s.Card.Controls[0] is TableLayoutPanel inner)
-                s.Card.Height = inner.PreferredSize.Height + s.Card.Padding.Vertical;
+                // +2 logical px so sub-pixel rounding (notably at 150%) can't let
+                // the card's rounded clip region shave the combo's bottom edge.
+                s.Card.Height = inner.PreferredSize.Height + s.Card.Padding.Vertical + LogicalToDeviceUnits(2);
             total += s.Card.Height + s.Card.Margin.Vertical;
         }
         int chrome = _footer.PreferredSize.Height + LogicalToDeviceUnits(14) * 2 + LogicalToDeviceUnits(12);
@@ -675,10 +677,11 @@ public class MainForm : Form
     // Build one slider: its card, controls, and wiring, for the given HID axis.
     Axis BuildSlider(int axisIndex, string name)
     {
-        // Anchor (not Dock.Fill) so the owner-drawn box keeps its own ItemHeight-
-        // driven height; Dock.Fill pinned it to the row and clipped the text at
-        // high DPI.
-        var combo = new RoundedComboBox { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right, Placeholder = "No target selected" };
+        // Dock.Fill so the combo fills its cell exactly (its height is forced via
+        // DesiredHeight + reported through GetPreferredSize, so the row is sized to
+        // match). Anchoring instead let the taller window spill below its cell and
+        // clip against the card edge at 150% scaling.
+        var combo = new RoundedComboBox { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Margin = new Padding(0), Dock = DockStyle.Fill, Placeholder = "No target selected" };
         var bar = new FaderBar { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
         var pct = new Label { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
         var nameLbl = new Label { Text = name, AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
