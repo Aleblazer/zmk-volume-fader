@@ -157,9 +157,13 @@ internal sealed class RoundedComboBox : ComboBox
 
     void PaintClosed(Graphics g)
     {
+        // Paint into the actual client area — the control Height can exceed
+        // ClientSize.Height, and centring on Height then drops text below the
+        // painted region and clips it.
+        int w = ClientSize.Width, h = ClientSize.Height;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.Clear(Surround);
-        var r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+        var r = new RectangleF(0.5f, 0.5f, w - 1.5f, h - 1.5f);
         using (var path = RoundGfx.Round(r, Radius))
         {
             using (var b = new SolidBrush(BoxColor)) g.FillPath(b, path);
@@ -173,20 +177,21 @@ internal sealed class RoundedComboBox : ComboBox
             text = Placeholder!;
             textColor = PlaceholderColor;
         }
-        int textLeft = 9;
+        int textLeft = LogicalToDeviceUnits(9);
         if (DrawLeadingIcon != null && SelectedIndex >= 0 && SelectedItem != null)
         {
             int isz = LogicalToDeviceUnits(18);
-            var ir = new Rectangle(LogicalToDeviceUnits(8), (Height - isz) / 2, isz, isz);
+            var ir = new Rectangle(LogicalToDeviceUnits(8), (h - isz) / 2, isz, isz);
             DrawLeadingIcon(g, ir, SelectedItem, textColor);
             textLeft = ir.Right + LogicalToDeviceUnits(6);
         }
-        var textRect = new Rectangle(textLeft, 0, Width - textLeft - 22, Height);
+        var textRect = new Rectangle(textLeft, 0, w - textLeft - LogicalToDeviceUnits(22), h);
         TextRenderer.DrawText(g, text, Font, textRect, textColor,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
 
-        float cxv = Width - 15, cyv = Height / 2f;
+        float cxv = w - LogicalToDeviceUnits(15), cyv = h / 2f;
+        float ax = LogicalToDeviceUnits(4), ay = LogicalToDeviceUnits(2);
         using var cp = new Pen(ChevronColor, 1.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
-        g.DrawLines(cp, new[] { new PointF(cxv - 4, cyv - 2), new PointF(cxv, cyv + 2.5f), new PointF(cxv + 4, cyv - 2) });
+        g.DrawLines(cp, new[] { new PointF(cxv - ax, cyv - ay), new PointF(cxv, cyv + ay + 0.5f), new PointF(cxv + ax, cyv - ay) });
     }
 }
