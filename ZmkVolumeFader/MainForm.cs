@@ -637,7 +637,7 @@ public class MainForm : Form
         string[] tabNames = { "Output", "Apps", "Categories" };
         Action<Graphics, Rectangle, Color>[] tabIcons = { GlyphSpeaker, GlyphApps, GlyphTag };
         var tabFont = new Font("Segoe UI", 8.25f);
-        const int tabIconSz = 11, tabH = 23;
+        const int tabIconSz = 11, tabH = 27;
         for (int k = 0; k < 3; k++)
         {
             int kind = k;
