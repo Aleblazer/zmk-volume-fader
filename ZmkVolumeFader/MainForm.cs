@@ -1367,7 +1367,18 @@ public class MainForm : Form
             ApplyCalibration(s, cfg.Cal);
         }
         _loadingSettings = false;
-        foreach (var s in _sliders) ApplyActive(s);   // output cap comes from DeviceMax
+        // Refresh each card to its loaded target: restyle the tab row and refill
+        // the combo for that tab (Output/App/Category) before selecting within it.
+        // Without this the combo still holds the previous tab's items and an
+        // App/Category target can't be re-selected (falls back to no selection).
+        foreach (var s in _sliders)
+        {
+            StyleTabs(s);
+            _applyingActive = true;
+            PopulateCombo(s);
+            _applyingActive = false;
+            ApplyActive(s);   // output cap comes from DeviceMax
+        }
     }
 
     // Rebuild the on-screen sliders from a profile's slider set (count, axes,
