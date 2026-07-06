@@ -264,12 +264,13 @@ public class MainForm : Form
             LayoutBox();
         }
 
-        int Zone => 18;   // right strip holding the chevrons
+        int Zone => LogicalToDeviceUnits(18);   // right strip holding the chevrons
 
         void LayoutBox()
         {
             int h = _box.PreferredHeight;
-            _box.SetBounds(7, Math.Max(0, (Height - h) / 2), Math.Max(10, Width - Zone - 9), h);
+            int padL = LogicalToDeviceUnits(7), padR = LogicalToDeviceUnits(9);
+            _box.SetBounds(padL, Math.Max(0, (Height - h) / 2), Math.Max(10, Width - Zone - padR), h);
         }
 
         void Set(int v)
@@ -314,10 +315,11 @@ public class MainForm : Form
                 g.FillPath(bg, path);
                 g.DrawPath(pen, path);
             }
-            int cx = Width - Zone / 2 - 3, my = Height / 2;
+            int cx = Width - Zone / 2 - LogicalToDeviceUnits(3), my = Height / 2;
+            int aw = LogicalToDeviceUnits(4), ah = LogicalToDeviceUnits(6), yo = LogicalToDeviceUnits(2);
             using var cb = new SolidBrush(ChevronColor);
-            g.FillPolygon(cb, new[] { new Point(cx - 4, my - 2), new Point(cx + 4, my - 2), new Point(cx, my - 6) });
-            g.FillPolygon(cb, new[] { new Point(cx - 4, my + 2), new Point(cx + 4, my + 2), new Point(cx, my + 6) });
+            g.FillPolygon(cb, new[] { new Point(cx - aw, my - yo), new Point(cx + aw, my - yo), new Point(cx, my - ah) });
+            g.FillPolygon(cb, new[] { new Point(cx - aw, my + yo), new Point(cx + aw, my + yo), new Point(cx, my + ah) });
         }
 
         protected override void OnMouseDown(MouseEventArgs e)
@@ -657,7 +659,10 @@ public class MainForm : Form
     // Build one slider: its card, controls, and wiring, for the given HID axis.
     Axis BuildSlider(int axisIndex, string name)
     {
-        var combo = new RoundedComboBox { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Dock = DockStyle.Fill, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right, Placeholder = "No target selected" };
+        // Anchor (not Dock.Fill) so the owner-drawn box keeps its own ItemHeight-
+        // driven height; Dock.Fill pinned it to the row and clipped the text at
+        // high DPI.
+        var combo = new RoundedComboBox { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Margin = new Padding(0), Anchor = AnchorStyles.Left | AnchorStyles.Right, Placeholder = "No target selected" };
         var bar = new FaderBar { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
         var pct = new Label { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
         var nameLbl = new Label { Text = name, AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
