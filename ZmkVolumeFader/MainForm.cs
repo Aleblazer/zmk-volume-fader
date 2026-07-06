@@ -628,7 +628,10 @@ public class MainForm : Form
         {
             int fh = s.Combo.Font.Height;
             s.Combo.ItemHeight = fh + LogicalToDeviceUnits(8);   // dropdown list rows
-            s.Combo.Height = fh + LogicalToDeviceUnits(12);       // closed box (custom-painted)
+            // Force the closed box taller than the font (a DropDownList otherwise
+            // clamps to ~font height and clips descenders at high DPI).
+            s.Combo.DesiredHeight = fh + LogicalToDeviceUnits(12);
+            s.Combo.Height = s.Combo.DesiredHeight;
             s.Limit.SizeToFont();
         }
     }

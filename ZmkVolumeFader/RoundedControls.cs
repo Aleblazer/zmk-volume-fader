@@ -104,6 +104,10 @@ internal sealed class RoundedComboBox : ComboBox
     public Color BorderColor { get; set; } = Color.Gray;
     public Color ChevronColor { get; set; } = Color.Gray;
     public int Radius { get; set; } = 8;
+    // Force a taller control than the font-derived default (a DropDownList clamps
+    // its own height in SetBoundsCore, so we override it via WM_WINDOWPOSCHANGING).
+    // 0 = let the combo size itself.
+    public int DesiredHeight { get; set; }
     // Shown (in PlaceholderColor) when nothing is selected.
     public string? Placeholder { get; set; }
     public Color PlaceholderColor { get; set; } = Color.Gray;
@@ -112,8 +116,11 @@ internal sealed class RoundedComboBox : ComboBox
     // owner-drawn separately via the DrawItem event.
     public Action<Graphics, Rectangle, object?, Color>? DrawLeadingIcon { get; set; }
 
-    const int WM_PAINT = 0x000F, WM_ERASEBKGND = 0x0014;
+    const int WM_PAINT = 0x000F, WM_ERASEBKGND = 0x0014, WM_WINDOWPOSCHANGING = 0x0046;
+    const uint SWP_NOSIZE = 0x0001;
 
+    [StructLayout(LayoutKind.Sequential)]
+    struct WINDOWPOS { public IntPtr hwnd, hwndInsertAfter; public int x, y, cx, cy; public uint flags; }
     [StructLayout(LayoutKind.Sequential)]
     struct RECT { public int L, T, R, B; }
     [StructLayout(LayoutKind.Sequential)]
@@ -137,6 +144,18 @@ internal sealed class RoundedComboBox : ComboBox
 
     protected override void WndProc(ref Message m)
     {
+        // Override the DropDownList's self-imposed height clamp.
+        if (m.Msg == WM_WINDOWPOSCHANGING && DesiredHeight > 0)
+        {
+            var wp = Marshal.PtrToStructure<WINDOWPOS>(m.LParam);
+            if ((wp.flags & SWP_NOSIZE) == 0 && wp.cy != DesiredHeight)
+            {
+                wp.cy = DesiredHeight;
+                Marshal.StructureToPtr(wp, m.LParam, false);
+            }
+            base.WndProc(ref m);
+            return;
+        }
         if (m.Msg == WM_ERASEBKGND) { m.Result = (IntPtr)1; return; }
         if (m.Msg == WM_PAINT)
         {
