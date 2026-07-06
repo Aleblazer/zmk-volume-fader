@@ -599,6 +599,9 @@ public class MainForm : Form
         _tray.Visible = true;
 
         Resize += (_, _) => { if (WindowState == FormWindowState.Minimized) MinimizeToTray(); };
+        // Moved to a monitor at a different scale — re-fit after the framework
+        // rescales the controls.
+        DpiChanged += (_, _) => BeginInvoke(FitWindowHeight);
 
         Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); };
         FormClosing += OnFormClosing;
@@ -621,7 +624,9 @@ public class MainForm : Form
         int chrome = _footer.PreferredSize.Height + LogicalToDeviceUnits(14) * 2 + LogicalToDeviceUnits(12);
         int want = total + chrome;
         int cap = Math.Min(LogicalToDeviceUnits(760), Screen.FromControl(this).WorkingArea.Height - LogicalToDeviceUnits(80));
-        ClientSize = new Size(ClientSize.Width, Math.Clamp(want, LogicalToDeviceUnits(300), cap));
+        // Force width to the DPI-scaled design width too — belt-and-braces in case
+        // the framework auto-scale didn't already widen it.
+        ClientSize = new Size(LogicalToDeviceUnits(460), Math.Clamp(want, LogicalToDeviceUnits(300), cap));
     }
 
     // (Re)build the slider host with one row per slider. Called on construction

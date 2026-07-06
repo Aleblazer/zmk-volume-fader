@@ -14,6 +14,9 @@
     <AssemblyVersion>1.1.0.0</AssemblyVersion>
     <Product>ZMK Volume Fader</Product>
     <Company>Aleblazer</Company>
+    <!-- Per-monitor DPI so WinForms auto-scales the (hand-coded) layout at 125%+
+         Windows display scaling and re-scales when moved between monitors. -->
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
   </PropertyGroup>
 
   <ItemGroup>
