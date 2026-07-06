@@ -26,6 +26,7 @@ sealed class OptionsDialog : Form
     readonly List<OutputPref>[] _outputs;
     List<Category> _categories;
     readonly IReadOnlyDictionary<string, string> _knownApps;
+    readonly IReadOnlyDictionary<string, Image?>? _appIcons;
     readonly string[] _labels;
     readonly IReadOnlyList<OutputPref> _known;
     readonly string[] _presentIds;
@@ -56,8 +57,10 @@ sealed class OptionsDialog : Form
     public OptionsDialog(MainForm.Theme theme, ThemeMode themeMode, bool startWithWindows,
         Calibration[] cals, Func<int>[] raws, List<OutputPref>[] outs, string[] labels,
         IReadOnlyList<OutputPref> known, IEnumerable<string> presentIds,
-        List<Category> categories, IReadOnlyDictionary<string, string> knownApps)
+        List<Category> categories, IReadOnlyDictionary<string, string> knownApps,
+        IReadOnlyDictionary<string, Image?>? appIcons = null)
     {
+        _appIcons = appIcons;
         _t = theme;
         _n = cals.Length;
         _cal = cals;
@@ -223,7 +226,7 @@ sealed class OptionsDialog : Form
 
     void OpenCategories()
     {
-        using var dlg = new CategoriesDialog(_t, _categories, _knownApps);
+        using var dlg = new CategoriesDialog(_t, _categories, _knownApps, _appIcons);
         if (dlg.ShowDialog(this) == DialogResult.OK) _categories = dlg.Result;
     }
 

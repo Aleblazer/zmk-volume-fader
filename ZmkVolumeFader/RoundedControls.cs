@@ -29,6 +29,10 @@ internal sealed class RoundedButton : Button
 {
     public Color Surround { get; set; } = Color.Black;
     public int Radius { get; set; } = 8;
+    // Optional leading glyph, painted in the current ForeColor to the left of the
+    // text. Receives (graphics, icon rect, colour). Null = text-only (centred).
+    public Action<Graphics, Rectangle, Color>? DrawIcon { get; set; }
+    public int IconSize { get; set; } = 14;
     bool _hover, _down;
 
     public RoundedButton()
@@ -37,6 +41,15 @@ internal sealed class RoundedButton : Button
                  | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
         FlatStyle = FlatStyle.Flat;
         FlatAppearance.BorderSize = 0;
+    }
+
+    // AutoSize measures text only; reserve room for the leading icon + gap so the
+    // label isn't clipped.
+    public override Size GetPreferredSize(Size proposedSize)
+    {
+        var s = base.GetPreferredSize(proposedSize);
+        if (DrawIcon != null) s.Width += IconSize + 6;
+        return s;
     }
 
     protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
@@ -61,8 +74,23 @@ internal sealed class RoundedButton : Button
         if (border.A > 0 && border != BackColor)
             using (var p = new Pen(border, 1f)) g.DrawPath(p, path);
 
-        TextRenderer.DrawText(g, Text, Font, new Rectangle(0, 0, Width, Height), ForeColor,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+        if (DrawIcon == null)
+        {
+            TextRenderer.DrawText(g, Text, Font, new Rectangle(0, 0, Width, Height), ForeColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            return;
+        }
+
+        // Icon + text centred as a group.
+        const int gap = 6;
+        var ts = TextRenderer.MeasureText(g, Text, Font, new Size(int.MaxValue, Height),
+            TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+        int total = IconSize + gap + ts.Width;
+        int x = Math.Max(2, (Width - total) / 2);
+        DrawIcon(g, new Rectangle(x, (Height - IconSize) / 2, IconSize, IconSize), ForeColor);
+        var tr = new Rectangle(x + IconSize + gap, 0, Width - (x + IconSize + gap), Height);
+        TextRenderer.DrawText(g, Text, Font, tr, ForeColor,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
     }
 }
 
@@ -79,6 +107,10 @@ internal sealed class RoundedComboBox : ComboBox
     // Shown (in PlaceholderColor) when nothing is selected.
     public string? Placeholder { get; set; }
     public Color PlaceholderColor { get; set; } = Color.Gray;
+    // Optional leading icon for the selected item, painted in the closed box.
+    // Receives (graphics, icon rect, selected item, text colour). List rows are
+    // owner-drawn separately via the DrawItem event.
+    public Action<Graphics, Rectangle, object?, Color>? DrawLeadingIcon { get; set; }
 
     const int WM_PAINT = 0x000F, WM_ERASEBKGND = 0x0014;
 
@@ -137,7 +169,14 @@ internal sealed class RoundedComboBox : ComboBox
             text = Placeholder!;
             textColor = PlaceholderColor;
         }
-        var textRect = new Rectangle(9, 0, Width - 9 - 22, Height);
+        int textLeft = 9;
+        if (DrawLeadingIcon != null && SelectedIndex >= 0 && SelectedItem != null)
+        {
+            var ir = new Rectangle(8, (Height - 16) / 2, 16, 16);
+            DrawLeadingIcon(g, ir, SelectedItem, textColor);
+            textLeft = ir.Right + 6;
+        }
+        var textRect = new Rectangle(textLeft, 0, Width - textLeft - 22, Height);
         TextRenderer.DrawText(g, text, Font, textRect, textColor,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
 

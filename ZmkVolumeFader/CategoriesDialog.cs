@@ -13,6 +13,7 @@ sealed class CategoriesDialog : Form
 
     readonly MainForm.Theme _t;
     readonly (string Key, string Name)[] _apps;   // all seen apps, sorted by name
+    readonly IReadOnlyDictionary<string, Image?>? _appIcons;
 
     readonly TextBox _name = new() { BorderStyle = BorderStyle.FixedSingle };
     readonly ListBox _catList = new() { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, BorderStyle = BorderStyle.FixedSingle, IntegralHeight = false };
@@ -23,9 +24,11 @@ sealed class CategoriesDialog : Form
     [DllImport("dwmapi.dll")]
     static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
-    public CategoriesDialog(MainForm.Theme t, List<Category> categories, IReadOnlyDictionary<string, string> knownApps)
+    public CategoriesDialog(MainForm.Theme t, List<Category> categories, IReadOnlyDictionary<string, string> knownApps,
+        IReadOnlyDictionary<string, Image?>? appIcons = null)
     {
         _t = t;
+        _appIcons = appIcons;
         Result = categories.Select(c => new Category { Name = c.Name, AppKeys = new(c.AppKeys) }).ToList();
         _apps = knownApps.Select(kv => (kv.Key, kv.Value)).OrderBy(a => a.Value, StringComparer.OrdinalIgnoreCase).ToArray();
 
@@ -171,9 +174,21 @@ sealed class CategoriesDialog : Form
         bool sel = (e.State & DrawItemState.Selected) != 0;
         using (var b = new SolidBrush(sel ? _t.Accent : _t.CtlBg)) e.Graphics.FillRectangle(b, e.Bounds);
         Color fg = sel ? AccentText() : _t.Text;
-        string box = member ? "☑" : "☐";   // ☑ / ☐
-        var r = new Rectangle(e.Bounds.X + 6, e.Bounds.Y, e.Bounds.Width - 8, e.Bounds.Height);
-        TextRenderer.DrawText(e.Graphics, $"{box}  {_apps[e.Index].Name}", _appList.Font, r, fg,
+        // Checkbox glyph in a fixed lead column.
+        var boxRect = new Rectangle(e.Bounds.X + 6, e.Bounds.Y, 18, e.Bounds.Height);
+        TextRenderer.DrawText(e.Graphics, member ? "☑" : "☐", _appList.Font, boxRect, fg,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+        int left = boxRect.Right + 2;
+        // App icon, if we have one.
+        if (_appIcons != null && _appIcons.TryGetValue(_apps[e.Index].Key, out var img) && img != null)
+        {
+            var ir = new Rectangle(left, e.Bounds.Y + (e.Bounds.Height - 16) / 2, 16, 16);
+            e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+            e.Graphics.DrawImage(img, ir);
+            left = ir.Right + 5;
+        }
+        var r = new Rectangle(left, e.Bounds.Y, e.Bounds.Right - left - 2, e.Bounds.Height);
+        TextRenderer.DrawText(e.Graphics, _apps[e.Index].Name, _appList.Font, r, fg,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
     }
 

@@ -474,6 +474,9 @@ public class MainForm : Form
     readonly Dictionary<string, string> _knownApps = new();
     HashSet<string> _liveApps = new();   // apps with a session right now (i.e. in the mixer)
     Dictionary<string, List<AudioSessionControl>> _appSessions = new();
+    // App-key -> extracted 16px exe icon (null once = couldn't extract, retried
+    // cheaply while still null). Kept for the app lifetime.
+    readonly Dictionary<string, Image?> _appIcons = new();
     List<Category> _categories = new();
     readonly System.Windows.Forms.Timer _sessionPoll = new() { Interval = 1000 };
 
@@ -631,10 +634,11 @@ public class MainForm : Form
         var tabRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 4) };
         var tabs = new RoundedButton[3];
         string[] tabNames = { "Output", "Apps", "Categories" };
+        Action<Graphics, Rectangle, Color>[] tabIcons = { GlyphSpeaker, GlyphApps, GlyphTag };
         for (int k = 0; k < 3; k++)
         {
             int kind = k;
-            var b = new RoundedButton { Text = tabNames[k], AutoSize = true, Padding = new Padding(10, 3, 10, 3), Margin = new Padding(0, 0, 4, 0), Radius = 7 };
+            var b = new RoundedButton { Text = tabNames[k], AutoSize = true, Padding = new Padding(9, 3, 10, 3), Margin = new Padding(0, 0, 4, 0), Radius = 7, DrawIcon = tabIcons[k], IconSize = 13 };
             b.Click += (_, _) => SetTab(axis, (TargetKind)kind);
             tabs[k] = b;
             tabRow.Controls.Add(b);
@@ -648,6 +652,7 @@ public class MainForm : Form
 
         combo.SelectedIndexChanged += (_, _) => OnDevicePicked(axis);
         combo.DrawItem += OnComboDrawItem;
+        combo.DrawLeadingIcon = DrawComboIcon;
         limit.ValueChanged += (_, _) => OnLimitChanged(axis);
         return axis;
     }
@@ -813,10 +818,97 @@ public class MainForm : Form
         using (var b = new SolidBrush(bg)) e.Graphics.FillRectangle(b, e.Bounds);
         if (e.Index >= 0)
         {
-            var r = new Rectangle(e.Bounds.X + 4, e.Bounds.Y, e.Bounds.Width - 6, e.Bounds.Height);
-            TextRenderer.DrawText(e.Graphics, cb.GetItemText(cb.Items[e.Index]), cb.Font, r, fg,
+            var item = cb.Items[e.Index];
+            var ir = new Rectangle(e.Bounds.X + 5, e.Bounds.Y + (e.Bounds.Height - 16) / 2, 16, 16);
+            DrawComboIcon(e.Graphics, ir, item, fg);
+            int left = ir.Right + 5;
+            var r = new Rectangle(left, e.Bounds.Y, e.Bounds.Right - left - 2, e.Bounds.Height);
+            TextRenderer.DrawText(e.Graphics, cb.GetItemText(item), cb.Font, r, fg,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
         }
+    }
+
+    // Leading icon for a combo row / the closed box: real exe icon for apps,
+    // drawn glyphs for outputs / system sounds / categories.
+    void DrawComboIcon(Graphics g, Rectangle r, object? item, Color fg)
+    {
+        switch (item)
+        {
+            case DeviceItem:
+                GlyphSpeaker(g, r, fg);
+                break;
+            case CategoryItem:
+                GlyphTag(g, r, fg);
+                break;
+            case AppItem ai:
+                var img = AppIcon(ai.Key);
+                if (img != null)
+                {
+                    var save = g.InterpolationMode;
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.DrawImage(img, r);
+                    g.InterpolationMode = save;
+                }
+                else if (ai.Key == SystemAppKey) GlyphSpeaker(g, r, fg);
+                else GlyphApps(g, r, fg);
+                break;
+        }
+    }
+
+    // --- monochrome vector glyphs (tinted to the caller's colour) --------------
+    // Each fills a ~16px square; used for tab icons and non-app combo rows.
+
+    static void GlyphSpeaker(Graphics g, Rectangle r, Color c)
+    {
+        var s = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+        float x = r.X, y = r.Y, w = r.Width, h = r.Height;
+        // Speaker body: a small square + a triangular cone.
+        using var body = new GraphicsPath();
+        float bx = x + w * 0.14f, by = y + h * 0.36f, bw = w * 0.18f, bh = h * 0.28f;
+        body.AddRectangle(new RectangleF(bx, by, bw, bh));
+        body.AddPolygon(new[]
+        {
+            new PointF(bx + bw, by - h * 0.06f),
+            new PointF(x + w * 0.50f, y + h * 0.18f),
+            new PointF(x + w * 0.50f, y + h * 0.82f),
+            new PointF(bx + bw, by + bh + h * 0.06f),
+        });
+        using (var b = new SolidBrush(c)) g.FillPath(b, body);
+        // Two sound arcs.
+        using var pen = new Pen(c, Math.Max(1.2f, w * 0.09f)) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+        g.DrawArc(pen, x + w * 0.52f, y + h * 0.30f, w * 0.24f, h * 0.40f, -55, 110);
+        g.DrawArc(pen, x + w * 0.52f, y + h * 0.18f, w * 0.44f, h * 0.64f, -50, 100);
+        g.SmoothingMode = s;
+    }
+
+    static void GlyphApps(Graphics g, Rectangle r, Color c)
+    {
+        var s = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+        float w = r.Width, h = r.Height;
+        float cell = w * 0.34f, gap = w * 0.12f;
+        float x0 = r.X + w * 0.14f, y0 = r.Y + h * 0.14f;
+        using var b = new SolidBrush(c);
+        for (int iy = 0; iy < 2; iy++)
+            for (int ix = 0; ix < 2; ix++)
+            {
+                var cell2 = new RectangleF(x0 + ix * (cell + gap), y0 + iy * (cell + gap), cell, cell);
+                using var p = RoundGfx.Round(cell2, cell * 0.28f);
+                g.FillPath(b, p);
+            }
+        g.SmoothingMode = s;
+    }
+
+    static void GlyphTag(Graphics g, Rectangle r, Color c)
+    {
+        var s = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+        float x = r.X, y = r.Y, w = r.Width, h = r.Height;
+        using var b = new SolidBrush(c);
+        // Folder: a small tab, then the body.
+        using (var tab = RoundGfx.Round(new RectangleF(x + w * 0.12f, y + h * 0.24f, w * 0.42f, h * 0.20f), h * 0.06f))
+            g.FillPath(b, tab);
+        using (var body = RoundGfx.Round(new RectangleF(x + w * 0.12f, y + h * 0.34f, w * 0.76f, h * 0.42f), h * 0.08f))
+            g.FillPath(b, body);
+        g.SmoothingMode = s;
     }
 
     // Black or white, whichever reads on the accent green.
@@ -1013,6 +1105,7 @@ public class MainForm : Form
     {
         var byApp = new Dictionary<string, List<AudioSessionControl>>();
         bool namesChanged = false;
+        bool iconsChanged = false;
         foreach (var di in _present.Values)
         {
             SessionCollection sessions;
@@ -1036,9 +1129,16 @@ public class MainForm : Form
                     if (sc.IsSystemSoundsSession) { key = SystemAppKey; name = "System sounds"; }
                     else
                     {
-                        var k = AppKeyForPid((int)sc.GetProcessID, out name);
+                        var k = AppKeyForPid((int)sc.GetProcessID, out name, out var exePath);
                         if (k == null) continue;
                         key = k;
+                        // Grab the exe icon the first time (retry cheaply while null).
+                        if (!_appIcons.TryGetValue(key, out var have) || have == null)
+                        {
+                            var loaded = LoadExeIcon(exePath);
+                            _appIcons[key] = loaded;
+                            if (loaded != null) iconsChanged = true;
+                        }
                     }
 
                     if (!byApp.TryGetValue(key, out var list)) byApp[key] = list = new();
@@ -1058,15 +1158,19 @@ public class MainForm : Form
             if (namesChanged) SaveSettings();
             PopulateCombos();
         }
+        else if (iconsChanged)
+            foreach (var s in _sliders) s.Combo.Invalidate();   // late-loaded icon
         // Push app/category sliders in case their sessions just (re)appeared.
         foreach (var s in _sliders)
             if (s.Target != TargetKind.Output) { s.LastApplied = -1; Render(s); }
     }
 
-    // App identity key (lowercased process name) + a friendly display name.
-    static string? AppKeyForPid(int pid, out string name)
+    // App identity key (lowercased process name) + a friendly display name, and
+    // the exe path (for icon extraction) when the main module is readable.
+    static string? AppKeyForPid(int pid, out string name, out string? exePath)
     {
         name = "";
+        exePath = null;
         if (pid <= 0) return null;
         try
         {
@@ -1074,7 +1178,9 @@ public class MainForm : Form
             name = p.ProcessName;
             try
             {
-                var fd = p.MainModule?.FileVersionInfo.FileDescription;
+                var mod = p.MainModule;
+                exePath = mod?.FileName;
+                var fd = mod?.FileVersionInfo.FileDescription;
                 if (!string.IsNullOrWhiteSpace(fd)) name = fd!;
             }
             catch { }
@@ -1082,6 +1188,30 @@ public class MainForm : Form
         }
         catch { return null; }
     }
+
+    // Extract a small icon from an exe, scaled to 16px. Returns null on failure.
+    static Image? LoadExeIcon(string? path)
+    {
+        if (string.IsNullOrEmpty(path)) return null;
+        try
+        {
+            using var ic = Icon.ExtractAssociatedIcon(path!);
+            if (ic == null) return null;
+            using var raw = ic.ToBitmap();
+            var bmp = new Bitmap(16, 16);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.DrawImage(raw, new Rectangle(0, 0, 16, 16));
+            }
+            return bmp;
+        }
+        catch { return null; }
+    }
+
+    // The cached icon for an app (may be null if none could be extracted).
+    Image? AppIcon(string key) => _appIcons.TryGetValue(key, out var img) ? img : null;
 
     // The output the ranking alone would choose: highest-ranked present device.
     string? AutoTarget(Axis a)
@@ -1457,7 +1587,7 @@ public class MainForm : Form
         var labels = _sliders.Select(s => s.Name.Text).ToArray();
         var cats = _categories.Select(c => new Category { Name = c.Name, AppKeys = new(c.AppKeys) }).ToList();
         using var dlg = new OptionsDialog(_theme, _themeMode, GetStartWithWindows(),
-            cals, raws, outs, labels, AllKnownOutputs(), _present.Keys.ToArray(), cats, _knownApps);
+            cals, raws, outs, labels, AllKnownOutputs(), _present.Keys.ToArray(), cats, _knownApps, _appIcons);
         _calibrating = true;                 // stop driving devices while sweeping
         var result = dlg.ShowDialog(this);
         _calibrating = false;
