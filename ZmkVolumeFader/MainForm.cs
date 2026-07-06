@@ -264,6 +264,14 @@ public class MainForm : Form
             LayoutBox();
         }
 
+        // Size the control to the (DPI-scaled) font so it isn't clipped/malformed
+        // at high Windows scaling. Idempotent — safe to call after auto-scaling.
+        public void SizeToFont()
+        {
+            Size = new Size(LogicalToDeviceUnits(60), _box.PreferredHeight + LogicalToDeviceUnits(8));
+            LayoutBox();
+        }
+
         int Zone => LogicalToDeviceUnits(18);   // right strip holding the chevrons
 
         void LayoutBox()
@@ -612,12 +620,17 @@ public class MainForm : Form
     // Main-window height for N slider cards, capped (the host scrolls beyond).
     static int WindowHeightFor(int n) => Math.Clamp(n * 180 + 70, 300, 720);
 
-    // Owner-drawn combo rows use a fixed ItemHeight; size it to the (DPI-scaled)
-    // font so dropdown text isn't clipped at 125%+ scaling.
+    // Size the owner-drawn combos and the Max steppers to the (DPI-scaled) font so
+    // neither the dropdown rows nor the closed box clip at 125%+ scaling.
     void TuneComboItemHeight()
     {
         foreach (var s in _sliders)
-            s.Combo.ItemHeight = s.Combo.Font.Height + LogicalToDeviceUnits(8);
+        {
+            int fh = s.Combo.Font.Height;
+            s.Combo.ItemHeight = fh + LogicalToDeviceUnits(8);   // dropdown list rows
+            s.Combo.Height = fh + LogicalToDeviceUnits(12);       // closed box (custom-painted)
+            s.Limit.SizeToFont();
+        }
     }
 
     // Size the window to the cards' actual content. Fonts are point-based so this

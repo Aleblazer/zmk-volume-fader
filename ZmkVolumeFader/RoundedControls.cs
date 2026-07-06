@@ -129,6 +129,10 @@ internal sealed class RoundedComboBox : ComboBox
     {
         DropDownStyle = ComboBoxStyle.DropDownList;
         FlatStyle = FlatStyle.Flat;
+        // Allow a custom (taller) control height — the closed box is fully
+        // owner-painted, and a DropDownList otherwise snaps to the font height and
+        // clips descenders at high DPI.
+        IntegralHeight = false;
     }
 
     protected override void WndProc(ref Message m)
