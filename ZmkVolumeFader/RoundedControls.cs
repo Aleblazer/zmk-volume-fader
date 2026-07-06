@@ -142,6 +142,15 @@ internal sealed class RoundedComboBox : ComboBox
         IntegralHeight = false;
     }
 
+    // Report the forced height to the layout engine too, so the row/card that
+    // holds this combo is sized tall enough and doesn't clip its bottom.
+    public override Size GetPreferredSize(Size proposedSize)
+    {
+        var s = base.GetPreferredSize(proposedSize);
+        if (DesiredHeight > 0) s.Height = DesiredHeight;
+        return s;
+    }
+
     protected override void WndProc(ref Message m)
     {
         // Override the DropDownList's self-imposed height clamp.
