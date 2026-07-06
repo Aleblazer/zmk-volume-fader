@@ -13,8 +13,15 @@ namespace ZmkVolumeFader;
 /// <summary>How the UI picks its palette: follow Windows, or force one.</summary>
 internal enum ThemeMode { Auto, Light, Dark }
 
-/// <summary>What a slider controls: an output device's volume, or an app's.</summary>
-internal enum TargetKind { Output, App }
+/// <summary>What a slider controls: an output device, one app, or a category of apps.</summary>
+internal enum TargetKind { Output, App, Category }
+
+/// <summary>A named group of apps whose volume moves together.</summary>
+internal sealed class Category
+{
+    public string Name { get; set; } = "";
+    public List<string> AppKeys { get; set; } = new();   // process-name keys
+}
 
 /// <summary>
 /// Reads a ZMK dongle's hid-io fader report (vendor page 0xFF00, report id 2:
@@ -346,6 +353,13 @@ public class MainForm : Form
         public override string ToString() => Name;
     }
 
+    // A target that is a category of apps.
+    sealed class CategoryItem
+    {
+        public required string Name;
+        public override string ToString() => Name;
+    }
+
     const string SystemAppKey = "#system";
 
     // Fires a callback whenever the set of audio endpoints changes (plug/unplug,
@@ -371,6 +385,7 @@ public class MainForm : Form
         public required Label Name;    // "Left fader" heading
         public required Stepper Limit;
         public required CardPanel Card;
+        public RoundedButton[] Tabs = Array.Empty<RoundedButton>();  // Output/Apps/Categories
         public int AxisIndex;                                 // which HID report axis (0..5) drives this slider
         public Calibration Cal = new();                       // value->% mapping (persisted)
         public (int v, int pct)[] Curve = Array.Empty<(int, int)>();  // built from Cal
@@ -387,10 +402,11 @@ public class MainForm : Form
         public string? OverrideId;
         public string? ActiveId;
 
-        // Output vs app target. When App, AppKey names the app (process name) and
-        // the ranked-output machinery above is unused.
+        // Target: Output (ranked list above), App (AppKey), or Category
+        // (CategoryName). The active picker tab mirrors Target.
         public TargetKind Target;
         public string? AppKey;
+        public string? CategoryName;
     }
 
     // One slider within a device profile (persisted). Max lives per-output in
@@ -404,7 +420,8 @@ public class MainForm : Form
         public string? OverrideId { get; set; }
         public TargetKind Target { get; set; }
         public string? AppKey { get; set; }
-        public int Max { get; set; } = 100;   // per-slider cap (used for app targets)
+        public string? CategoryName { get; set; }
+        public int Max { get; set; } = 100;   // per-slider cap (used for app/category targets)
     }
 
     // Everything remembered for one physical fader unit (its sliders, in order).
@@ -424,6 +441,8 @@ public class MainForm : Form
         // process-name key -> display name for every app we've seen a session for
         // (so assigned/grouped apps keep a name while closed).
         public Dictionary<string, string> KnownApps { get; set; } = new();
+        // User-defined app groups (global across devices).
+        public List<Category> Categories { get; set; } = new();
         public ThemeMode ThemeMode { get; set; } = ThemeMode.Auto;
 
         // Legacy pre-multi-slider flat fields, read once to migrate settings.json.
@@ -455,6 +474,7 @@ public class MainForm : Form
     readonly Dictionary<string, string> _knownApps = new();
     HashSet<string> _liveApps = new();   // apps with a session right now (i.e. in the mixer)
     Dictionary<string, List<AudioSessionControl>> _appSessions = new();
+    List<Category> _categories = new();
     readonly System.Windows.Forms.Timer _sessionPoll = new() { Interval = 1000 };
 
     // Currently-present render endpoints (id -> item), rebuilt by LoadDevices.
@@ -522,6 +542,7 @@ public class MainForm : Form
         _sliders = new[] { BuildSlider(0, "Left fader"), BuildSlider(1, "Right fader") };
         _left = _sliders[0];
         _right = _sliders[1];
+        ClientSize = new Size(ClientSize.Width, WindowHeightFor(_sliders.Length));
 
         // Slider cards stack in a scrollable host; the footer stays pinned below.
         _sliderHost = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, AutoScroll = true, BackColor = Color.Transparent, Margin = new Padding(0), Padding = new Padding(0) };
@@ -563,6 +584,9 @@ public class MainForm : Form
         FormClosing += OnFormClosing;
     }
 
+    // Main-window height for N slider cards, capped (the host scrolls beyond).
+    static int WindowHeightFor(int n) => Math.Clamp(n * 180 + 70, 300, 720);
+
     // (Re)build the slider host with one row per slider. Called on construction
     // and whenever the slider set changes.
     void PopulateSliderHost()
@@ -587,28 +611,73 @@ public class MainForm : Form
         var pct = new Label { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
         var nameLbl = new Label { Text = name, AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
         var limit = new Stepper { Minimum = 1, Maximum = 100, Value = 100 };
-        var card = new CardPanel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 134, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
+        var card = new CardPanel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 168, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
 
-        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3, BackColor = Color.Transparent };
+        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // name / pct
         t.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));  // fader (track + ticks + knob)
+        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // target tabs
         t.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // combo / max
         t.Controls.Add(nameLbl, 0, 0);
         t.Controls.Add(pct, 1, 0);
         t.Controls.Add(bar, 0, 1); t.SetColumnSpan(bar, 2);
-        t.Controls.Add(combo, 0, 2);
-        t.Controls.Add(MaxCap(limit), 1, 2);
-        card.Controls.Add(t);
 
         var axis = new Axis { AxisIndex = axisIndex, Combo = combo, Bar = bar, Pct = pct, Name = nameLbl, Limit = limit, Card = card };
         axis.Curve = axis.Cal.BuildCurve();
+
+        // Target-type tabs: Output | Apps | Categories (index = (int)TargetKind).
+        var tabRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 4) };
+        var tabs = new RoundedButton[3];
+        string[] tabNames = { "Output", "Apps", "Categories" };
+        for (int k = 0; k < 3; k++)
+        {
+            int kind = k;
+            var b = new RoundedButton { Text = tabNames[k], AutoSize = true, Padding = new Padding(10, 3, 10, 3), Margin = new Padding(0, 0, 4, 0), Radius = 7 };
+            b.Click += (_, _) => SetTab(axis, (TargetKind)kind);
+            tabs[k] = b;
+            tabRow.Controls.Add(b);
+        }
+        axis.Tabs = tabs;
+        t.Controls.Add(tabRow, 0, 2); t.SetColumnSpan(tabRow, 2);
+
+        t.Controls.Add(combo, 0, 3);
+        t.Controls.Add(MaxCap(limit), 1, 3);
+        card.Controls.Add(t);
 
         combo.SelectedIndexChanged += (_, _) => OnDevicePicked(axis);
         combo.DrawItem += OnComboDrawItem;
         limit.ValueChanged += (_, _) => OnLimitChanged(axis);
         return axis;
+    }
+
+    // Switch a slider's target type (which tab is active) and repopulate its combo.
+    void SetTab(Axis a, TargetKind kind)
+    {
+        if (a.Target == kind) return;
+        a.Target = kind;
+        StyleTabs(a);
+        _applyingActive = true;
+        PopulateCombo(a);
+        _applyingActive = false;
+        a.LastApplied = -1;
+        ApplyActive(a);
+        if (!_loadingSettings) SaveSettings();
+    }
+
+    void StyleTabs(Axis a)
+    {
+        for (int k = 0; k < a.Tabs.Length; k++)
+        {
+            var b = a.Tabs[k];
+            bool on = k == (int)a.Target;
+            b.Surround = _theme.Card;
+            b.BackColor = on ? _theme.Accent : _theme.CtlBg;
+            b.ForeColor = on ? AccentText() : _theme.Text;
+            b.FlatAppearance.BorderColor = on ? _theme.Accent : _theme.CtlBorder;
+            b.Invalidate();
+        }
     }
 
     static FlowLayoutPanel MaxCap(Stepper n)
@@ -702,6 +771,8 @@ public class MainForm : Form
 
             var u = s.Limit;
             u.BackColor = t.CtlBg; u.ForeColor = t.Text; u.BorderColor = t.CtlBorder; u.ChevronColor = t.Subtle; u.Surround = t.Card; u.Invalidate();
+
+            StyleTabs(s);
         }
         foreach (var btn in new[] { _btnRefresh, _btnOptions })
         {
@@ -742,17 +813,8 @@ public class MainForm : Form
         using (var b = new SolidBrush(bg)) e.Graphics.FillRectangle(b, e.Bounds);
         if (e.Index >= 0)
         {
-            var item = cb.Items[e.Index];
             var r = new Rectangle(e.Bounds.X + 4, e.Bounds.Y, e.Bounds.Width - 6, e.Bounds.Height);
-            // Tag app entries so they're distinguishable from output devices.
-            if (item is AppItem)
-            {
-                Color tag = hi ? fg : _theme.Subtle;
-                TextRenderer.DrawText(e.Graphics, "app", cb.Font, r, tag,
-                    TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
-                r.Width -= 30;
-            }
-            TextRenderer.DrawText(e.Graphics, cb.GetItemText(item), cb.Font, r, fg,
+            TextRenderer.DrawText(e.Graphics, cb.GetItemText(cb.Items[e.Index]), cb.Font, r, fg,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
         }
     }
@@ -865,30 +927,42 @@ public class MainForm : Form
     // app changes.
     void PopulateCombos()
     {
-        var devs = _present.Values.OrderBy(d => d.Name).Cast<object>().ToArray();
-        // Apps currently in the mixer, plus any app assigned to a slider (so an
-        // assignment doesn't disappear when the app isn't running right now).
-        var assigned = _sliders.Where(s => s.Target == TargetKind.App && s.AppKey != null).Select(s => s.AppKey!);
-        var apps = _liveApps.Concat(assigned).Distinct()
-            .Select(k => new AppItem { Key = k, Name = _knownApps.TryGetValue(k, out var nm) ? nm : k })
-            .OrderBy(a => a.Name, StringComparer.OrdinalIgnoreCase)
-            .Cast<object>().ToArray();
-
         // Clearing items resets the combo selection and would otherwise fire
         // OnDevicePicked with no selection; suppress that (ApplyActive re-selects).
         _applyingActive = true;
-        foreach (var s in _sliders)
-        {
-            var cb = s.Combo;
-            cb.BeginUpdate();
-            cb.Items.Clear();
-            cb.Items.AddRange(devs);
-            cb.Items.AddRange(apps);
-            cb.EndUpdate();
-        }
+        foreach (var s in _sliders) PopulateCombo(s);
         _applyingActive = false;
-
         foreach (var s in _sliders) ApplyActive(s);
+    }
+
+    // Fill one slider's combo with the items for its active tab.
+    void PopulateCombo(Axis a)
+    {
+        var cb = a.Combo;
+        cb.BeginUpdate();
+        cb.Items.Clear();
+        switch (a.Target)
+        {
+            case TargetKind.Output:
+                cb.Items.AddRange(_present.Values.OrderBy(d => d.Name).Cast<object>().ToArray());
+                break;
+            case TargetKind.App:
+                // Live mixer apps, plus this slider's assigned app if it's closed.
+                var keys = _liveApps.ToHashSet();
+                if (a.AppKey != null) keys.Add(a.AppKey);
+                cb.Items.AddRange(keys
+                    .Select(k => new AppItem { Key = k, Name = _knownApps.TryGetValue(k, out var nm) ? nm : k })
+                    .OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
+                    .Cast<object>().ToArray());
+                break;
+            case TargetKind.Category:
+                cb.Items.AddRange(_categories
+                    .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+                    .Select(c => new CategoryItem { Name = c.Name })
+                    .Cast<object>().ToArray());
+                break;
+        }
+        cb.EndUpdate();
     }
 
     void RegisterDeviceNotifications()
@@ -984,9 +1058,9 @@ public class MainForm : Form
             if (namesChanged) SaveSettings();
             PopulateCombos();
         }
-        // Push app-targeted sliders in case their sessions just (re)appeared.
+        // Push app/category sliders in case their sessions just (re)appeared.
         foreach (var s in _sliders)
-            if (s.Target == TargetKind.App) { s.LastApplied = -1; Render(s); }
+            if (s.Target != TargetKind.Output) { s.LastApplied = -1; Render(s); }
     }
 
     // App identity key (lowercased process name) + a friendly display name.
@@ -1026,10 +1100,11 @@ public class MainForm : Form
     // select the app; output targets resolve the ranked list and load the cap.
     void ApplyActive(Axis a)
     {
-        if (a.Target == TargetKind.App)
+        if (a.Target != TargetKind.Output)
         {
             _applyingActive = true;
-            SelectAppInCombo(a.Combo, a.AppKey);
+            if (a.Target == TargetKind.App) SelectAppInCombo(a.Combo, a.AppKey);
+            else SelectCategoryInCombo(a.Combo, a.CategoryName);
             _applyingActive = false;
             a.ActiveId = null;
             Render(a);
@@ -1072,6 +1147,15 @@ public class MainForm : Form
         if (cb.SelectedIndex != -1) cb.SelectedIndex = -1;
     }
 
+    static void SelectCategoryInCombo(ComboBox cb, string? name)
+    {
+        if (name != null)
+            for (int i = 0; i < cb.Items.Count; i++)
+                if (cb.Items[i] is CategoryItem ci && ci.Name == name)
+                { if (cb.SelectedIndex != i) cb.SelectedIndex = i; return; }
+        if (cb.SelectedIndex != -1) cb.SelectedIndex = -1;
+    }
+
     void OnDevicePicked(Axis a)
     {
         if (_loadingSettings || _applyingActive) return;
@@ -1081,6 +1165,14 @@ public class MainForm : Form
             // Switch this slider to controlling an app's volume (everywhere it plays).
             a.Target = TargetKind.App;
             a.AppKey = app.Key;
+            ApplyActive(a);
+            SaveSettings();
+            return;
+        }
+        if (item is CategoryItem cat)
+        {
+            a.Target = TargetKind.Category;
+            a.CategoryName = cat.Name;
             ApplyActive(a);
             SaveSettings();
             return;
@@ -1135,6 +1227,7 @@ public class MainForm : Form
             _devices = s.Devices != null ? new(s.Devices) : new();
             _knownApps.Clear();
             if (s.KnownApps != null) foreach (var kv in s.KnownApps) _knownApps[kv.Key] = kv.Value;
+            _categories = s.Categories ?? new();
             _themeMode = s.ThemeMode;
 
             // No per-device profiles yet but old flat settings present -> build a
@@ -1189,12 +1282,13 @@ public class MainForm : Form
                         OverrideId = s.OverrideId,
                         Target = s.Target,
                         AppKey = s.AppKey,
+                        CategoryName = s.CategoryName,
                         Max = (int)s.Limit.Value,
                     }).ToList(),
                 };
             }
 
-            var s = new Settings { Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), ThemeMode = _themeMode };
+            var s = new Settings { Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), Categories = _categories, ThemeMode = _themeMode };
             Directory.CreateDirectory(SettingsDir);
             // Write to a temp file then swap it in, so a crash mid-write can't
             // leave a half-written (corrupt) file behind.
@@ -1268,7 +1362,8 @@ public class MainForm : Form
             s.OverrideId = cfg.OverrideId;
             s.Target = cfg.Target;
             s.AppKey = cfg.AppKey;
-            if (cfg.Target == TargetKind.App) s.Limit.Value = ClampLimit(cfg.Max);
+            s.CategoryName = cfg.CategoryName;
+            if (cfg.Target != TargetKind.Output) s.Limit.Value = ClampLimit(cfg.Max);
             ApplyCalibration(s, cfg.Cal);
         }
         _loadingSettings = false;
@@ -1288,7 +1383,8 @@ public class MainForm : Form
             a.OverrideId = c.OverrideId;
             a.Target = c.Target;
             a.AppKey = c.AppKey;
-            if (c.Target == TargetKind.App) { _loadingSettings = true; a.Limit.Value = ClampLimit(c.Max); _loadingSettings = false; }
+            a.CategoryName = c.CategoryName;
+            if (c.Target != TargetKind.Output) { _loadingSettings = true; a.Limit.Value = ClampLimit(c.Max); _loadingSettings = false; }
             ApplyCalibration(a, c.Cal);
             return a;
         }).ToArray();
@@ -1298,10 +1394,7 @@ public class MainForm : Form
 
         PopulateSliderHost();
         ApplyTheme(CurrentTheme());
-
-        // Grow the window to fit the cards, up to a cap (the host scrolls beyond).
-        const int per = 146, chrome = 70;   // card+margin, footer+padding
-        ClientSize = new Size(ClientSize.Width, Math.Clamp(_sliders.Length * per + chrome, 280, 720));
+        ClientSize = new Size(ClientSize.Width, WindowHeightFor(_sliders.Length));
 
         LoadDevices();   // repopulate combos + re-pick active outputs
         foreach (var s in old) s.Card.Dispose();
@@ -1351,8 +1444,9 @@ public class MainForm : Form
         var raws = _sliders.Select(s => (Func<int>)(() => s.LastRaw)).ToArray();
         var outs = _sliders.Select(s => ClonePrefs(s.Prefs)).ToArray();
         var labels = _sliders.Select(s => s.Name.Text).ToArray();
+        var cats = _categories.Select(c => new Category { Name = c.Name, AppKeys = new(c.AppKeys) }).ToList();
         using var dlg = new OptionsDialog(_theme, _themeMode, GetStartWithWindows(),
-            cals, raws, outs, labels, AllKnownOutputs(), _present.Keys.ToArray());
+            cals, raws, outs, labels, AllKnownOutputs(), _present.Keys.ToArray(), cats, _knownApps);
         _calibrating = true;                 // stop driving devices while sweeping
         var result = dlg.ShowDialog(this);
         _calibrating = false;
@@ -1363,14 +1457,16 @@ public class MainForm : Form
                 ApplyCalibration(_sliders[i], dlg.Cals[i]);
                 ApplyOutputs(_sliders[i], dlg.Outputs[i]);
             }
+            _categories = dlg.Categories;
             _themeMode = dlg.SelectedTheme;
             ApplyTheme(CurrentTheme());
             SetStartWithWindows(dlg.StartWithWindows);
             SaveSettings();
             if (dlg.SetupRequested) { RunSetupWizard(); return; }
         }
-        // Re-push the current position to the devices now that we're live again.
-        foreach (var s in _sliders) { s.LastApplied = -1; ApplyActive(s); }
+        // Re-push (categories/outputs may have changed, so repopulate combos too).
+        foreach (var s in _sliders) s.LastApplied = -1;
+        PopulateCombos();
     }
 
     // Adopt an edited ranked list. Re-ranking returns the fader to automatic
@@ -1521,12 +1617,15 @@ public class MainForm : Form
         float scalar = applied / 100f;
         if (a.Target == TargetKind.App)
         {
-            // Drive the app's volume on every output it's currently playing to.
-            // Nothing is driven when the app has no live session (it takes effect
-            // as soon as one appears — see PollSessions).
-            if (a.AppKey != null && _appSessions.TryGetValue(a.AppKey, out var list))
-                foreach (var sc in list)
-                { try { sc.SimpleAudioVolume.Volume = scalar; } catch { } }
+            // Drive the app on every output it's currently playing to. Nothing is
+            // driven when it has no live session; it takes effect once one appears.
+            ApplyAppVolume(a.AppKey, scalar);
+        }
+        else if (a.Target == TargetKind.Category)
+        {
+            // Move every app in the category together.
+            var cat = _categories.FirstOrDefault(c => c.Name == a.CategoryName);
+            if (cat != null) foreach (var key in cat.AppKeys) ApplyAppVolume(key, scalar);
         }
         // Each fader drives its own active output. If two sliders resolve to the
         // same endpoint they both write its volume (last move wins) — by design,
@@ -1536,6 +1635,12 @@ public class MainForm : Form
             try { di.Device.AudioEndpointVolume.MasterVolumeLevelScalar = scalar; }
             catch { }
         }
+    }
+
+    void ApplyAppVolume(string? key, float scalar)
+    {
+        if (key != null && _appSessions.TryGetValue(key, out var list))
+            foreach (var sc in list) { try { sc.SimpleAudioVolume.Volume = scalar; } catch { } }
     }
 
     void SetStatus(string text, bool connected)

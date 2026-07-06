@@ -14,6 +14,7 @@ sealed class OptionsDialog : Form
 {
     public Calibration[] Cals => _cal;
     public List<OutputPref>[] Outputs => _outputs;
+    public List<Category> Categories => _categories;
     public bool StartWithWindows => _startup.Checked;
     public ThemeMode SelectedTheme => (ThemeMode)Math.Clamp(_themeCombo.SelectedIndex, 0, 2);
     // Set when the user clicks "Set up sliders…"; the owner runs the wizard.
@@ -23,6 +24,8 @@ sealed class OptionsDialog : Form
     readonly Calibration[] _cal;
     readonly Func<int>[] _raw;
     readonly List<OutputPref>[] _outputs;
+    List<Category> _categories;
+    readonly IReadOnlyDictionary<string, string> _knownApps;
     readonly string[] _labels;
     readonly IReadOnlyList<OutputPref> _known;
     readonly string[] _presentIds;
@@ -52,13 +55,16 @@ sealed class OptionsDialog : Form
 
     public OptionsDialog(MainForm.Theme theme, ThemeMode themeMode, bool startWithWindows,
         Calibration[] cals, Func<int>[] raws, List<OutputPref>[] outs, string[] labels,
-        IReadOnlyList<OutputPref> known, IEnumerable<string> presentIds)
+        IReadOnlyList<OutputPref> known, IEnumerable<string> presentIds,
+        List<Category> categories, IReadOnlyDictionary<string, string> knownApps)
     {
         _t = theme;
         _n = cals.Length;
         _cal = cals;
         _raw = raws;
         _outputs = outs;
+        _categories = categories;
+        _knownApps = knownApps;
         _labels = labels;
         _known = known;
         _presentIds = presentIds.ToArray();
@@ -167,7 +173,7 @@ sealed class OptionsDialog : Form
 
     Panel BuildGeneral(ThemeMode mode, bool startup)
     {
-        var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 132, Margin = new Padding(0, 0, 0, 4), Padding = new Padding(12), BackColor = _t.Card };
+        var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 168, Margin = new Padding(0, 0, 0, 4), Padding = new Padding(12), BackColor = _t.Card };
 
         var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -188,16 +194,20 @@ sealed class OptionsDialog : Form
         themeRow.Controls.Add(_themeCombo);
         t.Controls.Add(themeRow, 0, 1);
 
-        // Setup wizard + the ranked output-fallback editor, side by side.
-        var btnRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
+        // Setup wizard, ranked-output editor, and category editor (wraps to fit).
+        var btnRow = new FlowLayoutPanel { AutoSize = true, WrapContents = true, MaximumSize = new Size(392, 0), BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
         var setupBtn = MakeButton("Set up sliders…", accent: false, surround: _t.Card);
-        setupBtn.Margin = new Padding(0);
+        setupBtn.Margin = new Padding(0, 0, 6, 6);
         setupBtn.Click += (_, _) => { SetupRequested = true; DialogResult = DialogResult.OK; Close(); };
         var outBtn = MakeButton("Set Default Outputs…", accent: false, surround: _t.Card);
-        outBtn.Margin = new Padding(8, 0, 0, 0);
+        outBtn.Margin = new Padding(0, 0, 6, 6);
         outBtn.Click += (_, _) => OpenOutputs();
+        var catBtn = MakeButton("Manage Categories…", accent: false, surround: _t.Card);
+        catBtn.Margin = new Padding(0, 0, 0, 6);
+        catBtn.Click += (_, _) => OpenCategories();
         btnRow.Controls.Add(setupBtn);
         btnRow.Controls.Add(outBtn);
+        btnRow.Controls.Add(catBtn);
         t.Controls.Add(btnRow, 0, 2);
 
         card.Controls.Add(t);
@@ -209,6 +219,12 @@ sealed class OptionsDialog : Form
         using var dlg = new OutputsDialog(_t, _labels, _outputs, _known, _presentIds);
         if (dlg.ShowDialog(this) == DialogResult.OK)
             for (int i = 0; i < _n; i++) _outputs[i] = dlg.Result[i];
+    }
+
+    void OpenCategories()
+    {
+        using var dlg = new CategoriesDialog(_t, _categories, _knownApps);
+        if (dlg.ShowDialog(this) == DialogResult.OK) _categories = dlg.Result;
     }
 
     Panel BuildFader(int i, string name)
