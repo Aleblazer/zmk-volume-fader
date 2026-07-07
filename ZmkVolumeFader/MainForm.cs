@@ -375,11 +375,24 @@ public class MainForm : Form
     // A target that is a category of apps.
     sealed class CategoryItem
     {
-        public required string Name;
-        public override string ToString() => Name;
+        public required string Name;   // stored CategoryName (may be the Unassigned sentinel)
+        public bool IsUnassigned => Name == UnassignedCategory;
+        public override string ToString() => IsUnassigned ? UnassignedDisplay : Name;
     }
 
     const string SystemAppKey = "#system";
+
+    // Sentinel category that captures every live app not placed in a real
+    // category. Stored as CategoryName; never a user-created category (the '#'
+    // prefix matches the System Sounds convention and can't be typed in the
+    // category editor).
+    const string UnassignedCategory = "#unassigned";
+    const string UnassignedDisplay = "Everything Else";
+
+    // Live mixer apps not assigned to any category — what the Unassigned
+    // pseudo-category drives.
+    IEnumerable<string> UnassignedKeys() =>
+        _appSessions.Keys.Where(k => !_categories.Any(c => c.AppKeys.Contains(k)));
 
     // Fires a callback whenever the set of audio endpoints changes (plug/unplug,
     // enable/disable) so the app can re-pick each fader's active output live.
@@ -1193,6 +1206,8 @@ public class MainForm : Form
                     .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
                     .Select(c => new CategoryItem { Name = c.Name })
                     .Cast<object>().ToArray());
+                // Always last: catch-all for apps in no category.
+                cb.Items.Add(new CategoryItem { Name = UnassignedCategory });
                 break;
         }
         cb.EndUpdate();
@@ -1926,6 +1941,7 @@ public class MainForm : Form
             case TargetKind.App:
                 return a.AppKey != null && _appSessions.ContainsKey(a.AppKey);
             case TargetKind.Category:
+                if (a.CategoryName == UnassignedCategory) return UnassignedKeys().Any();
                 var c = _categories.FirstOrDefault(x => x.Name == a.CategoryName);
                 return c != null && c.AppKeys.Any(_appSessions.ContainsKey);
             default:
@@ -1976,8 +1992,13 @@ public class MainForm : Form
         else if (a.Target == TargetKind.Category)
         {
             // Move every app in the category together.
-            var cat = _categories.FirstOrDefault(c => c.Name == a.CategoryName);
-            if (cat != null) foreach (var key in cat.AppKeys) ApplyAppVolume(key, scalar);
+            if (a.CategoryName == UnassignedCategory)
+                foreach (var key in UnassignedKeys()) ApplyAppVolume(key, scalar);
+            else
+            {
+                var cat = _categories.FirstOrDefault(c => c.Name == a.CategoryName);
+                if (cat != null) foreach (var key in cat.AppKeys) ApplyAppVolume(key, scalar);
+            }
         }
         // Each fader drives its own active output. If two sliders resolve to the
         // same endpoint they both write its volume (last move wins) — by design,
