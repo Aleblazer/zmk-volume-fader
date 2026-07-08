@@ -112,7 +112,7 @@ sealed class OptionsDialog : Form
 
         _scroll = new RoundedScrollPanel
         {
-            Dock = DockStyle.Fill, BackColor = Color.Transparent, Padding = new Padding(14, 14, 14, 0),
+            Dock = DockStyle.Fill, BackColor = Color.Transparent, Padding = new Padding(14, 14, 14, 14),
             ThumbColor = _t.CtlBorder, ThumbHoverColor = _t.Subtle,
         };
         _scroll.SetContent(_root);
@@ -147,7 +147,7 @@ sealed class OptionsDialog : Form
     // and wider while the window stayed ~430px and clipped the right-hand buttons.
     void FitHeight()
     {
-        int content = _root.PreferredSize.Height + LogicalToDeviceUnits(14);      // scroll padding
+        int content = _root.PreferredSize.Height + LogicalToDeviceUnits(28);      // scroll top+bottom padding
         int buttons = _btnRow.PreferredSize.Height;
         ClientSize = new Size(LogicalToDeviceUnits(430),
             Math.Clamp(content + buttons, LogicalToDeviceUnits(300), LogicalToDeviceUnits(720)));
@@ -163,7 +163,9 @@ sealed class OptionsDialog : Form
         {
             Text = $"ZMK Volume Fader  {MainForm.VersionText()}"
                  + "\nVibecoded by Aleblazer of Split Logic Keyboards",
-            AutoSize = false, Dock = DockStyle.Fill, Height = 34, TextAlign = ContentAlignment.MiddleCenter,
+            // AutoSize so both lines are always fully shown — a fixed height clipped
+            // the second line at 125%+ scaling. Anchor.None centres it in the cell.
+            AutoSize = true, Anchor = AnchorStyles.None, TextAlign = ContentAlignment.MiddleCenter,
             ForeColor = _t.Subtle, Font = new Font("Segoe UI", 8.25f), Margin = new Padding(0, 0, 0, 4),
         }, 0, 0);
 
