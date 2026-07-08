@@ -9,9 +9,9 @@
     <RootNamespace>ZmkVolumeFader</RootNamespace>
     <AssemblyName>ZmkVolumeFader</AssemblyName>
     <ApplicationIcon>app.ico</ApplicationIcon>
-    <Version>1.1.0</Version>
-    <FileVersion>1.1.0.0</FileVersion>
-    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <Version>1.2.0</Version>
+    <FileVersion>1.2.0.0</FileVersion>
+    <AssemblyVersion>1.2.0.0</AssemblyVersion>
     <Product>ZMK Volume Fader</Product>
     <Company>Aleblazer</Company>
     <!-- Per-monitor DPI so WinForms auto-scales the (hand-coded) layout at 125%+
@@ -25,7 +25,7 @@
   </ItemGroup>
 
   <!-- Embed the current git short hash (with -dirty if the tree has uncommitted
-       changes) into AssemblyInformationalVersion as "1.1.0+<hash>", so dev builds
+       changes) into AssemblyInformationalVersion as "1.2.0+<hash>", so dev builds
        can show which commit they came from. Fails soft when git is unavailable. -->
   <Target Name="SetGitCommit"
           BeforeTargets="GetAssemblyVersion;CoreCompile"
