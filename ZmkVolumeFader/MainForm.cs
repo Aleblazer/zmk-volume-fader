@@ -112,8 +112,65 @@ public class MainForm : Form
         public bool Muted { get => _muted; set { if (v_set(ref _muted, value)) Invalidate(); } }
         static bool v_set(ref bool f, bool v) { if (f == v) return false; f = v; return true; }
 
+        // Interactive (virtual) faders let the user drag the knob to set the level.
+        // Display-only (physical) faders leave this false and ignore the mouse.
+        bool _interactive;
+        public bool Interactive
+        {
+            get => _interactive;
+            set { _interactive = value; Cursor = value ? Cursors.Hand : Cursors.Default; }
+        }
+        bool _dragging;
+        // Raised while the user drags (live volume) and once more on release. The
+        // bool is true on the final (mouse-up) event so the owner can persist then.
+        public event Action<int, bool>? UserSet;
+
         public FaderBar() => SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
                                       | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+
+        // Horizontal span the knob centre travels across, matching OnPaint. Returns
+        // false when the control is too small to interact with.
+        bool Travel(out float left, out float right)
+        {
+            float knobR = Math.Max(6f, Math.Min(10f, Height / 2f - 4f));
+            const float symW = 12f;
+            left = symW + knobR;
+            right = Width - symW - knobR;
+            return right - left >= 4f;
+        }
+
+        int ValueFromX(int x)
+        {
+            if (!Travel(out float left, out float right)) return _value;
+            return (int)Math.Round(Math.Clamp((x - left) / (right - left), 0f, 1f) * 100f);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (!_interactive || e.Button != MouseButtons.Left) return;
+            _dragging = true;
+            Capture = true;
+            Value = ValueFromX(e.X);
+            UserSet?.Invoke(_value, false);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (!_dragging) return;
+            Value = ValueFromX(e.X);
+            UserSet?.Invoke(_value, false);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (!_dragging) return;
+            _dragging = false;
+            Capture = false;
+            UserSet?.Invoke(_value, true);   // committed — owner persists here
+        }
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -382,6 +439,12 @@ public class MainForm : Form
 
     const string SystemAppKey = "#system";
 
+    // Synthetic device key for the home profile that holds virtual faders when no
+    // physical fader unit is connected (so people without hardware still persist a
+    // layout). A connected unit uses its own key; virtual faders can also live
+    // mixed into a physical unit's profile.
+    const string VirtualKey = "#virtual";
+
     // Sentinel category that captures every live app not placed in a real
     // category. Stored as CategoryName; never a user-created category (the '#'
     // prefix matches the System Sounds convention and can't be typed in the
@@ -418,7 +481,12 @@ public class MainForm : Form
         public required Stepper Limit;
         public required CardPanel Card;
         public RoundedButton[] Tabs = Array.Empty<RoundedButton>();  // Output/Apps/Categories
+        public RoundedButton? Remove;   // virtual faders only: the delete button
         public int AxisIndex;                                 // which HID report axis (0..7) drives this slider
+        // Virtual faders have no HID axis; VValue (0..100) is the mouse-set level
+        // and stands in for the physical throw. AxisIndex is -1 for these.
+        public bool IsVirtual;
+        public int VValue = 50;
         public Calibration Cal = new();                       // value->% mapping (persisted)
         public (int v, int pct)[] Curve = Array.Empty<(int, int)>();  // built from Cal
         public double Sm = -1;          // EMA state (smoothed raw value)
@@ -454,6 +522,10 @@ public class MainForm : Form
         public string? AppKey { get; set; }
         public string? CategoryName { get; set; }
         public int Max { get; set; } = 100;   // per-slider cap (used for app/category targets)
+        // A virtual fader has no HID axis (AxisIndex = -1); it's driven by dragging
+        // the on-screen bar with the mouse. Value is its last position (0..100).
+        public bool IsVirtual { get; set; }
+        public int Value { get; set; } = 50;
     }
 
     // Everything remembered for one physical fader unit (its sliders, in order).
@@ -626,7 +698,7 @@ public class MainForm : Form
         // rescales the controls.
         DpiChanged += (_, _) => BeginInvoke(FitWindowHeight);
 
-        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); };
+        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); MaybeActivateVirtualHome(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); };
         FormClosing += OnFormClosing;
     }
 
@@ -688,14 +760,16 @@ public class MainForm : Form
     }
 
     // Build one slider: its card, controls, and wiring, for the given HID axis.
-    Axis BuildSlider(int axisIndex, string name)
+    // A virtual slider (isVirtual) has no axis — its bar is draggable and its
+    // level is set by the mouse instead of the hardware.
+    Axis BuildSlider(int axisIndex, string name, bool isVirtual = false)
     {
         // Dock.Fill so the combo fills its cell exactly (its height is forced via
         // DesiredHeight + reported through GetPreferredSize, so the row is sized to
         // match). Anchoring instead let the taller window spill below its cell and
         // clip against the card edge at 150% scaling.
         var combo = new RoundedComboBox { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Margin = new Padding(0), Dock = DockStyle.Fill, Placeholder = "No target selected" };
-        var bar = new FaderBar { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
+        var bar = new FaderBar { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4), Interactive = isVirtual };
         var pct = new Label { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
         var nameLbl = new Label { Text = name, AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
         var limit = new Stepper { Minimum = 1, Maximum = 100, Value = 100 };
@@ -712,7 +786,7 @@ public class MainForm : Form
         t.Controls.Add(pct, 1, 0);
         t.Controls.Add(bar, 0, 1); t.SetColumnSpan(bar, 2);
 
-        var axis = new Axis { AxisIndex = axisIndex, Combo = combo, Bar = bar, Pct = pct, Name = nameLbl, Limit = limit, Card = card };
+        var axis = new Axis { AxisIndex = axisIndex, Combo = combo, Bar = bar, Pct = pct, Name = nameLbl, Limit = limit, Card = card, IsVirtual = isVirtual };
         axis.Curve = axis.Cal.BuildCurve();
 
         // Target-type tabs: Output | Apps | Categories (index = (int)TargetKind).
@@ -737,7 +811,10 @@ public class MainForm : Form
         t.Controls.Add(tabRow, 0, 2); t.SetColumnSpan(tabRow, 2);
 
         t.Controls.Add(combo, 0, 3);
-        t.Controls.Add(MaxCap(limit), 1, 3);
+        // Physical faders show a Max % cap; virtual faders drag straight to the
+        // final volume (no cap needed) and show a Remove button in its place.
+        if (isVirtual) { axis.Remove = RemoveButton(axis); t.Controls.Add(axis.Remove, 1, 3); }
+        else t.Controls.Add(MaxCap(limit), 1, 3);
         card.Controls.Add(t);
 
         combo.SelectedIndexChanged += (_, _) => OnDevicePicked(axis);
@@ -749,12 +826,35 @@ public class MainForm : Form
         nameLbl.Cursor = Cursors.Hand;
         _tip.SetToolTip(nameLbl, "Double-click to rename");
         _tip.SetToolTip(combo, "Pick what this fader controls");
-        _tip.SetToolTip(limit, "Maximum volume this fader can reach");
         _tip.SetToolTip(tabs[0], "Control an output device's volume");
         _tip.SetToolTip(tabs[1], "Control one app's volume");
         _tip.SetToolTip(tabs[2], "Control a group of apps together");
-        limit.ValueChanged += (_, _) => OnLimitChanged(axis);
+        if (isVirtual)
+        {
+            bar.UserSet += (val, committed) => OnVirtualSet(axis, val, committed);
+            _tip.SetToolTip(bar, "Drag to set the volume");
+        }
+        else
+        {
+            _tip.SetToolTip(limit, "Maximum volume this fader can reach");
+            limit.ValueChanged += (_, _) => OnLimitChanged(axis);
+        }
         return axis;
+    }
+
+    // Small "Remove" button shown on a virtual fader's card (where a physical
+    // fader shows its Max cap). Deletes just that virtual slider.
+    RoundedButton RemoveButton(Axis axis)
+    {
+        var b = new RoundedButton
+        {
+            Text = "Remove", AutoSize = true, Font = new Font("Segoe UI", 8.25f),
+            Padding = new Padding(10, 4, 10, 4), Margin = new Padding(10, 2, 0, 0),
+            Anchor = AnchorStyles.Right, Radius = 7,
+        };
+        b.Click += (_, _) => RemoveSlider(axis);
+        _tip.SetToolTip(b, "Delete this virtual fader");
+        return b;
     }
 
     // Inline rename: overlay a themed text box on the fader heading. Commit on
@@ -916,6 +1016,12 @@ public class MainForm : Form
 
             var u = s.Limit;
             u.BackColor = t.CtlBg; u.ForeColor = t.Text; u.BorderColor = t.CtlBorder; u.ChevronColor = t.Subtle; u.Surround = t.Card; u.Invalidate();
+
+            if (s.Remove is { } rb)
+            {
+                rb.BackColor = t.CtlBg; rb.ForeColor = t.Text;
+                rb.FlatAppearance.BorderColor = t.CtlBorder; rb.Surround = t.Card; rb.Invalidate();
+            }
 
             StyleTabs(s);
         }
@@ -1525,6 +1631,40 @@ public class MainForm : Form
         Render(a);
     }
 
+    // The user dragged a virtual fader. Push the new level to its target live;
+    // persist only when the drag ends (committed) to avoid a write per pixel.
+    void OnVirtualSet(Axis a, int value, bool committed)
+    {
+        a.VValue = value;
+        Render(a);
+        if (committed && !_loadingSettings) SaveSettings();
+    }
+
+    // Delete one virtual fader: rebuild the layout from the remaining sliders.
+    void RemoveSlider(Axis a)
+    {
+        var configs = _sliders.Where(s => s != a).Select(ToConfig).ToList();
+        if (_activeKey != null && _devices.TryGetValue(_activeKey, out var p)) p.Sliders = configs;
+        RebuildSliders(configs);
+        SaveSettings();
+    }
+
+    // Snapshot one live slider into its persistable config.
+    static SliderConfig ToConfig(Axis s) => new()
+    {
+        AxisIndex = s.AxisIndex,
+        Label = s.Name.Text,
+        Cal = s.Cal,
+        Outputs = s.Prefs,
+        OverrideId = s.OverrideId,
+        Target = s.Target,
+        AppKey = s.AppKey,
+        CategoryName = s.CategoryName,
+        Max = (int)s.Limit.Value,
+        IsVirtual = s.IsVirtual,
+        Value = s.VValue,
+    };
+
     // Remembered cap for an output (default 100% for outputs we haven't capped).
     int MaxForDevice(string? id) =>
         id != null && _deviceMax.TryGetValue(id, out int m) ? ClampLimit(m) : 100;
@@ -1599,18 +1739,7 @@ public class MainForm : Form
                 _devices[_activeKey] = new DeviceProfile
                 {
                     Name = name,
-                    Sliders = _sliders.Select(s => new SliderConfig
-                    {
-                        AxisIndex = s.AxisIndex,
-                        Label = s.Name.Text,
-                        Cal = s.Cal,
-                        Outputs = s.Prefs,
-                        OverrideId = s.OverrideId,
-                        Target = s.Target,
-                        AppKey = s.AppKey,
-                        CategoryName = s.CategoryName,
-                        Max = (int)s.Limit.Value,
-                    }).ToList(),
+                    Sliders = _sliders.Select(ToConfig).ToList(),
                 };
             }
 
@@ -1657,8 +1786,13 @@ public class MainForm : Form
             profile.Name = name;
             _devices[key] = profile;
         }
-        // Rebuild the cards if this unit's slider count differs from what's shown.
-        if (profile.Sliders.Count > 0 && profile.Sliders.Count != _sliders.Length)
+        // Rebuild the cards if this unit's slider count — or its physical/virtual
+        // makeup — differs from what's shown (virtual cards are wired differently,
+        // so ApplyProfile alone can't convert one kind into the other).
+        bool needRebuild = profile.Sliders.Count > 0 &&
+            (profile.Sliders.Count != _sliders.Length ||
+             profile.Sliders.Where((c, i) => c.IsVirtual != _sliders[i].IsVirtual).Any());
+        if (needRebuild)
             RebuildSliders(profile.Sliders);
         else
             ApplyProfile(profile);
@@ -1671,6 +1805,19 @@ public class MainForm : Form
         new SliderConfig { AxisIndex = 0, Label = "Left fader" },
         new SliderConfig { AxisIndex = 1, Label = "Right fader" },
     };
+
+    // At startup with no physical unit connected, show the saved virtual-fader
+    // home (if any) so people without hardware get their draggable faders back. A
+    // real unit connecting later takes over via ActivateDevice.
+    void MaybeActivateVirtualHome()
+    {
+        if (_activeKey != null) return;
+        if (_devices.TryGetValue(VirtualKey, out var vp) && vp.Sliders.Count > 0)
+        {
+            _activeKey = VirtualKey;
+            RebuildSliders(vp.Sliders);
+        }
+    }
 
     // Push a profile onto the live sliders. (Phase 2 keeps the slider count fixed
     // at two; the wizard will rebuild the host to the profile's count.)
@@ -1689,6 +1836,8 @@ public class MainForm : Form
             s.Target = cfg.Target;
             s.AppKey = cfg.AppKey;
             s.CategoryName = cfg.CategoryName;
+            s.VValue = cfg.Value;
+            if (s.IsVirtual) s.Bar.Value = cfg.Value;
             if (cfg.Target != TargetKind.Output) s.Limit.Value = ClampLimit(cfg.Max);
             ApplyCalibration(s, cfg.Cal);
         }
@@ -1715,12 +1864,14 @@ public class MainForm : Form
         var old = _sliders;
         _sliders = configs.Select((c, i) =>
         {
-            var a = BuildSlider(c.AxisIndex, string.IsNullOrEmpty(c.Label) ? $"Fader {i + 1}" : c.Label);
+            var a = BuildSlider(c.AxisIndex, string.IsNullOrEmpty(c.Label) ? $"Fader {i + 1}" : c.Label, c.IsVirtual);
             a.Prefs = ClonePrefs(c.Outputs);
             a.OverrideId = c.OverrideId;
             a.Target = c.Target;
             a.AppKey = c.AppKey;
             a.CategoryName = c.CategoryName;
+            a.VValue = c.Value;
+            if (a.IsVirtual) a.Bar.Value = c.Value;
             if (c.Target != TargetKind.Output) { _loadingSettings = true; a.Limit.Value = ClampLimit(c.Max); _loadingSettings = false; }
             ApplyCalibration(a, c.Cal);
             return a;
@@ -1748,13 +1899,24 @@ public class MainForm : Form
             _calibrating = prev;
             if (result == DialogResult.OK && dlg.Result.Count > 0)
             {
-                var configs = dlg.Result.Select((r, i) => new SliderConfig
+                var configs = dlg.Result.Select((r, i) => r.Axis < 0
+                    ? new SliderConfig { IsVirtual = true, AxisIndex = -1, Label = $"Fader {i + 1}", Value = 50 }
+                    : new SliderConfig
+                    {
+                        AxisIndex = r.Axis,
+                        Label = $"Fader {i + 1}",
+                        Cal = new Calibration { Min = r.Min, Max = r.Max, Taper = TaperKind.Linear },
+                    }).ToList();
+                // With no physical unit connected, virtual faders live in the
+                // synthetic virtual-home profile so they persist and reappear.
+                string key = _activeKey ?? VirtualKey;
+                _activeKey = key;
+                if (!_devices.TryGetValue(key, out var p))
                 {
-                    AxisIndex = r.Axis,
-                    Label = $"Fader {i + 1}",
-                    Cal = new Calibration { Min = r.Min, Max = r.Max, Taper = TaperKind.Linear },
-                }).ToList();
-                if (_activeKey != null && _devices.TryGetValue(_activeKey, out var p)) p.Sliders = configs;
+                    p = new DeviceProfile { Name = key == VirtualKey ? "Virtual faders" : "" };
+                    _devices[key] = p;
+                }
+                p.Sliders = configs;
                 RebuildSliders(configs);
                 SaveSettings();
             }
@@ -1915,7 +2077,7 @@ public class MainForm : Form
             {
                 for (int i = 0; i < axes.Length && i < MaxAxes; i++) _lastAxisRaw[i] = axes[i];
                 foreach (var s in _sliders)
-                    if (s.AxisIndex < axes.Length) ApplyAxis(s, axes[s.AxisIndex]);
+                    if (s.AxisIndex >= 0 && s.AxisIndex < axes.Length) ApplyAxis(s, axes[s.AxisIndex]);
             });
         }
         catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
@@ -1935,7 +2097,9 @@ public class MainForm : Form
     // live session. Drives the muted (greyed) look on the fader bar.
     bool Drivable(Axis a)
     {
-        if (!_connected) return false;
+        // Virtual faders don't depend on the dongle, so a disconnect doesn't grey
+        // them; they still grey when their app/category target isn't playing.
+        if (!a.IsVirtual && !_connected) return false;
         switch (a.Target)
         {
             case TargetKind.App:
@@ -1962,11 +2126,12 @@ public class MainForm : Form
     void Render(Axis a)
     {
         UpdateSliderState(a);
-        if (a.Sm < 0) return;
+        if (!a.IsVirtual && a.Sm < 0) return;
 
-        int v = (int)Math.Round(a.Sm);
-        double faderPct = Calibration.Eval(a.Curve, v);
-        int cap = (int)a.Limit.Value;
+        // Virtual faders drag straight to the final volume (no taper curve, no cap);
+        // physical faders map their smoothed raw value through the calibration curve.
+        double faderPct = a.IsVirtual ? a.VValue : Calibration.Eval(a.Curve, (int)Math.Round(a.Sm));
+        int cap = a.IsVirtual ? 100 : (int)a.Limit.Value;
         double pf = Math.Clamp(faderPct * cap / 100.0, 0, 100);
 
         // Hysteresis: hold the current integer % until pf moves > Hyst off it.

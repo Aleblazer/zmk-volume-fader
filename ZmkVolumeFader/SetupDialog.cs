@@ -27,7 +27,8 @@ sealed class SetupDialog : Form
 
     readonly Label _title = new() { AutoSize = false, Dock = DockStyle.Fill, Height = 30, Margin = new Padding(0, 0, 0, 6), Font = new Font("Segoe UI", 12.5f, FontStyle.Bold) };
     readonly Label _detail = new() { AutoSize = false, Dock = DockStyle.Fill, Height = 84, Margin = new Padding(0) };
-    readonly RoundedButton _next, _finish, _cancel;
+    readonly RoundedButton _next, _virtual, _finish, _cancel;
+    int _virtualCount;
 
     [DllImport("dwmapi.dll")]
     static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
@@ -45,7 +46,7 @@ sealed class SetupDialog : Form
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(440, 220);
+        ClientSize = new Size(540, 220);
         BackColor = _t.Window;
 
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(16), BackColor = Color.Transparent };
@@ -63,11 +64,14 @@ sealed class SetupDialog : Form
         var btnRow = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, BackColor = Color.Transparent, Margin = new Padding(0, 8, 0, 0) };
         _next = MakeButton("Next fader ▶", accent: true);
         _next.Click += (_, _) => AcceptCandidate();
-        _finish = MakeButton("No more faders", accent: false);
+        _virtual = MakeButton("Add virtual fader", accent: false);
+        _virtual.Click += (_, _) => AddVirtual();
+        _finish = MakeButton("Done", accent: false);
         _finish.Click += (_, _) => Finish();
         _cancel = MakeButton("Cancel", accent: false);
         _cancel.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
         btnRow.Controls.Add(_next);
+        btnRow.Controls.Add(_virtual);
         btnRow.Controls.Add(_finish);
         btnRow.Controls.Add(_cancel);
         root.Controls.Add(btnRow, 0, 3);
@@ -121,13 +125,17 @@ sealed class SetupDialog : Form
     {
         int n = Captured + 1;
         _title.Text = $"Fader {n}";
+        string tally = Captured > 0
+            ? $"{Captured} added so far{(_virtualCount > 0 ? $" ({_virtualCount} virtual)" : "")}.  "
+            : "";
         _detail.Text = _candidate >= 0
             ? $"Detected on axis {_candidate + 1} — range {_min[_candidate]}–{_max[_candidate]} mV.\n\n" +
               "Sweep it fully bottom→top to capture both ends, then “Next fader”.\n" +
-              "Or “No more faders” if that was the last one."
-            : $"Move fader {n} fully from bottom to top.\n\n" +
-              (Captured > 0 ? $"{Captured} captured so far.  " : "") +
-              "Click “No more faders” once you've done them all.";
+              "Or “Done” if that was the last one."
+            : $"Move a physical fader fully from bottom to top, or add a virtual\n" +
+              "fader you can drag with the mouse.\n\n" +
+              tally +
+              "Click “Done” once you've added them all.";
     }
 
     void AcceptCandidate()
@@ -136,6 +144,14 @@ sealed class SetupDialog : Form
         Result.Add((_candidate, _min[_candidate], _max[_candidate]));
         _used.Add(_candidate);
         if (_used.Count >= MaxAxes) { Finish(); return; }
+        StartStep();
+    }
+
+    // A virtual fader has no hardware axis (Axis = -1); it's dragged in the app.
+    void AddVirtual()
+    {
+        Result.Add((-1, 0, 0));
+        _virtualCount++;
         StartStep();
     }
 
