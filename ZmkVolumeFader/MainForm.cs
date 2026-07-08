@@ -25,15 +25,15 @@ internal sealed class Category
 
 /// <summary>
 /// Reads a ZMK dongle's hid-io fader report (vendor page 0xFF00, report id 2:
-/// two signed 16-bit LE axes, [1..2]=left [3..4]=right, raw wiper mV ~0..3300) and drives
-/// the volume of two chosen Windows output devices. Each fader has its own
+/// up to eight signed 16-bit LE axes at bytes [1..], raw wiper mV ~0..3300) and drives
+/// the volume of the chosen Windows output devices. Each fader has its own
 /// max-volume cap: the throw scales into 0..cap (top = cap, middle = cap/2).
 /// The UI follows the OS light/dark theme with a green accent.
 /// </summary>
 public class MainForm : Form
 {
     const int VID = 0x1D50, PID = 0x615E;
-    const int MaxAxes = 6;   // hid-io joystick report carries up to six 16-bit axes
+    const int MaxAxes = 8;   // hid-io vendor report carries up to eight 16-bit axes
 
     // The git short hash the SetGitCommit build target embedded into
     // AssemblyInformationalVersion ("1.1.0+<hash>"), or "" when unavailable.
@@ -418,7 +418,7 @@ public class MainForm : Form
         public required Stepper Limit;
         public required CardPanel Card;
         public RoundedButton[] Tabs = Array.Empty<RoundedButton>();  // Output/Apps/Categories
-        public int AxisIndex;                                 // which HID report axis (0..5) drives this slider
+        public int AxisIndex;                                 // which HID report axis (0..7) drives this slider
         public Calibration Cal = new();                       // value->% mapping (persisted)
         public (int v, int pct)[] Curve = Array.Empty<(int, int)>();  // built from Cal
         public double Sm = -1;          // EMA state (smoothed raw value)
@@ -1886,9 +1886,9 @@ public class MainForm : Form
                     try { n = stream.Read(buf, 0, buf.Length); }
                     catch (TimeoutException) { continue; }
                     catch { break; }
-                    // Report id 2: up to six 16-bit LE axes at bytes 1.. (two
+                    // Report id 2: up to eight 16-bit LE axes at bytes 1.. (two
                     // bytes each), then a button byte. Read whatever axes are
-                    // present so any number of sliders (1..6) can be driven.
+                    // present so any number of sliders (1..8) can be driven.
                     if (n >= 3 && buf[0] == 0x02)
                     {
                         int count = Math.Min(MaxAxes, (n - 1) / 2);

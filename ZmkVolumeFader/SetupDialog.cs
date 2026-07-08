@@ -16,7 +16,7 @@ sealed class SetupDialog : Form
     readonly Func<int[]> _rawAxes;
     readonly System.Windows.Forms.Timer _tick = new() { Interval = 40 };
 
-    const int MaxAxes = 6;
+    const int MaxAxes = 8;   // hid-io vendor report carries up to eight 16-bit axes
     const int TravelThreshold = 1500;   // mV of sweep before we count a fader as "moved"
 
     readonly HashSet<int> _used = new();
