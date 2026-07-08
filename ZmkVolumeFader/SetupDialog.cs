@@ -81,7 +81,9 @@ sealed class SetupDialog : Form
 
         StartStep();
         _tick.Tick += (_, _) => Poll();
-        Load += (_, _) => { ApplyDark(); _tick.Start(); };
+        // Force the DPI-scaled size — auto-scale doesn't reliably resize a
+        // FixedDialog, so the 4-button row would clip at 125%+.
+        Load += (_, _) => { ApplyDark(); ClientSize = new Size(LogicalToDeviceUnits(540), LogicalToDeviceUnits(220)); _tick.Start(); };
         FormClosing += (_, _) => _tick.Stop();
     }
 

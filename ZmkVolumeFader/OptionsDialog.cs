@@ -37,6 +37,7 @@ sealed class OptionsDialog : Form
     readonly RoundedComboBox[] _taper;
     readonly MainForm.FaderBar[] _bar;
     readonly bool[] _recording;
+    readonly bool[] _virtual;   // per slider: virtual faders have no calibration
 
     readonly CheckBox _startup = new() { Text = "Start with Windows", AutoSize = true, FlatStyle = FlatStyle.Standard, Margin = new Padding(0, 0, 0, 0) };
     readonly RoundedComboBox _themeCombo = new() { Width = 190 };
@@ -59,7 +60,7 @@ sealed class OptionsDialog : Form
         Calibration[] cals, Func<int>[] raws, List<OutputPref>[] outs, string[] labels,
         IReadOnlyList<OutputPref> known, IEnumerable<string> presentIds,
         List<Category> categories, IReadOnlyDictionary<string, string> knownApps,
-        IReadOnlyDictionary<string, Image?>? appIcons = null)
+        IReadOnlyDictionary<string, Image?>? appIcons = null, bool[]? virtuals = null)
     {
         AutoScaleDimensions = new SizeF(96f, 96f);
         AutoScaleMode = AutoScaleMode.Dpi;
@@ -77,6 +78,7 @@ sealed class OptionsDialog : Form
         _rawLbl = new Label[_n]; _rangeLbl = new Label[_n]; _previewLbl = new Label[_n];
         _recordBtn = new RoundedButton[_n]; _taper = new RoundedComboBox[_n];
         _bar = new MainForm.FaderBar[_n]; _recording = new bool[_n];
+        _virtual = virtuals ?? new bool[_n];
 
         Text = "Options";
         Font = new Font("Segoe UI", 9.75f);
@@ -87,21 +89,26 @@ sealed class OptionsDialog : Form
         ClientSize = new Size(430, 700);
         BackColor = _t.Window;
 
-        // Scrollable content (General + calibration label + N faders + About),
-        // with Save/Cancel pinned below.
-        int rows = 3 + _n;
+        // Scrollable content (General + [calibration label] + N faders + About),
+        // with Save/Cancel pinned below. The calibration blurb is skipped when
+        // every fader is virtual (nothing to calibrate).
+        bool anyPhysical = _virtual.Any(v => !v);
+        int rows = 2 + _n + (anyPhysical ? 1 : 0);
         _root = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, RowCount = rows, BackColor = Color.Transparent };
         _root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         for (int r = 0; r < rows; r++) _root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        _root.Controls.Add(BuildGeneral(themeMode, startWithWindows), 0, 0);
-        _root.Controls.Add(new Label
-        {
-            Text = "Calibration — hit Record, sweep the fader fully end-to-end, then stop. Then pick the taper that matches your pot. The preview updates as you move it.",
-            AutoSize = true, MaximumSize = new Size(392, 0), ForeColor = _t.Subtle, Margin = new Padding(2, 4, 2, 10),
-        }, 0, 1);
-        for (int i = 0; i < _n; i++) _root.Controls.Add(BuildFader(i, _labels[i]), 0, 2 + i);
-        _root.Controls.Add(BuildAbout(), 0, 2 + _n);
+        int row = 0;
+        _root.Controls.Add(BuildGeneral(themeMode, startWithWindows), 0, row++);
+        if (anyPhysical)
+            _root.Controls.Add(new Label
+            {
+                Text = "Calibration — hit Record, sweep the fader fully end-to-end, then stop. Then pick the taper that matches your pot. The preview updates as you move it.",
+                AutoSize = true, MaximumSize = new Size(392, 0), ForeColor = _t.Subtle, Margin = new Padding(2, 4, 2, 10),
+            }, 0, row++);
+        for (int i = 0; i < _n; i++)
+            _root.Controls.Add(_virtual[i] ? BuildVirtualFader(_labels[i]) : BuildFader(i, _labels[i]), 0, row++);
+        _root.Controls.Add(BuildAbout(), 0, row++);
 
         _scroll = new RoundedScrollPanel
         {
@@ -135,11 +142,15 @@ sealed class OptionsDialog : Form
     }
 
     // Size the dialog to its content up to a cap; the fader list scrolls beyond.
+    // Width is forced to the DPI-scaled design width — the framework auto-scale
+    // doesn't reliably widen a FixedDialog, so at 125%+ the content grew taller
+    // and wider while the window stayed ~430px and clipped the right-hand buttons.
     void FitHeight()
     {
         int content = _root.PreferredSize.Height + LogicalToDeviceUnits(14);      // scroll padding
         int buttons = _btnRow.PreferredSize.Height;
-        ClientSize = new Size(ClientSize.Width, Math.Clamp(content + buttons, LogicalToDeviceUnits(300), LogicalToDeviceUnits(720)));
+        ClientSize = new Size(LogicalToDeviceUnits(430),
+            Math.Clamp(content + buttons, LogicalToDeviceUnits(300), LogicalToDeviceUnits(720)));
     }
 
     Control BuildAbout()
@@ -243,6 +254,20 @@ sealed class OptionsDialog : Form
         if (dlg.ShowDialog(this) == DialogResult.OK) _categories = dlg.Result;
     }
 
+    // Virtual faders have no calibration (no raw/range/Record/taper); show a
+    // compact card that just names it and explains it's dragged in the app.
+    Panel BuildVirtualFader(string name)
+    {
+        var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
+        var t = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, RowCount = 2, BackColor = Color.Transparent };
+        t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        for (int r = 0; r < 2; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        t.Controls.Add(new Label { Text = name, AutoSize = true, ForeColor = _t.Text, Anchor = AnchorStyles.Left, Margin = new Padding(0, 0, 0, 0) }, 0, 0);
+        t.Controls.Add(new Label { Text = "Virtual fader — set by dragging it in the app. No calibration needed.", AutoSize = true, MaximumSize = new Size(392, 0), ForeColor = _t.Subtle, Margin = new Padding(0, 4, 0, 0) }, 0, 1);
+        card.Controls.Add(t);
+        return card;
+    }
+
     Panel BuildFader(int i, string name)
     {
         int idx = i;
@@ -324,6 +349,7 @@ sealed class OptionsDialog : Form
 
     void Tick(int i)
     {
+        if (_virtual[i]) return;   // no calibration controls on a virtual fader
         int v = _raw[i]();
         _rawLbl[i].Text = $"raw {v}";
         if (_recording[i])
@@ -344,7 +370,7 @@ sealed class OptionsDialog : Form
         if (DwmSetWindowAttribute(Handle, 20, ref v, sizeof(int)) != 0)
             DwmSetWindowAttribute(Handle, 19, ref v, sizeof(int));
         foreach (var c in _taper)
-            if (c.IsHandleCreated) SetWindowTheme(c.Handle, _t.Dark ? "DarkMode_CFD" : null, null);
+            if (c is { IsHandleCreated: true }) SetWindowTheme(c.Handle, _t.Dark ? "DarkMode_CFD" : null, null);
         if (_themeCombo.IsHandleCreated) SetWindowTheme(_themeCombo.Handle, _t.Dark ? "DarkMode_CFD" : null, null);
     }
 }

@@ -94,6 +94,9 @@ sealed class CategoriesDialog : Form
         Load += (_, _) =>
         {
             ApplyDark();
+            // Force the DPI-scaled size — auto-scale doesn't reliably resize a
+            // FixedDialog, so at 125%+ the content would clip against a ~440px window.
+            ClientSize = new Size(LogicalToDeviceUnits(440), LogicalToDeviceUnits(540));
             // Row height tracks the DPI-scaled font so text isn't clipped at 125%+.
             _catList.ItemHeight = _catList.Font.Height + LogicalToDeviceUnits(8);
             _appList.ItemHeight = _appList.Font.Height + LogicalToDeviceUnits(8);

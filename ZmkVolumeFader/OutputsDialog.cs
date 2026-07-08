@@ -109,7 +109,9 @@ sealed class OutputsDialog : Form
             // after DPI/font scaling.
             int content = root.PreferredSize.Height + LogicalToDeviceUnits(14);
             int foot = footer.PreferredSize.Height;
-            ClientSize = new Size(ClientSize.Width, Math.Clamp(content + foot, LogicalToDeviceUnits(300), LogicalToDeviceUnits(720)));
+            // Force the DPI-scaled width — auto-scale doesn't reliably widen a
+            // FixedDialog, so the content would otherwise clip at 125%+.
+            ClientSize = new Size(LogicalToDeviceUnits(430), Math.Clamp(content + foot, LogicalToDeviceUnits(300), LogicalToDeviceUnits(720)));
         };
         FormClosed += (_, _) => _enum.Dispose();
     }

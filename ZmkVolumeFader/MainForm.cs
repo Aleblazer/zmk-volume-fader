@@ -1944,8 +1944,9 @@ public class MainForm : Form
         var outs = _sliders.Select(s => ClonePrefs(s.Prefs)).ToArray();
         var labels = _sliders.Select(s => s.Name.Text).ToArray();
         var cats = _categories.Select(c => new Category { Name = c.Name, AppKeys = new(c.AppKeys) }).ToList();
+        var virtuals = _sliders.Select(s => s.IsVirtual).ToArray();
         using var dlg = new OptionsDialog(_theme, _themeMode, GetStartWithWindows(),
-            cals, raws, outs, labels, AllKnownOutputs(), _present.Keys.ToArray(), cats, _knownApps, _appIcons);
+            cals, raws, outs, labels, AllKnownOutputs(), _present.Keys.ToArray(), cats, _knownApps, _appIcons, virtuals);
         _calibrating = true;                 // stop driving devices while sweeping
         var result = dlg.ShowDialog(this);
         _calibrating = false;
