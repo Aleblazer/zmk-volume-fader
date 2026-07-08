@@ -23,6 +23,47 @@ internal sealed class Category
     public List<string> AppKeys { get; set; } = new();   // process-name keys
 }
 
+/// <summary>A global hotkey binding: a virtual-key code plus modifier flags.
+/// Vk == 0 means unbound. Observed via a low-level keyboard hook (pass-through,
+/// so the key still reaches the focused app — Discord-style, not swallowed).</summary>
+internal sealed class Hotkey
+{
+    public int Vk { get; set; }
+    public bool Ctrl { get; set; }
+    public bool Alt { get; set; }
+    public bool Shift { get; set; }
+    public bool Win { get; set; }
+
+    public bool IsBound => Vk != 0;
+
+    public bool Matches(int vk, bool ctrl, bool alt, bool shift, bool win)
+        => IsBound && vk == Vk && ctrl == Ctrl && alt == Alt && shift == Shift && win == Win;
+
+    // Extended F-keys (F13..F24) and media keys are safe to bind bare — nothing
+    // else uses them. Any other bare key fires during normal use (a "hint" case).
+    public bool IsBareCommonKey =>
+        IsBound && !Ctrl && !Alt && !Shift && !Win
+        && !(Vk >= 0x7C && Vk <= 0x87)   // VK_F13..VK_F24
+        && !(Vk >= 0xAD && Vk <= 0xB3);  // VK_VOLUME_* / VK_MEDIA_*
+
+    public override string ToString()
+    {
+        if (!IsBound) return "Unbound";
+        var s = "";
+        if (Ctrl) s += "Ctrl+";
+        if (Alt) s += "Alt+";
+        if (Shift) s += "Shift+";
+        if (Win) s += "Win+";
+        return s + KeyName(Vk);
+    }
+
+    static string KeyName(int vk)
+    {
+        var k = (System.Windows.Forms.Keys)vk;
+        return k.ToString();
+    }
+}
+
 /// <summary>
 /// Reads a ZMK dongle's hid-io fader report (vendor page 0xFF00, report id 2:
 /// up to eight signed 16-bit LE axes at bytes [1..], raw wiper mV ~0..3300) and drives
@@ -295,7 +336,7 @@ public class MainForm : Form
     // can't be dark-themed). A borderless child text box handles typing/caret;
     // this control paints the frame + chevrons. Type then Enter, click a
     // chevron, use Up/Down, or scroll.
-    sealed class Stepper : Control
+    internal sealed class Stepper : Control
     {
         readonly TextBox _box = new() { BorderStyle = BorderStyle.None, TextAlign = HorizontalAlignment.Right, MaxLength = 3 };
         int _value = 100, _min = 1, _max = 100;
@@ -482,11 +523,19 @@ public class MainForm : Form
         public required CardPanel Card;
         public RoundedButton[] Tabs = Array.Empty<RoundedButton>();  // Output/Apps/Categories
         public RoundedButton? Remove;   // virtual faders only: the delete button
+        public RoundedButton? Hotkey;   // virtual faders only: opens the hotkey dialog
         public int AxisIndex;                                 // which HID report axis (0..7) drives this slider
-        // Virtual faders have no HID axis; VValue (0..100) is the mouse-set level
-        // and stands in for the physical throw. AxisIndex is -1 for these.
+        // Virtual faders have no HID axis; they stand in for the physical throw.
+        // VTarget (0..100) is the goal set by mouse drag or a hotkey; VCur eases
+        // toward it so hotkey steps glide instead of spiking. AxisIndex is -1.
         public bool IsVirtual;
-        public int VValue = 50;
+        public int VTarget = 50;
+        public double VCur = 50;
+        public bool VMuted;
+        public int VPreMute = 50;       // level to restore when unmuting
+        // Per-fader hotkey bindings + step (virtual faders only; persisted).
+        public Hotkey HkUp = new(), HkDown = new(), HkMute = new();
+        public int Step = 5;
         public Calibration Cal = new();                       // value->% mapping (persisted)
         public (int v, int pct)[] Curve = Array.Empty<(int, int)>();  // built from Cal
         public double Sm = -1;          // EMA state (smoothed raw value)
@@ -523,9 +572,15 @@ public class MainForm : Form
         public string? CategoryName { get; set; }
         public int Max { get; set; } = 100;   // per-slider cap (used for app/category targets)
         // A virtual fader has no HID axis (AxisIndex = -1); it's driven by dragging
-        // the on-screen bar with the mouse. Value is its last position (0..100).
+        // the on-screen bar with the mouse or by hotkeys. Value is its last
+        // position (0..100). HkUp/HkDown/HkMute are its global hotkey bindings and
+        // Step is the per-press percentage nudge.
         public bool IsVirtual { get; set; }
         public int Value { get; set; } = 50;
+        public Hotkey HkUp { get; set; } = new();
+        public Hotkey HkDown { get; set; } = new();
+        public Hotkey HkMute { get; set; } = new();
+        public int Step { get; set; } = 5;
     }
 
     // Everything remembered for one physical fader unit (its sliders, in order).
@@ -616,6 +671,11 @@ public class MainForm : Form
     // Coalesces bursts of device notifications into a single refresh.
     readonly System.Windows.Forms.Timer _deviceDebounce = new() { Interval = 250 };
 
+    // Global keyboard hook (observes keys, never swallows) + the smoothing ramp
+    // that eases virtual faders toward their hotkey-set target.
+    readonly KeyboardHook _hook = new();
+    readonly System.Windows.Forms.Timer _vramp = new() { Interval = 20 };
+
     Axis _left = null!, _right = null!;
     // All sliders in axis order (count comes from the active device profile).
     Axis[] _sliders = Array.Empty<Axis>();
@@ -703,7 +763,8 @@ public class MainForm : Form
         // rescales the controls.
         DpiChanged += (_, _) => BeginInvoke(FitWindowHeight);
 
-        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); MaybeActivateVirtualHome(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); };
+        _vramp.Tick += (_, _) => VrampTick();
+        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); MaybeActivateVirtualHome(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); StartHotkeys(); };
         FormClosing += OnFormClosing;
     }
 
@@ -859,8 +920,16 @@ public class MainForm : Form
 
         t.Controls.Add(combo, 0, 3);
         // Physical faders show a Max % cap; virtual faders drag straight to the
-        // final volume (no cap needed) and show a Remove button in its place.
-        if (isVirtual) { axis.Remove = RemoveButton(axis); t.Controls.Add(axis.Remove, 1, 3); }
+        // final volume (no cap needed) and show Hotkeys + Remove buttons instead.
+        if (isVirtual)
+        {
+            axis.Hotkey = HotkeyButton(axis);
+            axis.Remove = RemoveButton(axis);
+            var vbtns = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Anchor = AnchorStyles.Right, Margin = new Padding(10, 0, 0, 0) };
+            vbtns.Controls.Add(axis.Hotkey);
+            vbtns.Controls.Add(axis.Remove);
+            t.Controls.Add(vbtns, 1, 3);
+        }
         else t.Controls.Add(MaxCap(limit), 1, 3);
         card.Controls.Add(t);
 
@@ -889,14 +958,27 @@ public class MainForm : Form
         return axis;
     }
 
-    // Small "Remove" button shown on a virtual fader's card (where a physical
-    // fader shows its Max cap). Deletes just that virtual slider.
+    // Small buttons shown on a virtual fader's card (where a physical fader shows
+    // its Max cap): assign global hotkeys, or delete the fader.
+    RoundedButton HotkeyButton(Axis axis)
+    {
+        var b = new RoundedButton
+        {
+            Text = "Hotkeys", AutoSize = true, Font = new Font("Segoe UI", 8.25f),
+            Padding = new Padding(10, 4, 10, 4), Margin = new Padding(0, 2, 6, 0),
+            Anchor = AnchorStyles.Right, Radius = 7,
+        };
+        b.Click += (_, _) => OpenHotkeys(axis);
+        _tip.SetToolTip(b, "Assign global volume hotkeys");
+        return b;
+    }
+
     RoundedButton RemoveButton(Axis axis)
     {
         var b = new RoundedButton
         {
             Text = "Remove", AutoSize = true, Font = new Font("Segoe UI", 8.25f),
-            Padding = new Padding(10, 4, 10, 4), Margin = new Padding(10, 2, 0, 0),
+            Padding = new Padding(10, 4, 10, 4), Margin = new Padding(0, 2, 0, 0),
             Anchor = AnchorStyles.Right, Radius = 7,
         };
         b.Click += (_, _) => RemoveSlider(axis);
@@ -1064,11 +1146,12 @@ public class MainForm : Form
             var u = s.Limit;
             u.BackColor = t.CtlBg; u.ForeColor = t.Text; u.BorderColor = t.CtlBorder; u.ChevronColor = t.Subtle; u.Surround = t.Card; u.Invalidate();
 
-            if (s.Remove is { } rb)
-            {
-                rb.BackColor = t.CtlBg; rb.ForeColor = t.Text;
-                rb.FlatAppearance.BorderColor = t.CtlBorder; rb.Surround = t.Card; rb.Invalidate();
-            }
+            foreach (var vb in new[] { s.Remove, s.Hotkey })
+                if (vb is { } btn)
+                {
+                    btn.BackColor = t.CtlBg; btn.ForeColor = t.Text;
+                    btn.FlatAppearance.BorderColor = t.CtlBorder; btn.Surround = t.Card; btn.Invalidate();
+                }
 
             StyleTabs(s);
         }
@@ -1298,6 +1381,9 @@ public class MainForm : Form
         _deviceDebounce.Dispose();
         _sessionPoll.Stop();
         _sessionPoll.Dispose();
+        _vramp.Stop();
+        _vramp.Dispose();
+        _hook.Dispose();   // unhook the global keyboard hook
         // Release the audio COM wrappers we're holding.
         foreach (var it in _present.Values) { try { it.Device.Dispose(); } catch { } }
         _present.Clear();
@@ -1419,6 +1505,14 @@ public class MainForm : Form
         _sessionPoll.Tick += (_, _) => PollSessions();
         _sessionPoll.Start();
         PollSessions();
+    }
+
+    // Install the global keyboard hook on the UI thread so its callback (and the
+    // hotkey actions it triggers) run here, where touching the UI is safe.
+    void StartHotkeys()
+    {
+        _hook.KeyDown += OnGlobalKey;
+        _hook.Install();
     }
 
     // Enumerate every render endpoint's audio sessions, group live sessions by
@@ -1692,13 +1786,83 @@ public class MainForm : Form
         Render(a);
     }
 
-    // The user dragged a virtual fader. Push the new level to its target live;
-    // persist only when the drag ends (committed) to avoid a write per pixel.
+    // The user dragged a virtual fader. Drag is direct (no smoothing ramp — you're
+    // already in fine control): set target and current together. Persist only when
+    // the drag ends (committed) to avoid a write per pixel.
     void OnVirtualSet(Axis a, int value, bool committed)
     {
-        a.VValue = value;
+        a.VTarget = value;
+        a.VCur = value;
+        a.VMuted = false;
         Render(a);
         if (committed && !_loadingSettings) SaveSettings();
+    }
+
+    // A bound hotkey fired. Runs on the UI thread (the hook is installed there),
+    // so touch sliders directly — but keep it quick; it's in the global key path.
+    void OnGlobalKey(int vk, bool ctrl, bool alt, bool shift, bool win)
+    {
+        foreach (var a in _sliders)
+        {
+            if (!a.IsVirtual) continue;
+            if (a.HkUp.Matches(vk, ctrl, alt, shift, win)) NudgeVirtual(a, a.Step);
+            else if (a.HkDown.Matches(vk, ctrl, alt, shift, win)) NudgeVirtual(a, -a.Step);
+            else if (a.HkMute.Matches(vk, ctrl, alt, shift, win)) ToggleMuteVirtual(a);
+        }
+    }
+
+    // Move a virtual fader's target by delta%; the ramp glides the applied level
+    // to it, so holding the key (OS auto-repeat) chases smoothly without spiking.
+    void NudgeVirtual(Axis a, int delta)
+    {
+        a.VMuted = false;
+        a.VTarget = Math.Clamp(a.VTarget + delta, 0, 100);
+        EnsureRamp();
+    }
+
+    void ToggleMuteVirtual(Axis a)
+    {
+        if (a.VMuted) { a.VTarget = a.VPreMute; a.VMuted = false; }
+        else { a.VPreMute = a.VTarget; a.VTarget = 0; a.VMuted = true; }
+        EnsureRamp();
+    }
+
+    void EnsureRamp() { if (!_vramp.Enabled) _vramp.Start(); }
+
+    // Ease each virtual fader's current level toward its target; drive volume as it
+    // moves; stop and persist once everything has settled.
+    void VrampTick()
+    {
+        bool moving = false;
+        foreach (var a in _sliders)
+        {
+            if (!a.IsVirtual) continue;
+            double diff = a.VTarget - a.VCur;
+            if (Math.Abs(diff) < 0.5)
+            {
+                if (a.VCur != a.VTarget) { a.VCur = a.VTarget; Render(a); }
+                continue;
+            }
+            a.VCur += diff * 0.35;   // exponential ease-out
+            Render(a);
+            moving = true;
+        }
+        if (!moving)
+        {
+            _vramp.Stop();
+            if (!_loadingSettings) SaveSettings();   // persist settled levels once
+        }
+    }
+
+    // Open the per-fader hotkey assignment dialog and store the result.
+    void OpenHotkeys(Axis a)
+    {
+        using var dlg = new HotkeyDialog(_theme, a.Name.Text, a.HkUp, a.HkDown, a.HkMute, a.Step);
+        if (dlg.ShowDialog(this) == DialogResult.OK)
+        {
+            a.HkUp = dlg.Up; a.HkDown = dlg.Down; a.HkMute = dlg.Mute; a.Step = dlg.Step;
+            SaveSettings();
+        }
     }
 
     // Delete one virtual fader: rebuild the layout from the remaining sliders.
@@ -1726,8 +1890,26 @@ public class MainForm : Form
         CategoryName = s.CategoryName,
         Max = (int)s.Limit.Value,
         IsVirtual = s.IsVirtual,
-        Value = s.VValue,
+        Value = s.VTarget,
+        HkUp = s.HkUp,
+        HkDown = s.HkDown,
+        HkMute = s.HkMute,
+        Step = s.Step,
     };
+
+    // Copy a config's virtual-fader state (level, hotkeys, step) onto a slider.
+    static void LoadVirtual(Axis a, SliderConfig c)
+    {
+        a.VTarget = c.Value;
+        a.VCur = c.Value;
+        a.VPreMute = c.Value;
+        a.VMuted = false;
+        a.HkUp = c.HkUp ?? new();
+        a.HkDown = c.HkDown ?? new();
+        a.HkMute = c.HkMute ?? new();
+        a.Step = c.Step <= 0 ? 5 : c.Step;
+        if (a.IsVirtual) a.Bar.Value = c.Value;
+    }
 
     // Remembered cap for an output (default 100% for outputs we haven't capped).
     int MaxForDevice(string? id) =>
@@ -1900,8 +2082,7 @@ public class MainForm : Form
             s.Target = cfg.Target;
             s.AppKey = cfg.AppKey;
             s.CategoryName = cfg.CategoryName;
-            s.VValue = cfg.Value;
-            if (s.IsVirtual) s.Bar.Value = cfg.Value;
+            LoadVirtual(s, cfg);
             if (cfg.Target != TargetKind.Output) s.Limit.Value = ClampLimit(cfg.Max);
             ApplyCalibration(s, cfg.Cal);
         }
@@ -1934,8 +2115,7 @@ public class MainForm : Form
             a.Target = c.Target;
             a.AppKey = c.AppKey;
             a.CategoryName = c.CategoryName;
-            a.VValue = c.Value;
-            if (a.IsVirtual) a.Bar.Value = c.Value;
+            LoadVirtual(a, c);
             if (c.Target != TargetKind.Output) { _loadingSettings = true; a.Limit.Value = ClampLimit(c.Max); _loadingSettings = false; }
             ApplyCalibration(a, c.Cal);
             return a;
@@ -2216,7 +2396,7 @@ public class MainForm : Form
 
         // Virtual faders drag straight to the final volume (no taper curve, no cap);
         // physical faders map their smoothed raw value through the calibration curve.
-        double faderPct = a.IsVirtual ? a.VValue : Calibration.Eval(a.Curve, (int)Math.Round(a.Sm));
+        double faderPct = a.IsVirtual ? a.VCur : Calibration.Eval(a.Curve, (int)Math.Round(a.Sm));
         int cap = a.IsVirtual ? 100 : (int)a.Limit.Value;
         double pf = Math.Clamp(faderPct * cap / 100.0, 0, 100);
 
