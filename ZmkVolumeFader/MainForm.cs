@@ -606,6 +606,10 @@ public class MainForm : Form
 
     // Slider cards are built dynamically into this scrollable host (one row each).
     TableLayoutPanel _sliderHost = null!, _footer = null!;
+    // Empty-state card shown (in place of slider rows) when there are no faders.
+    CardPanel? _emptyCard;
+    Label? _emptyTitle, _emptySub;
+    RoundedButton? _emptyAdd;
 
     readonly MMDeviceEnumerator _enum = new();
     DeviceNotify? _notify;
@@ -650,11 +654,12 @@ public class MainForm : Form
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
 
-        // Build the sliders. The list is what makes the count arbitrary; a later
-        // phase sets it per device from the setup wizard. Two for now.
-        _sliders = new[] { BuildSlider(0, "Left fader"), BuildSlider(1, "Right fader") };
-        _left = _sliders[0];
-        _right = _sliders[1];
+        // Start with no faders: the slider count is per-device (a connecting unit
+        // seeds its defaults; the setup dialog builds an arbitrary set). Until then
+        // the host shows the empty-state "Add fader" card. _left/_right are
+        // vestigial (only ever assigned, never read).
+        _sliders = Array.Empty<Axis>();
+        _left = _right = null!;
         ClientSize = new Size(ClientSize.Width, WindowHeightFor(_sliders.Length));
 
         // Slider cards stack in a scrollable host; the footer stays pinned below.
@@ -735,6 +740,13 @@ public class MainForm : Form
                 s.Card.Height = inner.PreferredSize.Height + s.Card.Padding.Vertical + LogicalToDeviceUnits(2);
             total += s.Card.Height + s.Card.Margin.Vertical;
         }
+        // No faders: size to the empty-state card (treat it like one slider card).
+        if (_sliders.Length == 0 && _emptyCard is { } ec)
+        {
+            if (ec.Controls.Count > 0 && ec.Controls[0] is TableLayoutPanel inner)
+                ec.Height = inner.PreferredSize.Height + ec.Padding.Vertical + LogicalToDeviceUnits(2);
+            total += ec.Height + ec.Margin.Vertical;
+        }
         int chrome = _footer.PreferredSize.Height + LogicalToDeviceUnits(14) * 2 + LogicalToDeviceUnits(12);
         int want = total + chrome;
         int cap = Math.Min(LogicalToDeviceUnits(760), Screen.FromControl(this).WorkingArea.Height - LogicalToDeviceUnits(80));
@@ -750,13 +762,48 @@ public class MainForm : Form
         _sliderHost.SuspendLayout();
         _sliderHost.Controls.Clear();
         _sliderHost.RowStyles.Clear();
-        _sliderHost.RowCount = _sliders.Length;
-        for (int i = 0; i < _sliders.Length; i++)
+        // The empty card is rebuilt each time; drop the old reference so a rebuilt
+        // host with sliders doesn't keep a stale (disposed) card around.
+        _emptyCard = null; _emptyTitle = _emptySub = null; _emptyAdd = null;
+        if (_sliders.Length == 0)
         {
+            _sliderHost.RowCount = 1;
             _sliderHost.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            _sliderHost.Controls.Add(_sliders[i].Card, 0, i);
+            _sliderHost.Controls.Add(BuildEmptyCard(), 0, 0);
+        }
+        else
+        {
+            _sliderHost.RowCount = _sliders.Length;
+            for (int i = 0; i < _sliders.Length; i++)
+            {
+                _sliderHost.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                _sliderHost.Controls.Add(_sliders[i].Card, 0, i);
+            }
         }
         _sliderHost.ResumeLayout();
+    }
+
+    // Empty-state card (shown when there are no faders): a short message plus an
+    // accent "Add fader" button that opens setup with the Add buttons pulsing.
+    CardPanel BuildEmptyCard()
+    {
+        var card = new CardPanel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 168, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 14, 16, 16) };
+        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, BackColor = Color.Transparent };
+        t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        _emptyTitle = new Label { Text = "No faders yet", AutoSize = true, Anchor = AnchorStyles.None, Font = new Font("Segoe UI", 13f, FontStyle.Bold), Margin = new Padding(0, 10, 0, 4) };
+        _emptySub = new Label { Text = "Add a physical or virtual fader to get started.", AutoSize = true, Anchor = AnchorStyles.None, Margin = new Padding(0, 0, 0, 12) };
+        _emptyAdd = new RoundedButton { Text = "Add fader", AutoSize = true, Anchor = AnchorStyles.None, Padding = new Padding(16, 7, 16, 7), Margin = new Padding(0, 0, 0, 4) };
+        _emptyAdd.Click += (_, _) => RunSetupWizard(pulse: true);
+        _tip.SetToolTip(_emptyAdd, "Set up your faders");
+        t.Controls.Add(_emptyTitle, 0, 0);
+        t.Controls.Add(_emptySub, 0, 1);
+        t.Controls.Add(_emptyAdd, 0, 2);
+        card.Controls.Add(t);
+        _emptyCard = card;
+        return card;
     }
 
     // Build one slider: its card, controls, and wiring, for the given HID axis.
@@ -1038,6 +1085,20 @@ public class MainForm : Form
         WalkLabels(this, l => { l.ForeColor = t.Subtle; l.BackColor = Color.Transparent; });
         foreach (var s in _sliders) s.Pct.ForeColor = t.Text;
         _statusDot.ForeColor = t.Accent;
+
+        // Empty-state card (present only when there are no faders). Set after
+        // WalkLabels so the title keeps its primary colour.
+        if (_emptyCard is { } ec)
+        {
+            ec.BackColor = t.Card;
+            if (_emptyTitle is { } et) et.ForeColor = t.Text;
+            if (_emptySub is { } es) es.ForeColor = t.Subtle;
+            if (_emptyAdd is { } ea)
+            {
+                ea.BackColor = t.Accent; ea.ForeColor = AccentText();
+                ea.FlatAppearance.BorderColor = t.Accent; ea.Surround = t.Card; ea.Invalidate();
+            }
+        }
 
         // Theme the scrollbar (shown when many sliders overflow the window).
         if (_sliderHost.IsHandleCreated)
@@ -1879,9 +1940,9 @@ public class MainForm : Form
             ApplyCalibration(a, c.Cal);
             return a;
         }).ToArray();
-        if (_sliders.Length == 0) _sliders = new[] { BuildSlider(0, "Fader 1") };
-        _left = _sliders[0];
-        _right = _sliders.Length > 1 ? _sliders[1] : _sliders[0];
+        // 0 sliders is valid now (empty-state card). _left/_right are vestigial.
+        _left = _sliders.Length > 0 ? _sliders[0] : null!;
+        _right = _sliders.Length > 1 ? _sliders[1] : _left;
 
         PopulateSliderHost();
         ApplyTheme(CurrentTheme());
@@ -1891,25 +1952,46 @@ public class MainForm : Form
         foreach (var s in old) s.Card.Dispose();
     }
 
-    // Run the guided setup: move each fader to detect its axis and capture travel.
-    void RunSetupWizard()
+    // Open the fader setup dialog: a reorderable list seeded from the current
+    // faders, with inline physical capture and add-virtual. On Done, rebuild the
+    // layout from the returned order — reusing each existing slider's config
+    // (target/cap/name/calibration) when the item carries its SourceIndex.
+    // pulse animates the dialog's Add buttons (used from the empty-state card).
+    void RunSetupWizard(bool pulse = false)
     {
+        var existing = _sliders.Select((s, i) => new SetupDialog.Item
+        {
+            Kind = s.IsVirtual ? SetupDialog.ItemKind.Virtual : SetupDialog.ItemKind.Physical,
+            Axis = s.AxisIndex,
+            Min = s.Cal.Min,
+            Max = s.Cal.Max,
+            SourceIndex = i,
+            Label = s.Name.Text,
+        }).ToList();
+
         bool prev = _calibrating;
         _calibrating = true;   // don't drive outputs mid-sweep
-        using (var dlg = new SetupDialog(_theme, () => (int[])_lastAxisRaw.Clone()))
+        using (var dlg = new SetupDialog(_theme, () => (int[])_lastAxisRaw.Clone(), existing, pulse))
         {
             var result = dlg.ShowDialog(this);
             _calibrating = prev;
-            if (result == DialogResult.OK && dlg.Result.Count > 0)
+            if (result == DialogResult.OK)
             {
-                var configs = dlg.Result.Select((r, i) => r.Axis < 0
-                    ? new SliderConfig { IsVirtual = true, AxisIndex = -1, Label = $"Fader {i + 1}", Value = 50 }
-                    : new SliderConfig
-                    {
-                        AxisIndex = r.Axis,
-                        Label = $"Fader {i + 1}",
-                        Cal = new Calibration { Min = r.Min, Max = r.Max, Taper = TaperKind.Linear },
-                    }).ToList();
+                var configs = dlg.Result.Select((item, i) =>
+                {
+                    // Seeded rows reuse the existing slider's full config so its
+                    // target/cap/name/calibration survive a reorder.
+                    if (item.SourceIndex is int si && si >= 0 && si < _sliders.Length)
+                        return ToConfig(_sliders[si]);
+                    return item.Kind == SetupDialog.ItemKind.Physical
+                        ? new SliderConfig
+                        {
+                            AxisIndex = item.Axis,
+                            Label = $"Fader {i + 1}",
+                            Cal = new Calibration { Min = item.Min, Max = item.Max, Taper = TaperKind.Linear },
+                        }
+                        : new SliderConfig { IsVirtual = true, AxisIndex = -1, Label = $"Fader {i + 1}", Value = 50 };
+                }).ToList();
                 // With no physical unit connected, virtual faders live in the
                 // synthetic virtual-home profile so they persist and reappear.
                 string key = _activeKey ?? VirtualKey;
@@ -1920,7 +2002,7 @@ public class MainForm : Form
                     _devices[key] = p;
                 }
                 p.Sliders = configs;
-                RebuildSliders(configs);
+                RebuildSliders(configs);   // 0 configs is valid — shows the empty card
                 SaveSettings();
             }
         }
