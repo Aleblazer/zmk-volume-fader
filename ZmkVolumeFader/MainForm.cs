@@ -1643,6 +1643,9 @@ public class MainForm : Form
     // Delete one virtual fader: rebuild the layout from the remaining sliders.
     void RemoveSlider(Axis a)
     {
+        if (MessageBox.Show(this, $"Remove the virtual fader “{a.Name.Text}”?",
+                "ZMK Volume Fader", MessageBoxButtons.YesNo, MessageBoxIcon.Question)
+            != DialogResult.Yes) return;
         var configs = _sliders.Where(s => s != a).Select(ToConfig).ToList();
         if (_activeKey != null && _devices.TryGetValue(_activeKey, out var p)) p.Sliders = configs;
         RebuildSliders(configs);
