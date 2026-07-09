@@ -40,6 +40,7 @@ sealed class OptionsDialog : Form
     readonly Label[] _rawLbl, _rangeLbl, _previewLbl;
     readonly RoundedButton[] _recordBtn;
     readonly RoundedComboBox[] _taper;
+    readonly MainForm.Stepper?[] _muteStep;   // physical faders' mute dead zone
     readonly MainForm.FaderBar[] _bar;
     readonly bool[] _recording;
     readonly bool[] _virtual;   // per slider: virtual faders have no calibration
@@ -84,6 +85,7 @@ sealed class OptionsDialog : Form
         _presentIds = presentIds.ToArray();
         _rawLbl = new Label[_n]; _rangeLbl = new Label[_n]; _previewLbl = new Label[_n];
         _recordBtn = new RoundedButton[_n]; _taper = new RoundedComboBox[_n];
+        _muteStep = new MainForm.Stepper?[_n];
         _bar = new MainForm.FaderBar[_n]; _recording = new bool[_n];
         _virtual = virtuals ?? new bool[_n];
 
@@ -144,7 +146,13 @@ sealed class OptionsDialog : Form
         CancelButton = cancel;
 
         _tick.Tick += (_, _) => { for (int i = 0; i < _n; i++) Tick(i); };
-        Load += (_, _) => { ApplyDark(); FitHeight(); _tick.Start(); };
+        Load += (_, _) =>
+        {
+            ApplyDark();
+            foreach (var ms in _muteStep) ms?.SizeToFont();   // DPI-fit before measuring
+            FitHeight();
+            _tick.Start();
+        };
         FormClosing += (_, _) => _tick.Stop();
     }
 
@@ -306,12 +314,14 @@ sealed class OptionsDialog : Form
     Panel BuildFader(int i, string name)
     {
         int idx = i;
-        var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 164, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
+        // Auto-size (like the virtual/General cards) so the added mute row can't
+        // clip at any scaling.
+        var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
 
-        var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4, BackColor = Color.Transparent };
+        var t = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2, RowCount = 5, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        for (int r = 0; r < 4; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        for (int r = 0; r < 5; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         t.Controls.Add(new Label { Text = name, AutoSize = true, ForeColor = _t.Subtle, Anchor = AnchorStyles.Left, Margin = new Padding(0, 4, 0, 0) }, 0, 0);
         _rawLbl[i] = new Label { Text = "raw —", AutoSize = true, ForeColor = _t.Text, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 11f) };
@@ -334,6 +344,25 @@ sealed class OptionsDialog : Form
         t.Controls.Add(taperPanel, 0, 2);
         t.SetColumnSpan(taperPanel, 2);
 
+        // Mute dead zone: force 0% output while the fader sits below this level
+        // (a mixer-style mute detent; also stops a wiper resting a few mV above
+        // the calibrated Min from hovering at 1%).
+        var mutePanel = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 0) };
+        mutePanel.Controls.Add(new Label { Text = "Mute below", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(0, 6, 8, 0) });
+        var ms = new MainForm.Stepper
+        {
+            Minimum = 0, Maximum = 50, Value = Math.Clamp(_cal[i].MutePct, 0, 50),
+            BackColor = _t.CtlBg, ForeColor = _t.Text, BorderColor = _t.CtlBorder,
+            ChevronColor = _t.Subtle, Surround = _t.Card,
+        };
+        ms.ValueChanged += (_, _) => _cal[idx].MutePct = ms.Value;
+        _muteStep[i] = ms;
+        mutePanel.Controls.Add(ms);
+        mutePanel.Controls.Add(new Label { Text = "%   (0 = off)", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(6, 6, 0, 0) });
+        _tip.SetToolTip(ms, "Force 0% volume while the fader sits below this level");
+        t.Controls.Add(mutePanel, 0, 3);
+        t.SetColumnSpan(mutePanel, 2);
+
         _bar[i] = new MainForm.FaderBar
         {
             Height = 22, ShowTicks = false, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 8, 8, 2),
@@ -342,8 +371,8 @@ sealed class OptionsDialog : Form
             KnobEdge = _t.Dark ? Color.FromArgb(0x0E, 0x10, 0x14) : Color.FromArgb(0xC2, 0xC6, 0xCC),
         };
         _previewLbl[i] = new Label { Text = "0%", AutoSize = true, ForeColor = _t.Accent, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 11f) };
-        t.Controls.Add(_bar[i], 0, 3);
-        t.Controls.Add(_previewLbl[i], 1, 3);
+        t.Controls.Add(_bar[i], 0, 4);
+        t.Controls.Add(_previewLbl[i], 1, 4);
 
         card.Controls.Add(t);
         return card;
@@ -395,6 +424,7 @@ sealed class OptionsDialog : Form
         _rangeLbl[i].Text = _cal[i].Min <= _cal[i].Max ? $"range {_cal[i].Min} – {_cal[i].Max}" : "range —";
 
         int p = Math.Clamp((int)Math.Round(Calibration.Eval(_cal[i].BuildCurve(), v)), 0, 100);
+        if (_cal[i].MutePct > 0 && p < _cal[i].MutePct) p = 0;   // preview the mute dead zone
         _previewLbl[i].Text = $"{p}%";
         _bar[i].Value = p;
     }
