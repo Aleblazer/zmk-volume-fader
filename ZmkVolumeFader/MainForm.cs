@@ -979,8 +979,8 @@ public class MainForm : Form
     {
         var b = new RoundedButton
         {
-            Text = "✕", AutoSize = true, Font = new Font("Segoe UI", 8.25f),
-            Padding = new Padding(8, 4, 8, 4), Margin = new Padding(0, 0, 0, 0),
+            Text = "✕", AutoSize = false, Font = new Font("Segoe UI", 8.25f),
+            Size = new Size(24, 26), Margin = new Padding(0, 0, 0, 0),
             Anchor = AnchorStyles.None, Radius = 7,
         };
         b.Click += (_, _) => RemoveSlider(axis);
