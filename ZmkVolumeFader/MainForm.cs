@@ -811,6 +811,12 @@ public class MainForm : Form
         int chrome = _footer.PreferredSize.Height + LogicalToDeviceUnits(14) * 2 + LogicalToDeviceUnits(12);
         int want = total + chrome;
         int cap = Math.Min(LogicalToDeviceUnits(760), Screen.FromControl(this).WorkingArea.Height - LogicalToDeviceUnits(80));
+        // When the cards overflow the cap the native vertical scrollbar appears and
+        // overlays the right edge of the host — clipping right-aligned card content
+        // (e.g. a virtual fader's ✕). The AutoScroll TableLayoutPanel doesn't shrink
+        // the anchored cards for it, so reserve its width as right padding.
+        bool willScroll = want > cap;
+        _sliderHost.Padding = new Padding(0, 0, willScroll ? SystemInformation.VerticalScrollBarWidth : 0, 0);
         // Force width to the DPI-scaled design width too — belt-and-braces in case
         // the framework auto-scale didn't already widen it.
         ClientSize = new Size(LogicalToDeviceUnits(460), Math.Clamp(want, LogicalToDeviceUnits(300), cap));
