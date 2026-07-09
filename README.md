@@ -2,38 +2,56 @@
 
 [![Build](https://github.com/Aleblazer/zmk-volume-fader/actions/workflows/build.yml/badge.svg)](https://github.com/Aleblazer/zmk-volume-fader/actions/workflows/build.yml)
 
-A small Windows app that maps two physical slide faders on a ZMK keyboard to the
-volume of two Windows audio output devices — so you can ride, say, **Game** and
-**Chat** levels independently without alt-tabbing to a mixer.
+**ZMK Volume Fader** rides the volume of your apps and audio devices in real time —
+with **physical slide faders on a ZMK keyboard**, **on-screen faders you drag with
+the mouse**, **global hotkeys**, or any mix of the three. A ZMK keyboard is
+**optional**: everything works with no hardware at all.
 
-The keyboard's dongle reports the faders over USB HID; this app reads that and
-drives each chosen output's volume in real time. It tucks into the system tray
-and keeps working in the background.
+Point each fader at a **Windows output device**, a **single app**, or a **group of
+apps**, and ride levels — say game vs. chat, or Discord vs. everything else —
+without alt-tabbing to a mixer. It tucks into the system tray and keeps working in
+the background.
 
 <!-- TODO: add a screenshot of the window here, e.g. docs/screenshot.png -->
 
-## How it works
+## Features
 
-Your ZMK build wires a slide potentiometer to an ADC channel and exposes it
-through [zmk-hid-io](https://github.com/Aleblazer/zmk-hid-io/tree/absolute-faders)
-as a HID joystick (Generic Desktop, **report id 2**): `X` = first fader, `Y` =
-second fader, each a **signed 16-bit little-endian** axis carrying the raw wiper
-voltage (~0..3300). In the raw report, bytes 1–2 are the first fader and bytes
-3–4 the second.
+- **Any number of faders (up to 8)**, each independently controlling one of:
+  - an **output device** (with ranked fallback across devices),
+  - one **app's** volume (followed across every device it's playing on),
+  - a **category** of apps that move together, or
+  - **"Everything Else"** — every running app not assigned to a category.
+- **Physical faders** — slide pots on a ZMK keyboard, read over USB HID *(optional hardware)*.
+- **Virtual faders** — on-screen faders you drag with the mouse. **No hardware required.**
+- **Global hotkeys** for virtual faders — bind Volume Up / Down / Mute to any key
+  (**F13–F24** are ideal) or a modifier combo. Keys pass through, so they still work
+  in the focused app; stepping is smoothed and the step size is configurable.
+- **Guided setup** — "Set Up Faders" detects each physical fader as you sweep it, or
+  adds virtual ones; reorder, rename, and remove faders in place.
+- **Categories editor**, **ranked default outputs** with automatic hotplug failover,
+  and per-output **Max %** caps.
+- **Light / dark / auto theme**, **start with Windows**, **minimize to tray**.
+- Per-device profiles keyed by device identity; settings persist in
+  `%APPDATA%\ZmkVolumeFader\settings.v2.json`.
 
-That 16-bit path uses a fork of zmk-hid-io patched to forward absolute axes
-(upstream only handled relative motion) and widened from 8-bit to 16-bit so a
-pot's taper-compressed top of travel keeps its resolution.
+## Install
+
+Download the latest **`ZmkVolumeFader-<version>-win-x64.exe`** from
+[Releases](https://github.com/Aleblazer/zmk-volume-fader/releases) — a self-contained
+single file, no .NET install needed (Windows 10/11 x64).
+
+> The build is **unsigned**, so Windows SmartScreen shows a "Windows protected your
+> PC" prompt on first run. Click **More info → Run anyway**.
 
 ## Requirements
 
-- **Windows** (uses the Core Audio API and WinForms).
-- **.NET 8 SDK** to build/run:
+- **Windows 10/11** (uses the Core Audio API and WinForms).
+- *(optional)* a **ZMK keyboard** whose dongle exposes slide faders over USB HID —
+  needed only for **physical** faders. Without one, use virtual faders + hotkeys.
+- *(to build from source)* the **.NET 8 SDK**:
   ```bat
   winget install Microsoft.DotNet.SDK.8
   ```
-- A **ZMK keyboard** whose dongle exposes the faders as described above — ZMK's
-  default USB VID `0x1D50` / PID `0x615E`.
 
 ## Build & run
 
@@ -42,45 +60,82 @@ cd ZmkVolumeFader
 dotnet run
 ```
 
-To produce a standalone `.exe` (no SDK needed to run it):
+Standalone single-file `.exe` (matches the released build):
 
 ```bat
-dotnet publish ZmkVolumeFader -c Release -r win-x64 --self-contained false
+dotnet publish ZmkVolumeFader -c Release -r win-x64 --self-contained true ^
+  -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true ^
+  -p:EnableCompressionInSingleFile=true
 ```
 
 ## Usage
 
-The app auto-finds the dongle (VID `0x1D50` / PID `0x615E`, by the Joystick HID
-usage) and shows a row per fader:
+Open **Options → Set up faders…** to add faders:
 
-- **Output dropdown** — pick the Windows render device each fader controls (e.g.
-  a headset's "Game" and "Chat" endpoints). Move a fader and its device's volume
-  follows.
-- **Max %** cap — the throw scales into `0..cap`, so a cap of 60 means bottom =
-  0%, top = 60%, middle = 30% — handy for outputs that get painfully loud past a
-  point. Changing the cap applies immediately, so dropping it instantly pulls a
-  loud device back down.
-- A live bar and a `raw (min-max)` readout per fader (the raw readout is for
-  calibration).
+- **Add physical fader** — sweep the fader fully bottom-to-top; the app detects which
+  axis it is and captures its range.
+- **Add virtual fader** — adds an on-screen fader you drag with the mouse.
+- Reorder with ▲/▼, remove with ✕, and rename each fader right in the list.
 
-Minimizing sends the window straight to the system tray; closing it asks whether
-to minimize to the tray or exit. While in the tray it keeps driving volume — use
-the tray icon's **Open** / **Exit** menu or double-click to bring it back.
+With no faders configured, the main window shows an **"Add fader"** card that jumps
+straight into setup.
 
-Device choices and caps are saved to `%APPDATA%\ZmkVolumeFader\settings.json`.
+Each fader card has:
 
-## Calibration
+- **Output / Apps / Categories** tabs — choose what the fader controls, then pick the
+  target from the dropdown below. The app list mirrors the live Windows mixer;
+  Categories includes the built-in **Everything Else** catch-all.
+- **Max %** cap (physical faders) — the throw scales into `0..cap`, so a cap of 60
+  means bottom = 0%, top = 60%, middle = 30%. Changing it applies immediately.
+- **Hotkeys** and **Remove** (virtual faders) — assign global hotkeys, or delete the
+  fader (with confirmation).
 
-The pot reads strongly compressed at the top of travel, so the value→percent
-mapping is a piecewise curve (`Curve` in `ZmkVolumeFader/MainForm.cs`), not
-linear — it inverts the taper so the throw feels ~linear. The end points are
-continuous dead bands (value 0 → 0%, value ≥ the last point → 100%), so the
-bottom rests cleanly and the top reaches full volume without a cliff. Output
-hysteresis keeps a parked level from flip-flopping between two percentages.
+### Virtual faders & hotkeys
 
-To recalibrate after a pot/wiring change: sweep both faders fully, read the
-`(min-max)` off each label, set `Curve`'s first point to `(min, 0)` and last to
-`(max, 100)`, and adjust the mids to taste.
+Drag a virtual fader with the mouse, or click **Hotkeys** to bind **Volume Up / Down /
+Mute** to global keys. **F13–F24** are ideal — nothing else uses them, so they need no
+modifier — and modifier combos (e.g. `Ctrl+Alt+↑`) work too. Keys are observed, not
+swallowed, so they keep doing their normal job in whatever app is focused. The step per
+press is configurable and the change is smoothed so holding a key ramps cleanly. On a
+ZMK keyboard, map a key (or a dedicated cluster) to F13–F24 and it becomes an app volume
+control — no analog fader hardware needed.
+
+### Output failover & categories
+
+**Set Default Outputs** ranks a fader's preferred output devices; the top present one is
+driven and it fails over automatically on plug/unplug. **Manage Categories** groups apps
+so a fader can move them together.
+
+### Tray & persistence
+
+Minimizing sends the window straight to the tray; closing asks whether to minimize or
+exit. While in the tray it keeps driving volume — use the tray icon's **Open** / **Exit**
+menu, or double-click to bring it back. Everything — faders, targets, order, hotkeys,
+calibration, theme — is saved to `%APPDATA%\ZmkVolumeFader\settings.v2.json`.
+
+## Calibration (physical faders)
+
+In **Options**, each physical fader has a **taper preset** (Linear / Audio / Straight)
+plus a **Record** button: hit Record, sweep the fader end-to-end, stop, then pick the
+taper that matches your pot — the preview updates as you move it. This corrects a slide
+pot's compressed top-of-travel so the throw feels even, and output hysteresis keeps a
+parked level from flip-flopping between two percentages. Virtual faders need no
+calibration.
+
+## Physical faders — ZMK firmware (optional)
+
+For physical faders, your ZMK build wires a slide potentiometer to an ADC channel and
+forwards it through a fork of
+[zmk-hid-io](https://github.com/Aleblazer/zmk-hid-io/tree/absolute-faders). The faders
+are emitted entirely under a **vendor HID page (`0xFF00`), report id 2**: up to **eight
+signed 16-bit little-endian axes**, each carrying the raw wiper voltage (~0..3300). The
+app finds the dongle by ZMK's default USB VID `0x1D50` / PID `0x615E` and the vendor
+usage `0xFF000001`, and reads whatever axes are present.
+
+The report sits on a vendor page (rather than Generic Desktop / Joystick) on purpose, so
+neither Windows nor games treat the keyboard as a game controller. The fork also forwards
+**absolute** axes (upstream only handled relative motion) and widens them from 8-bit to
+16-bit so a pot's taper-compressed top of travel keeps its resolution.
 
 ## fader_read.py — optional Python byte-dumper
 
