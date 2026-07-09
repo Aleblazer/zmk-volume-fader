@@ -211,7 +211,16 @@ sealed class SetupDialog : Form
         grid.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
         grid.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
 
-        var name = new Label { Text = string.IsNullOrEmpty(it.Label) ? (it.Kind == ItemKind.Virtual ? "Virtual fader" : "Physical fader") : it.Label, AutoSize = false, Dock = DockStyle.Fill, TextAlign = ContentAlignment.BottomLeft, ForeColor = _t.Text, Font = new Font("Segoe UI", 10f, FontStyle.Bold) };
+        // Editable name; blank falls back to a default (see RunSetupWizard).
+        var name = new TextBox
+        {
+            Text = it.Label,
+            PlaceholderText = it.Kind == ItemKind.Virtual ? "Virtual fader" : "Physical fader",
+            BorderStyle = BorderStyle.FixedSingle, BackColor = _t.CtlBg, ForeColor = _t.Text,
+            Font = new Font("Segoe UI", 9.75f),
+            Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom, Margin = new Padding(0, 0, 6, 1),
+        };
+        name.TextChanged += (_, _) => it.Label = name.Text;
         var sub = new Label { Text = Subtitle(it), AutoSize = false, Dock = DockStyle.Fill, TextAlign = ContentAlignment.TopLeft, ForeColor = _t.Subtle };
         grid.Controls.Add(name, 0, 0);
         grid.Controls.Add(sub, 0, 1);
@@ -245,7 +254,7 @@ sealed class SetupDialog : Form
 
     void AddVirtual()
     {
-        _items.Add(new Item { Kind = ItemKind.Virtual, Axis = -1, Label = "Virtual fader" });
+        _items.Add(new Item { Kind = ItemKind.Virtual, Axis = -1, Label = "" });
         RebuildRows();
     }
 
@@ -322,7 +331,7 @@ sealed class SetupDialog : Form
     void CaptureCandidate()
     {
         if (_candidate < 0) return;
-        _items.Add(new Item { Kind = ItemKind.Physical, Axis = _candidate, Min = _min[_candidate], Max = _max[_candidate], Label = "Physical fader" });
+        _items.Add(new Item { Kind = ItemKind.Physical, Axis = _candidate, Min = _min[_candidate], Max = _max[_candidate], Label = "" });
         ExitCapture();
         RebuildRows();
     }

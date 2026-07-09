@@ -2170,18 +2170,25 @@ public class MainForm : Form
             {
                 var configs = dlg.Result.Select((item, i) =>
                 {
+                    // The name typed in the dialog, or a positional default if blank.
+                    string label = string.IsNullOrWhiteSpace(item.Label) ? $"Fader {i + 1}" : item.Label.Trim();
                     // Seeded rows reuse the existing slider's full config so its
-                    // target/cap/name/calibration survive a reorder.
+                    // target/cap/calibration survive a reorder; the (possibly edited)
+                    // name overrides.
                     if (item.SourceIndex is int si && si >= 0 && si < _sliders.Length)
-                        return ToConfig(_sliders[si]);
+                    {
+                        var cfg = ToConfig(_sliders[si]);
+                        cfg.Label = label;
+                        return cfg;
+                    }
                     return item.Kind == SetupDialog.ItemKind.Physical
                         ? new SliderConfig
                         {
                             AxisIndex = item.Axis,
-                            Label = $"Fader {i + 1}",
+                            Label = label,
                             Cal = new Calibration { Min = item.Min, Max = item.Max, Taper = TaperKind.Linear },
                         }
-                        : new SliderConfig { IsVirtual = true, AxisIndex = -1, Label = $"Fader {i + 1}", Value = 50 };
+                        : new SliderConfig { IsVirtual = true, AxisIndex = -1, Label = label, Value = 50 };
                 }).ToList();
                 // With no physical unit connected, virtual faders live in the
                 // synthetic virtual-home profile so they persist and reappear.
