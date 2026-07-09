@@ -659,8 +659,11 @@ public class MainForm : Form
     readonly Label _status = new() { Text = "Starting…", AutoSize = true, Anchor = AnchorStyles.Left };
     readonly Label _statusDot = new() { Text = "●", AutoSize = true, Font = new Font("Segoe UI", 8f), Margin = new Padding(0, 3, 6, 0) };
 
-    // Slider cards are built dynamically into this scrollable host (one row each).
+    // Slider cards are built dynamically into _sliderHost (one row each); it lives
+    // inside _scroll, a custom scroll viewport that sizes the cards around its own
+    // thumb (the native AutoScroll bar overlaid the cards' right edge).
     TableLayoutPanel _sliderHost = null!, _footer = null!;
+    RoundedScrollPanel _scroll = null!;
     // Empty-state card shown (in place of slider rows) when there are no faders.
     CardPanel? _emptyCard;
     Label? _emptyTitle, _emptySub;
@@ -722,9 +725,12 @@ public class MainForm : Form
         _left = _right = null!;
         ClientSize = new Size(ClientSize.Width, WindowHeightFor(_sliders.Length));
 
-        // Slider cards stack in a scrollable host; the footer stays pinned below.
-        _sliderHost = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, AutoScroll = true, BackColor = Color.Transparent, Margin = new Padding(0), Padding = new Padding(0) };
+        // Slider cards stack in _sliderHost, which scrolls inside _scroll; the
+        // footer stays pinned below.
+        _sliderHost = new TableLayoutPanel { ColumnCount = 1, BackColor = Color.Transparent, Margin = new Padding(0), Padding = new Padding(0) };
         _sliderHost.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        _scroll = new RoundedScrollPanel { Dock = DockStyle.Fill, BackColor = Color.Transparent, Margin = new Padding(0), Padding = new Padding(0) };
+        _scroll.SetContent(_sliderHost);
         PopulateSliderHost();
 
         _footer = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, RowCount = 1, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 0) };
@@ -747,7 +753,7 @@ public class MainForm : Form
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));   // slider host (scrolls if needed)
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));       // footer (pinned)
-        root.Controls.Add(_sliderHost, 0, 0);
+        root.Controls.Add(_scroll, 0, 0);
         root.Controls.Add(_footer, 0, 1);
         Controls.Add(root);
 
@@ -811,15 +817,10 @@ public class MainForm : Form
         int chrome = _footer.PreferredSize.Height + LogicalToDeviceUnits(14) * 2 + LogicalToDeviceUnits(12);
         int want = total + chrome;
         int cap = Math.Min(LogicalToDeviceUnits(760), Screen.FromControl(this).WorkingArea.Height - LogicalToDeviceUnits(80));
-        // When the cards overflow the cap the native vertical scrollbar appears and
-        // overlays the right edge of the host — clipping right-aligned card content
-        // (e.g. a virtual fader's ✕). The AutoScroll TableLayoutPanel doesn't shrink
-        // the anchored cards for it, so reserve its width as right padding.
-        bool willScroll = want > cap;
-        _sliderHost.Padding = new Padding(0, 0, willScroll ? SystemInformation.VerticalScrollBarWidth : 0, 0);
         // Force width to the DPI-scaled design width too — belt-and-braces in case
         // the framework auto-scale didn't already widen it.
         ClientSize = new Size(LogicalToDeviceUnits(460), Math.Clamp(want, LogicalToDeviceUnits(300), cap));
+        _scroll.Reflow();   // resize the card column around the (custom) scrollbar
     }
 
     // (Re)build the slider host with one row per slider. Called on construction
@@ -848,6 +849,7 @@ public class MainForm : Form
             }
         }
         _sliderHost.ResumeLayout();
+        _scroll?.Reflow();
     }
 
     // Empty-state card (shown when there are no faders): a short message plus an
@@ -1191,9 +1193,10 @@ public class MainForm : Form
             }
         }
 
-        // Theme the scrollbar (shown when many sliders overflow the window).
-        if (_sliderHost.IsHandleCreated)
-            SetWindowTheme(_sliderHost.Handle, t.Dark ? "DarkMode_Explorer" : "Explorer", null);
+        // Theme the custom scrollbar thumb (shown when sliders overflow the window).
+        _scroll.ThumbColor = t.CtlBorder;
+        _scroll.ThumbHoverColor = t.Subtle;
+        _scroll.Invalidate();
 
         SetTitleBarDark(t.Dark);
         RefreshStatus();   // recompute the dot/text colour for the current state
