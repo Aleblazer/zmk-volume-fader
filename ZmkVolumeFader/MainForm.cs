@@ -925,13 +925,11 @@ public class MainForm : Form
         {
             axis.Hotkey = HotkeyButton(axis);
             axis.Remove = RemoveButton(axis);
-            // Stack Hotkeys over Remove (not side-by-side) so the card stays narrow.
-            var vbtns = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, RowCount = 2, BackColor = Color.Transparent, Anchor = AnchorStyles.Right, Margin = new Padding(10, 0, 0, 0) };
-            vbtns.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            vbtns.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            vbtns.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            vbtns.Controls.Add(axis.Hotkey, 0, 0);
-            vbtns.Controls.Add(axis.Remove, 0, 1);
+            // Compact side-by-side (Hotkeys + a small ✕) so the cell is about as
+            // wide as the physical cards' "Max %" and doesn't widen the card.
+            var vbtns = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Anchor = AnchorStyles.Right, Margin = new Padding(10, 0, 0, 0) };
+            vbtns.Controls.Add(axis.Hotkey);
+            vbtns.Controls.Add(axis.Remove);
             t.Controls.Add(vbtns, 1, 3);
         }
         else t.Controls.Add(MaxCap(limit), 1, 3);
@@ -969,8 +967,8 @@ public class MainForm : Form
         var b = new RoundedButton
         {
             Text = "Hotkeys", AutoSize = true, Font = new Font("Segoe UI", 8.25f),
-            Padding = new Padding(10, 4, 10, 4), Margin = new Padding(0, 0, 0, 4),
-            Anchor = AnchorStyles.Left | AnchorStyles.Right, Radius = 7,
+            Padding = new Padding(9, 4, 9, 4), Margin = new Padding(0, 0, 4, 0),
+            Anchor = AnchorStyles.None, Radius = 7,
         };
         b.Click += (_, _) => OpenHotkeys(axis);
         _tip.SetToolTip(b, "Assign global volume hotkeys");
@@ -981,9 +979,9 @@ public class MainForm : Form
     {
         var b = new RoundedButton
         {
-            Text = "Remove", AutoSize = true, Font = new Font("Segoe UI", 8.25f),
-            Padding = new Padding(10, 4, 10, 4), Margin = new Padding(0, 0, 0, 0),
-            Anchor = AnchorStyles.Left | AnchorStyles.Right, Radius = 7,
+            Text = "✕", AutoSize = true, Font = new Font("Segoe UI", 8.25f),
+            Padding = new Padding(8, 4, 8, 4), Margin = new Padding(0, 0, 0, 0),
+            Anchor = AnchorStyles.None, Radius = 7,
         };
         b.Click += (_, _) => RemoveSlider(axis);
         _tip.SetToolTip(b, "Delete this virtual fader");
