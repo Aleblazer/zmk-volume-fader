@@ -128,8 +128,12 @@ internal sealed class RoundedScrollPanel : Panel, IMessageFilter
     const int WM_MOUSEWHEEL = 0x020A;
     public bool PreFilterMessage(ref Message m)
     {
-        if (m.Msg != WM_MOUSEWHEEL || !ShowBar || !IsHandleCreated || !Visible || FindForm()?.Visible != true)
-            return false;
+        if (m.Msg != WM_MOUSEWHEEL || !ShowBar || !IsHandleCreated || !Visible) return false;
+        // The message filter is application-wide, so ignore the wheel unless this
+        // panel's form is the active one — otherwise a modal dialog layered over
+        // this window (Options over the main window) would still scroll us.
+        var f = FindForm();
+        if (f is not { Visible: true } || f != Form.ActiveForm) return false;
         if (!RectangleToScreen(ClientRectangle).Contains(Cursor.Position)) return false;
         int delta = (short)((long)m.WParam >> 16 & 0xFFFF);
         ScrollBy(-delta);
