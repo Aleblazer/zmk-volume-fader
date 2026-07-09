@@ -110,8 +110,13 @@ sealed class OutputsDialog : Form
             int content = root.PreferredSize.Height + LogicalToDeviceUnits(14);
             int foot = footer.PreferredSize.Height;
             // Force the DPI-scaled width — auto-scale doesn't reliably widen a
-            // FixedDialog, so the content would otherwise clip at 125%+.
-            ClientSize = new Size(LogicalToDeviceUnits(430), Math.Clamp(content + foot, LogicalToDeviceUnits(300), LogicalToDeviceUnits(720)));
+            // FixedDialog, so the content would otherwise clip at 125%+. Height
+            // is clamped to the screen too (720 logical = 1440 device at 200%);
+            // cap stays >= min or Math.Clamp throws.
+            int minH = LogicalToDeviceUnits(300);
+            int cap = Math.Max(minH, Math.Min(LogicalToDeviceUnits(720),
+                Screen.FromControl(this).WorkingArea.Height - LogicalToDeviceUnits(80)));
+            ClientSize = new Size(LogicalToDeviceUnits(430), Math.Clamp(content + foot, minH, cap));
         };
         FormClosed += (_, _) => _enum.Dispose();
     }

@@ -13,6 +13,10 @@ namespace ZmkVolumeFader;
 /// <summary>How the UI picks its palette: follow Windows, or force one.</summary>
 internal enum ThemeMode { Auto, Light, Dark }
 
+/// <summary>What closing the window does: ask each time, minimize to the tray,
+/// or exit the app. Configurable in Options.</summary>
+internal enum CloseBehavior { Ask, Tray, Exit }
+
 /// <summary>What a slider controls: an output device, one app, or a category of apps.</summary>
 internal enum TargetKind { Output, App, Category }
 
@@ -39,6 +43,10 @@ internal sealed class Hotkey
     public bool Matches(int vk, bool ctrl, bool alt, bool shift, bool win)
         => IsBound && vk == Vk && ctrl == Ctrl && alt == Alt && shift == Shift && win == Win;
 
+    /// <summary>Same chord as another binding (both bound, same key + modifiers).</summary>
+    public bool SameAs(Hotkey o)
+        => IsBound && o.IsBound && Vk == o.Vk && Ctrl == o.Ctrl && Alt == o.Alt && Shift == o.Shift && Win == o.Win;
+
     // Extended F-keys (F13..F24) and media keys are safe to bind bare — nothing
     // else uses them. Any other bare key fires during normal use (a "hint" case).
     public bool IsBareCommonKey =>
@@ -57,11 +65,19 @@ internal sealed class Hotkey
         return s + KeyName(Vk);
     }
 
-    static string KeyName(int vk)
+    // Friendly key names: Keys.ToString() yields "D1", "Oemtilde", "OemMinus"…
+    // Map digits and the common OEM keys to what's printed on the keycap.
+    static string KeyName(int vk) => vk switch
     {
-        var k = (System.Windows.Forms.Keys)vk;
-        return k.ToString();
-    }
+        >= 0x30 and <= 0x39 => ((char)vk).ToString(),   // 0-9 (Keys.D0..D9)
+        0x21 => "PageUp", 0x22 => "PageDown",           // aliased enum names
+        0xC0 => "`", 0xBD => "-", 0xBB => "=",
+        0xDB => "[", 0xDD => "]", 0xDC => "\\",
+        0xBA => ";", 0xDE => "'", 0xBC => ",", 0xBE => ".", 0xBF => "/",
+        0xAD => "Mute", 0xAE => "VolumeDown", 0xAF => "VolumeUp",
+        0xB0 => "NextTrack", 0xB1 => "PrevTrack", 0xB2 => "MediaStop", 0xB3 => "PlayPause",
+        _ => ((System.Windows.Forms.Keys)vk).ToString(),
+    };
 }
 
 /// <summary>
@@ -128,6 +144,7 @@ public class MainForm : Form
 
     Theme _theme = LightTheme;
     ThemeMode _themeMode = ThemeMode.Auto;   // Auto follows the OS; Light/Dark force it
+    CloseBehavior _closeBehavior = CloseBehavior.Ask;   // what the X button does
 
     // ---- custom controls --------------------------------------------------
 
@@ -153,21 +170,35 @@ public class MainForm : Form
         public bool Muted { get => _muted; set { if (v_set(ref _muted, value)) Invalidate(); } }
         static bool v_set(ref bool f, bool v) { if (f == v) return false; f = v; return true; }
 
-        // Interactive (virtual) faders let the user drag the knob to set the level.
-        // Display-only (physical) faders leave this false and ignore the mouse.
+        // Interactive (virtual) faders let the user drag the knob to set the level,
+        // or focus the bar (Tab / click) and nudge it with the keyboard.
+        // Display-only (physical) faders leave this false and ignore input.
         bool _interactive;
         public bool Interactive
         {
             get => _interactive;
-            set { _interactive = value; Cursor = value ? Cursors.Hand : Cursors.Default; }
+            set
+            {
+                _interactive = value;
+                Cursor = value ? Cursors.Hand : Cursors.Default;
+                SetStyle(ControlStyles.Selectable, value);
+                TabStop = value;
+            }
         }
         bool _dragging;
+        bool _keyAdjusting;   // arrow-key nudge in progress; commit on key-up
         // Raised while the user drags (live volume) and once more on release. The
-        // bool is true on the final (mouse-up) event so the owner can persist then.
+        // bool is true on the final (mouse-up / key-up) event so the owner can
+        // persist then.
         public event Action<int, bool>? UserSet;
 
-        public FaderBar() => SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
-                                      | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        public FaderBar()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer
+                     | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+            SetStyle(ControlStyles.Selectable, false);   // display-only until Interactive
+            TabStop = false;
+        }
 
         // Horizontal span the knob centre travels across, matching OnPaint. Returns
         // false when the control is too small to interact with.
@@ -190,6 +221,7 @@ public class MainForm : Form
         {
             base.OnMouseDown(e);
             if (!_interactive || e.Button != MouseButtons.Left) return;
+            Focus();   // so arrow keys work right after a click
             _dragging = true;
             Capture = true;
             Value = ValueFromX(e.X);
@@ -212,6 +244,45 @@ public class MainForm : Form
             Capture = false;
             UserSet?.Invoke(_value, true);   // committed — owner persists here
         }
+
+        // Keyboard nudging when focused: arrows ±1, PageUp/Down ±10, Home/End to
+        // the ends. Arrows are dialog-navigation keys, so claim them via IsInputKey.
+        protected override bool IsInputKey(Keys keyData) =>
+            (_interactive && (keyData & Keys.KeyCode) is Keys.Left or Keys.Right or Keys.Up or Keys.Down
+                or Keys.PageUp or Keys.PageDown or Keys.Home or Keys.End)
+            || base.IsInputKey(keyData);
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (!_interactive) return;
+            int v = e.KeyCode switch
+            {
+                Keys.Left or Keys.Down => _value - 1,
+                Keys.Right or Keys.Up => _value + 1,
+                Keys.PageDown => _value - 10,
+                Keys.PageUp => _value + 10,
+                Keys.Home => 0,
+                Keys.End => 100,
+                _ => _value,
+            };
+            if (v == _value) return;
+            e.Handled = true;
+            Value = Math.Clamp(v, 0, 100);
+            _keyAdjusting = true;
+            UserSet?.Invoke(_value, false);   // live while held (auto-repeat)
+        }
+
+        protected override void OnKeyUp(KeyEventArgs e)
+        {
+            base.OnKeyUp(e);
+            if (!_keyAdjusting) return;
+            _keyAdjusting = false;
+            UserSet?.Invoke(_value, true);    // committed — persist once per nudge
+        }
+
+        protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+        protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -284,6 +355,10 @@ public class MainForm : Form
             float dotR = knobR * 0.42f;
             using (var cd = new SolidBrush(_muted ? grey : ColorAt(f)))
                 g.FillEllipse(cd, kx - dotR, cy - dotR, dotR * 2, dotR * 2);
+
+            // Keyboard-focus cue for interactive (virtual) faders.
+            if (_interactive && Focused)
+                ControlPaint.DrawFocusRectangle(g, new Rectangle(0, 0, w, h));
         }
 
         // Green->yellow->red at fraction f, matching the fill gradient.
@@ -494,9 +569,13 @@ public class MainForm : Form
     const string UnassignedDisplay = "Everything Else";
 
     // Live mixer apps not assigned to any category — what the Unassigned
-    // pseudo-category drives.
+    // pseudo-category drives. Apps another fader targets *directly* are also
+    // excluded, so "Everything Else" never fights a dedicated app fader.
+    // (System Sounds counts as unassigned on purpose.)
     IEnumerable<string> UnassignedKeys() =>
-        _appSessions.Keys.Where(k => !_categories.Any(c => c.AppKeys.Contains(k)));
+        _appSessions.Keys.Where(k =>
+            !_categories.Any(c => c.AppKeys.Contains(k))
+            && !_sliders.Any(s => s.Target == TargetKind.App && s.AppKey == k));
 
     // Fires a callback whenever the set of audio endpoints changes (plug/unplug,
     // enable/disable) so the app can re-pick each fader's active output live.
@@ -581,6 +660,10 @@ public class MainForm : Form
         public Hotkey HkDown { get; set; } = new();
         public Hotkey HkMute { get; set; } = new();
         public int Step { get; set; } = 5;
+        // Mute survives a restart: Value is 0 while muted, PreMute is the level
+        // the mute hotkey restores.
+        public bool Muted { get; set; }
+        public int PreMute { get; set; } = 50;
     }
 
     // Everything remembered for one physical fader unit (its sliders, in order).
@@ -603,6 +686,9 @@ public class MainForm : Form
         // User-defined app groups (global across devices).
         public List<Category> Categories { get; set; } = new();
         public ThemeMode ThemeMode { get; set; } = ThemeMode.Auto;
+        public CloseBehavior CloseBehavior { get; set; } = CloseBehavior.Ask;
+        // App-key -> unix seconds last seen with a live session (for pruning).
+        public Dictionary<string, long> AppSeen { get; set; } = new();
 
         // Legacy pre-multi-slider flat fields, read once to migrate settings.json.
         public string? LeftDeviceId { get; set; }
@@ -634,8 +720,16 @@ public class MainForm : Form
     HashSet<string> _liveApps = new();   // apps with a session right now (i.e. in the mixer)
     Dictionary<string, List<AudioSessionControl>> _appSessions = new();
     // App-key -> extracted 16px exe icon (null once = couldn't extract, retried
-    // cheaply while still null). Kept for the app lifetime.
+    // up to IconTryMax times). Kept for the app lifetime.
     readonly Dictionary<string, Image?> _appIcons = new();
+    // App-key -> failed extraction attempts, so an inaccessible exe (elevated
+    // process, missing file) isn't re-tried on every 1s poll forever.
+    readonly Dictionary<string, int> _iconTries = new();
+    const int IconTryMax = 3;
+    // App-key -> unix seconds the app last had a live session (persisted).
+    // PruneKnownApps drops long-unseen, unreferenced apps at startup so the
+    // known-apps list and icon cache don't grow forever.
+    readonly Dictionary<string, long> _appSeen = new();
     List<Category> _categories = new();
     readonly System.Windows.Forms.Timer _sessionPoll = new() { Interval = 1000 };
 
@@ -678,6 +772,9 @@ public class MainForm : Form
     // that eases virtual faders toward their hotkey-set target.
     readonly KeyboardHook _hook = new();
     readonly System.Windows.Forms.Timer _vramp = new() { Interval = 20 };
+    // Every vk with any hotkey binding — a snapshot the hook thread reads so
+    // unbound keys (i.e. all normal typing) bail without touching the UI thread.
+    volatile int[] _boundVks = Array.Empty<int>();
 
     Axis _left = null!, _right = null!;
     // All sliders in axis order (count comes from the active device profile).
@@ -770,7 +867,7 @@ public class MainForm : Form
         DpiChanged += (_, _) => BeginInvoke(FitWindowHeight);
 
         _vramp.Tick += (_, _) => VrampTick();
-        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); MaybeActivateVirtualHome(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); StartHotkeys(); };
+        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); PruneKnownApps(); MaybeActivateVirtualHome(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); StartHotkeys(); };
         FormClosing += OnFormClosing;
     }
 
@@ -816,10 +913,13 @@ public class MainForm : Form
         }
         int chrome = _footer.PreferredSize.Height + LogicalToDeviceUnits(14) * 2 + LogicalToDeviceUnits(12);
         int want = total + chrome;
-        int cap = Math.Min(LogicalToDeviceUnits(760), Screen.FromControl(this).WorkingArea.Height - LogicalToDeviceUnits(80));
+        int minH = LogicalToDeviceUnits(300);
+        // Keep cap >= min: Math.Clamp throws when max < min (short screen + high DPI).
+        int cap = Math.Max(minH, Math.Min(LogicalToDeviceUnits(760),
+            Screen.FromControl(this).WorkingArea.Height - LogicalToDeviceUnits(80)));
         // Force width to the DPI-scaled design width too — belt-and-braces in case
         // the framework auto-scale didn't already widen it.
-        ClientSize = new Size(LogicalToDeviceUnits(460), Math.Clamp(want, LogicalToDeviceUnits(300), cap));
+        ClientSize = new Size(LogicalToDeviceUnits(460), Math.Clamp(want, minH, cap));
         _scroll.Reflow();   // resize the card column around the (custom) scrollbar
     }
 
@@ -830,8 +930,9 @@ public class MainForm : Form
         _sliderHost.SuspendLayout();
         _sliderHost.Controls.Clear();
         _sliderHost.RowStyles.Clear();
-        // The empty card is rebuilt each time; drop the old reference so a rebuilt
-        // host with sliders doesn't keep a stale (disposed) card around.
+        // The empty card is rebuilt each time; dispose the old one (Controls.Clear
+        // doesn't) so rebuilds don't leak it, and drop the references.
+        if (_emptyCard is { IsDisposed: false } oldEmpty) { ClearTips(oldEmpty); oldEmpty.Dispose(); }
         _emptyCard = null; _emptyTitle = _emptySub = null; _emptyAdd = null;
         if (_sliders.Length == 0)
         {
@@ -958,7 +1059,9 @@ public class MainForm : Form
         if (isVirtual)
         {
             bar.UserSet += (val, committed) => OnVirtualSet(axis, val, committed);
-            _tip.SetToolTip(bar, "Drag to set the volume");
+            bar.AccessibleName = $"{name} level";
+            bar.AccessibleRole = AccessibleRole.Slider;
+            _tip.SetToolTip(bar, "Drag to set the volume (or focus it and use the arrow keys)");
         }
         else
         {
@@ -990,6 +1093,7 @@ public class MainForm : Form
             Text = "✕", AutoSize = false, Font = new Font("Segoe UI", 8.25f),
             Size = new Size(24, 26), Margin = new Padding(0, 0, 0, 0),
             Anchor = AnchorStyles.None, Radius = 7,
+            AccessibleName = "Remove fader",
         };
         b.Click += (_, _) => RemoveSlider(axis);
         _tip.SetToolTip(b, "Delete this virtual fader");
@@ -1009,7 +1113,7 @@ public class MainForm : Form
             BackColor = _theme.CtlBg,
             ForeColor = _theme.Text,
             Font = a.Name.Font,
-            Bounds = new Rectangle(pt.X, pt.Y - 1, 190, a.Name.Height + 4),
+            Bounds = new Rectangle(pt.X, pt.Y - 1, LogicalToDeviceUnits(190), a.Name.Height + 4),
         };
         bool done = false;
         void Commit(bool save)
@@ -1345,6 +1449,8 @@ public class MainForm : Form
         base.WndProc(ref m);
         if (m.Msg == 0x001A)   // WM_SETTINGCHANGE — re-read the OS theme
             ApplyTheme(CurrentTheme());
+        else if (m.Msg == Program.WM_SHOWME)   // a second instance launched — surface this one
+            RestoreFromTray();
     }
 
     // ---- tray -------------------------------------------------------------
@@ -1371,13 +1477,24 @@ public class MainForm : Form
     {
         if (!_exiting && e.CloseReason == CloseReason.UserClosing)
         {
-            var r = MessageBox.Show(this, "Minimize to tray instead of exiting?",
-                "ZMK Volume Fader", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-            if (r == DialogResult.Yes)
+            // Honour the configured close behaviour (Options → "On close");
+            // Ask is the default.
+            if (_closeBehavior == CloseBehavior.Tray)
             {
                 e.Cancel = true;
                 MinimizeToTray();
                 return;
+            }
+            if (_closeBehavior == CloseBehavior.Ask)
+            {
+                var r = MessageBox.Show(this, "Minimize to tray instead of exiting?",
+                    "ZMK Volume Fader", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (r == DialogResult.Yes)
+                {
+                    e.Cancel = true;
+                    MinimizeToTray();
+                    return;
+                }
             }
         }
 
@@ -1518,13 +1635,43 @@ public class MainForm : Form
         PollSessions();
     }
 
-    // Install the global keyboard hook on the UI thread so its callback (and the
-    // hotkey actions it triggers) run here, where touching the UI is safe.
+    // Start the global keyboard hook. It lives on its own thread (so a busy UI
+    // can never delay system-wide key delivery — Windows silently drops a
+    // low-level hook whose callback stalls); its handler bails immediately for
+    // keys with no binding, and marshals real matches to the UI thread.
     void StartHotkeys()
     {
-        _hook.KeyDown += OnGlobalKey;
+        _hook.KeyDown += (vk, ctrl, alt, shift, win) =>
+        {
+            var bound = _boundVks;   // volatile snapshot
+            bool maybe = false;
+            for (int i = 0; i < bound.Length; i++)
+                if (bound[i] == vk) { maybe = true; break; }
+            if (!maybe || !IsHandleCreated) return;
+            try { BeginInvoke(() => OnGlobalKey(vk, ctrl, alt, shift, win)); }
+            catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
+        };
+        _hook.InstallFailed += () =>
+        {
+            try
+            {
+                BeginInvoke(() => _tray.ShowBalloonTip(3000, "ZMK Volume Fader",
+                    "Global hotkeys couldn't be enabled.", ToolTipIcon.Warning));
+            }
+            catch { }
+        };
         _hook.Install();
     }
+
+    // Rebuild the hook thread's bound-key snapshot. Call whenever bindings can
+    // change (profile load, slider rebuild, hotkey dialog save).
+    void UpdateHotkeySnapshot() =>
+        _boundVks = _sliders.Where(s => s.IsVirtual)
+            .SelectMany(s => new[] { s.HkUp, s.HkDown, s.HkMute })
+            .Where(h => h.IsBound)
+            .Select(h => h.Vk)
+            .Distinct()
+            .ToArray();
 
     // Enumerate every render endpoint's audio sessions, group live sessions by
     // app, and learn any app we haven't seen before (persisted). Refreshes the
@@ -1534,6 +1681,7 @@ public class MainForm : Form
         var byApp = new Dictionary<string, List<AudioSessionControl>>();
         bool namesChanged = false;
         bool iconsChanged = false;
+        long nowSec = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         foreach (var di in _present.Values)
         {
             SessionCollection sessions;
@@ -1560,24 +1708,34 @@ public class MainForm : Form
                         var k = AppKeyForPid((int)sc.GetProcessID, out name, out var exePath);
                         if (k == null) continue;
                         key = k;
-                        // Grab the exe icon the first time (retry cheaply while null,
-                        // and upgrade any low-res icon left by an older cache).
-                        if (!_appIcons.TryGetValue(key, out var have) || have == null || have.Width < IconStore)
+                        // Grab the exe icon the first time (upgrade any low-res icon
+                        // left by an older cache). Give up after IconTryMax failures
+                        // — an elevated/protected exe would otherwise be re-tried
+                        // on every poll forever.
+                        if ((!_appIcons.TryGetValue(key, out var have) || have == null || have.Width < IconStore)
+                            && _iconTries.GetValueOrDefault(key) < IconTryMax)
                         {
                             var loaded = LoadExeIcon(exePath);
-                            if (loaded != null) { _appIcons[key] = loaded; iconsChanged = true; SaveIconFile(key, loaded); }
-                            else _appIcons.TryAdd(key, null);
+                            if (loaded != null) { _appIcons[key] = loaded; iconsChanged = true; SaveIconFile(key, loaded); _iconTries.Remove(key); }
+                            else { _appIcons.TryAdd(key, null); _iconTries[key] = _iconTries.GetValueOrDefault(key) + 1; }
                         }
                     }
 
                     if (!byApp.TryGetValue(key, out var list)) byApp[key] = list = new();
                     list.Add(sc);
+                    _appSeen[key] = nowSec;
                     if (!_knownApps.TryGetValue(key, out var prev) || prev != name) { _knownApps[key] = name; namesChanged = true; }
                 }
                 catch { continue; }
             }
         }
+        // The old wrappers are ours alone (SessionCollection builds a fresh
+        // AudioSessionControl per access), so dispose them instead of leaving a
+        // second's worth of COM wrappers to the finalizer every poll.
+        var oldSessions = _appSessions;
         _appSessions = byApp;
+        foreach (var list in oldSessions.Values)
+            foreach (var sc in list) { try { sc.Dispose(); } catch { } }
 
         // Repopulate the target lists when the set of mixer apps changes.
         var live = new HashSet<string>(byApp.Keys);
@@ -1668,6 +1826,32 @@ public class MainForm : Form
             return new Bitmap(img);
         }
         catch { return null; }
+    }
+
+    // Drop known apps that haven't had a live session in ~60 days and aren't
+    // referenced by any category or fader target (in any device profile), so the
+    // app list and the icon cache don't grow forever. Apps without a timestamp
+    // (settings from an older build) get one now — a fresh grace period.
+    void PruneKnownApps()
+    {
+        const long MaxAgeSec = 60L * 24 * 3600;
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var referenced = new HashSet<string>(
+            _categories.SelectMany(c => c.AppKeys)
+                .Concat(_devices.Values.SelectMany(p => p.Sliders)
+                    .Where(cfg => cfg.AppKey != null).Select(cfg => cfg.AppKey!)));
+        foreach (var key in _knownApps.Keys.ToArray())
+        {
+            if (key == SystemAppKey || referenced.Contains(key)) continue;
+            if (!_appSeen.TryGetValue(key, out var seen)) { _appSeen[key] = now; continue; }
+            if (now - seen <= MaxAgeSec) continue;
+            _knownApps.Remove(key);
+            _appSeen.Remove(key);
+            try { File.Delete(IconFile(key)); } catch { }
+        }
+        // Timestamps for apps no longer known are dead weight.
+        foreach (var key in _appSeen.Keys.ToArray())
+            if (!_knownApps.ContainsKey(key)) _appSeen.Remove(key);
     }
 
     // Load any previously-cached app icons (for apps that may be closed now).
@@ -1865,15 +2049,29 @@ public class MainForm : Form
         }
     }
 
-    // Open the per-fader hotkey assignment dialog and store the result.
+    // Open the per-fader hotkey assignment dialog and store the result. Hotkey
+    // dispatch is suspended while it's open (Discord-style) so pressing an
+    // already-bound key to rebind it can't nudge a volume mid-capture; the other
+    // faders' bindings ride along so the dialog can warn about conflicts.
     void OpenHotkeys(Axis a)
     {
-        using var dlg = new HotkeyDialog(_theme, a.Name.Text, a.HkUp, a.HkDown, a.HkMute, a.Step);
-        if (dlg.ShowDialog(this) == DialogResult.OK)
+        var others = _sliders.Where(s => s.IsVirtual && s != a)
+            .SelectMany(s => new (string, Hotkey)[]
+                { (s.Name.Text, s.HkUp), (s.Name.Text, s.HkDown), (s.Name.Text, s.HkMute) })
+            .Where(o => o.Item2.IsBound)
+            .ToList();
+        _hook.Suspend = true;
+        try
         {
-            a.HkUp = dlg.Up; a.HkDown = dlg.Down; a.HkMute = dlg.Mute; a.Step = dlg.Step;
-            SaveSettings();
+            using var dlg = new HotkeyDialog(_theme, a.Name.Text, a.HkUp, a.HkDown, a.HkMute, a.Step, others);
+            if (dlg.ShowDialog(this) == DialogResult.OK)
+            {
+                a.HkUp = dlg.Up; a.HkDown = dlg.Down; a.HkMute = dlg.Mute; a.Step = dlg.Step;
+                SaveSettings();
+                UpdateHotkeySnapshot();
+            }
         }
+        finally { _hook.Suspend = false; }
     }
 
     // Delete one virtual fader: rebuild the layout from the remaining sliders.
@@ -1906,6 +2104,8 @@ public class MainForm : Form
         HkDown = s.HkDown,
         HkMute = s.HkMute,
         Step = s.Step,
+        Muted = s.VMuted,
+        PreMute = s.VPreMute,
     };
 
     // Copy a config's virtual-fader state (level, hotkeys, step) onto a slider.
@@ -1913,8 +2113,9 @@ public class MainForm : Form
     {
         a.VTarget = c.Value;
         a.VCur = c.Value;
-        a.VPreMute = c.Value;
-        a.VMuted = false;
+        a.VMuted = c.Muted;
+        // Restore the pre-mute level so unmuting after a restart still works.
+        a.VPreMute = c.Muted ? Math.Clamp(c.PreMute, 0, 100) : c.Value;
         a.HkUp = c.HkUp ?? new();
         a.HkDown = c.HkDown ?? new();
         a.HkMute = c.HkMute ?? new();
@@ -1936,22 +2137,35 @@ public class MainForm : Form
 
     void LoadSettings()
     {
+        _loadingSettings = true;
         try
         {
-            _loadingSettings = true;
             // Prefer the multi-slider file; fall back to the release build's
             // settings.json to migrate an existing setup on first run.
-            Settings? s = null;
-            if (File.Exists(SettingsPath)) s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(SettingsPath));
-            else if (File.Exists(LegacySettingsPath)) s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(LegacySettingsPath));
+            string? path = File.Exists(SettingsPath) ? SettingsPath
+                : File.Exists(LegacySettingsPath) ? LegacySettingsPath : null;
+            if (path == null) return;
+            Settings? s;
+            try { s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(path)); }
+            catch
+            {
+                // Unreadable (corrupt, truncated, or locked mid-scan): keep a copy
+                // for recovery — otherwise the next SaveSettings would overwrite
+                // every profile with the empty defaults we're falling back to.
+                try { File.Copy(path, path + ".bad", overwrite: true); } catch { }
+                return;
+            }
             if (s == null) return;
 
             _deviceMax = s.DeviceMax != null ? new(s.DeviceMax) : new();
             _devices = s.Devices != null ? new(s.Devices) : new();
             _knownApps.Clear();
             if (s.KnownApps != null) foreach (var kv in s.KnownApps) _knownApps[kv.Key] = kv.Value;
+            _appSeen.Clear();
+            if (s.AppSeen != null) foreach (var kv in s.AppSeen) _appSeen[kv.Key] = kv.Value;
             _categories = s.Categories ?? new();
             _themeMode = s.ThemeMode;
+            _closeBehavior = s.CloseBehavior;
 
             // No per-device profiles yet but old flat settings present -> build a
             // seed profile to apply to the first device that connects.
@@ -2000,7 +2214,7 @@ public class MainForm : Form
                 };
             }
 
-            var s = new Settings { Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), Categories = _categories, ThemeMode = _themeMode };
+            var s = new Settings { Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), AppSeen = new(_appSeen), Categories = _categories, ThemeMode = _themeMode, CloseBehavior = _closeBehavior };
             Directory.CreateDirectory(SettingsDir);
             // Write to a temp file then swap it in, so a crash mid-write can't
             // leave a half-written (corrupt) file behind.
@@ -2045,10 +2259,12 @@ public class MainForm : Form
         }
         // Rebuild the cards if this unit's slider count — or its physical/virtual
         // makeup — differs from what's shown (virtual cards are wired differently,
-        // so ApplyProfile alone can't convert one kind into the other).
-        bool needRebuild = profile.Sliders.Count > 0 &&
-            (profile.Sliders.Count != _sliders.Length ||
-             profile.Sliders.Where((c, i) => c.IsVirtual != _sliders[i].IsVirtual).Any());
+        // so ApplyProfile alone can't convert one kind into the other). A saved
+        // 0-slider profile must rebuild too, or the sliders currently on screen
+        // (e.g. the virtual home's) would get snapshotted into this device's
+        // profile by the SaveSettings below.
+        bool needRebuild = profile.Sliders.Count != _sliders.Length ||
+            profile.Sliders.Where((c, i) => c.IsVirtual != _sliders[i].IsVirtual).Any();
         if (needRebuild)
             RebuildSliders(profile.Sliders);
         else
@@ -2110,6 +2326,7 @@ public class MainForm : Form
             _applyingActive = false;
             ApplyActive(s);   // output cap comes from DeviceMax
         }
+        UpdateHotkeySnapshot();   // bindings may have changed with the profile
     }
 
     // Rebuild the on-screen sliders from a profile's slider set (count, axes,
@@ -2140,7 +2357,17 @@ public class MainForm : Form
         FitWindowHeight();
 
         LoadDevices();   // repopulate combos + re-pick active outputs
-        foreach (var s in old) s.Card.Dispose();
+        // ToolTip holds a reference per registered control — clear them before
+        // disposing the old cards so rebuilds don't accumulate dead entries.
+        foreach (var s in old) { ClearTips(s.Card); s.Card.Dispose(); }
+        UpdateHotkeySnapshot();
+    }
+
+    // Unregister every tooltip under a control tree (see RebuildSliders).
+    void ClearTips(Control root)
+    {
+        _tip.SetToolTip(root, null);
+        foreach (Control c in root.Controls) ClearTips(c);
     }
 
     // Open the fader setup dialog: a reorderable list seeded from the current
@@ -2228,7 +2455,7 @@ public class MainForm : Form
         var labels = _sliders.Select(s => s.Name.Text).ToArray();
         var cats = _categories.Select(c => new Category { Name = c.Name, AppKeys = new(c.AppKeys) }).ToList();
         var virtuals = _sliders.Select(s => s.IsVirtual).ToArray();
-        using var dlg = new OptionsDialog(_theme, _themeMode, GetStartWithWindows(),
+        using var dlg = new OptionsDialog(_theme, _themeMode, GetStartWithWindows(), _closeBehavior,
             cals, raws, outs, labels, AllKnownOutputs(), _present.Keys.ToArray(), cats, _knownApps, _appIcons, virtuals);
         _calibrating = true;                 // stop driving devices while sweeping
         var result = dlg.ShowDialog(this);
@@ -2241,15 +2468,30 @@ public class MainForm : Form
                 ApplyOutputs(_sliders[i], dlg.Outputs[i]);
             }
             _categories = dlg.Categories;
+            // Follow renames so sliders (and every saved device profile) that
+            // point at a renamed category stay attached instead of going dead.
+            if (dlg.CategoryRenames.Count > 0)
+            {
+                foreach (var s in _sliders)
+                    if (s.CategoryName != null && dlg.CategoryRenames.TryGetValue(s.CategoryName, out var nn))
+                        s.CategoryName = nn;
+                foreach (var p in _devices.Values)
+                    foreach (var cfg in p.Sliders)
+                        if (cfg.CategoryName != null && dlg.CategoryRenames.TryGetValue(cfg.CategoryName, out var nn))
+                            cfg.CategoryName = nn;
+            }
             _themeMode = dlg.SelectedTheme;
+            _closeBehavior = dlg.SelectedClose;
             ApplyTheme(CurrentTheme());
             SetStartWithWindows(dlg.StartWithWindows);
             SaveSettings();
-            if (dlg.SetupRequested) { RunSetupWizard(); return; }
         }
         // Re-push (categories/outputs may have changed, so repopulate combos too).
+        // Runs before any requested setup so the combos are fresh even if the
+        // setup dialog is then cancelled.
         foreach (var s in _sliders) s.LastApplied = -1;
         PopulateCombos();
+        if (result == DialogResult.OK && dlg.SetupRequested) RunSetupWizard();
     }
 
     // Adopt an edited ranked list. Re-ranking returns the fader to automatic
@@ -2272,7 +2514,10 @@ public class MainForm : Form
 
     const uint FaderUsage = 0xFF000001;   // vendor-defined fader page (0xFF00, usage 0x01)
 
-    static SortedSet<uint> Usages(HidDevice d)
+    // All usages in a device's report descriptor, or null when it couldn't be
+    // read (device busy/inaccessible) — distinct from "read fine, not ours" so a
+    // transient failure doesn't permanently rule a device out below.
+    static SortedSet<uint>? TryUsages(HidDevice d)
     {
         var usages = new SortedSet<uint>();
         try
@@ -2280,28 +2525,40 @@ public class MainForm : Form
             foreach (var item in d.GetReportDescriptor().DeviceItems)
                 foreach (var u in item.Usages.GetAllValues())
                     usages.Add(u);
+            return usages;
         }
-        catch { }
-        return usages;
+        catch { return null; }
     }
+
+    // Devices already inspected and found unrelated. FindFader runs every 1.5 s
+    // while disconnected, and parsing every HID device's report descriptor
+    // (RGB hubs, receivers, …) is not free — each device is inspected once.
+    static readonly HashSet<string> NonFaderPaths = new();
 
     static HidDevice? FindFader()
     {
-        var all = DeviceList.Local.GetHidDevices().ToArray();
+        var all = DeviceList.Local.GetHidDevices()
+            .Where(d => !NonFaderPaths.Contains(d.DevicePath)).ToArray();
 
         // Match on our unique vendor fader usage (0xFF000001) rather than the
         // exact VID/PID: over Bluetooth (HID-over-GATT) Windows can assign a
         // different product id than the USB build, so keying off the usage lets
         // the same app find the device on either transport. Prefer our VID when
-        // present, but don't require it.
-        var byUsage = all.Where(d => Usages(d).Contains(FaderUsage)).ToArray();
-        var hit = byUsage.FirstOrDefault(d => d.VendorID == VID) ?? byUsage.FirstOrDefault();
-        if (hit != null) return hit;
-
-        // Fallback: any device on our vendor usage page, preferring our VID.
-        var byPage = all.Where(d => Usages(d).Any(u => (u >> 16) == 0xFF00)).ToArray();
-        return byPage.FirstOrDefault(d => d.VendorID == VID)
-               ?? byPage.OrderBy(d => d.GetMaxInputReportLength()).FirstOrDefault();
+        // present, but don't require it. Fallback: any device on our vendor
+        // usage page.
+        var byUsage = new List<HidDevice>();
+        var byPage = new List<HidDevice>();
+        foreach (var d in all)
+        {
+            var us = TryUsages(d);
+            if (us == null) continue;
+            if (us.Contains(FaderUsage)) byUsage.Add(d);
+            else if (us.Any(u => (u >> 16) == 0xFF00)) byPage.Add(d);
+            else NonFaderPaths.Add(d.DevicePath);
+        }
+        return byUsage.FirstOrDefault(d => d.VendorID == VID) ?? byUsage.FirstOrDefault()
+            ?? byPage.FirstOrDefault(d => d.VendorID == VID)
+            ?? byPage.OrderBy(d => d.GetMaxInputReportLength()).FirstOrDefault();
     }
 
     void StartHid()

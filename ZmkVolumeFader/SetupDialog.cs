@@ -47,7 +47,9 @@ sealed class SetupDialog : Form
 
     // --- controls ---
     readonly Label _title = new() { AutoSize = false, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 8), Font = new Font("Segoe UI", 12.5f, FontStyle.Bold) };
-    readonly Panel _listScroll = new() { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Color.Transparent };
+    // Same themed scroll viewport as the main window (native AutoScroll would
+    // paint a squared scrollbar and ignore the wheel unless focused).
+    readonly RoundedScrollPanel _listScroll = new() { Dock = DockStyle.Fill, BackColor = Color.Transparent };
     readonly TableLayoutPanel _listInner;
     readonly TableLayoutPanel _capturePanel;
     readonly Label _captureDetail = new() { AutoSize = false, Dock = DockStyle.Fill, Margin = new Padding(0, 8, 0, 0) };
@@ -93,9 +95,11 @@ sealed class SetupDialog : Form
         root.Controls.Add(_title, 0, 0);
 
         // Scrolling list of faders.
-        _listInner = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, BackColor = Color.Transparent, Margin = new Padding(0) };
+        _listInner = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 1, BackColor = Color.Transparent, Margin = new Padding(0) };
         _listInner.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        _listScroll.Controls.Add(_listInner);
+        _listScroll.ThumbColor = _t.CtlBorder;
+        _listScroll.ThumbHoverColor = _t.Subtle;
+        _listScroll.SetContent(_listInner);
 
         // Capture panel (shown while adding a physical fader).
         _capturePanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, BackColor = Color.Transparent, Visible = false };
@@ -152,7 +156,11 @@ sealed class SetupDialog : Form
         Load += (_, _) =>
         {
             ApplyDark();
-            ClientSize = new Size(LogicalToDeviceUnits(W), LogicalToDeviceUnits(H));
+            // Height is additionally clamped to the screen (the list scrolls).
+            ClientSize = new Size(LogicalToDeviceUnits(W),
+                Math.Min(LogicalToDeviceUnits(H),
+                    Math.Max(LogicalToDeviceUnits(300),
+                        Screen.FromControl(this).WorkingArea.Height - LogicalToDeviceUnits(80))));
             _tick.Start();
             StartPulse();
         };
@@ -194,6 +202,7 @@ sealed class SetupDialog : Form
             }
         }
         _listInner.ResumeLayout();
+        _listScroll.Reflow();
     }
 
     Panel BuildRow(int index, int rowH, int gap)
@@ -225,13 +234,13 @@ sealed class SetupDialog : Form
         grid.Controls.Add(name, 0, 0);
         grid.Controls.Add(sub, 0, 1);
 
-        var up = SmallButton("▲");
+        var up = SmallButton("▲", "Move fader up");
         up.Enabled = index > 0;
         up.Click += (_, _) => { StopPulse(); Swap(index, index - 1); };
-        var down = SmallButton("▼");
+        var down = SmallButton("▼", "Move fader down");
         down.Enabled = index < _items.Count - 1;
         down.Click += (_, _) => { StopPulse(); Swap(index, index + 1); };
-        var remove = SmallButton("✕");
+        var remove = SmallButton("✕", "Remove fader");
         remove.Click += (_, _) => { StopPulse(); _items.RemoveAt(index); RebuildRows(); };
         grid.Controls.Add(up, 1, 0); grid.SetRowSpan(up, 2);
         grid.Controls.Add(down, 2, 0); grid.SetRowSpan(down, 2);
@@ -293,6 +302,7 @@ sealed class SetupDialog : Form
         _captureButtons.Visible = false;
         _listScroll.Visible = true;
         _listButtons.Visible = true;
+        _listScroll.Reflow();
         UpdateTitle();
     }
 
@@ -381,7 +391,7 @@ sealed class SetupDialog : Form
 
     // ---- shared helpers ---------------------------------------------------
 
-    RoundedButton SmallButton(string glyph)
+    RoundedButton SmallButton(string glyph, string accessibleName)
     {
         var b = new RoundedButton
         {
@@ -389,6 +399,7 @@ sealed class SetupDialog : Form
             Size = new Size(LogicalToDeviceUnits(34), LogicalToDeviceUnits(32)),
             Margin = new Padding(4, 0, 0, 0), Surround = _t.Card,
             BackColor = _t.CtlBg, ForeColor = _t.Text,
+            AccessibleName = accessibleName,
         };
         b.FlatAppearance.BorderColor = _t.CtlBorder;
         return b;

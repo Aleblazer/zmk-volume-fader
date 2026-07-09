@@ -20,7 +20,8 @@ the background.
   - an **output device** (with ranked fallback across devices),
   - one **app's** volume (followed across every device it's playing on),
   - a **category** of apps that move together, or
-  - **"Everything Else"** — every running app not assigned to a category.
+  - **"Everything Else"** — every running app not assigned to a category (and not
+    already targeted directly by another fader, so they never fight).
 - **Physical faders** — slide pots on a ZMK keyboard, read over USB HID *(optional hardware)*.
 - **Virtual faders** — on-screen faders you drag with the mouse. **No hardware required.**
 - **Global hotkeys** for virtual faders — bind Volume Up / Down / Mute to any key
@@ -109,7 +110,8 @@ so a fader can move them together.
 ### Tray & persistence
 
 Minimizing sends the window straight to the tray; closing asks whether to minimize or
-exit. While in the tray it keeps driving volume — use the tray icon's **Open** / **Exit**
+exit (configurable in Options: ask / always tray / always exit). While in the tray it
+keeps driving volume — use the tray icon's **Open** / **Exit**
 menu, or double-click to bring it back. Everything — faders, targets, order, hotkeys,
 calibration, theme — is saved to `%APPDATA%\ZmkVolumeFader\settings.v2.json`.
 

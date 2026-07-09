@@ -21,10 +21,14 @@ sealed class HotkeyDialog : Form
     readonly MainForm.Theme _t;
     Hotkey _up, _down, _mute;
     Field _listening = Field.None;
+    // Other virtual faders' bindings, for cross-fader conflict notices.
+    readonly IReadOnlyList<(string Fader, Hotkey Hk)> _others;
 
     readonly RoundedButton _upBtn, _downBtn, _muteBtn;
     readonly MainForm.Stepper _step;
     readonly Label _hint;
+    readonly TableLayoutPanel _root;
+    readonly FlowLayoutPanel _btnRow;
 
     const int W = 400, H = 320;
     const int VK_LWIN = 0x5B, VK_RWIN = 0x5C;
@@ -34,11 +38,13 @@ sealed class HotkeyDialog : Form
     [DllImport("user32.dll")]
     static extern short GetAsyncKeyState(int vKey);
 
-    public HotkeyDialog(MainForm.Theme t, string faderName, Hotkey up, Hotkey down, Hotkey mute, int step)
+    public HotkeyDialog(MainForm.Theme t, string faderName, Hotkey up, Hotkey down, Hotkey mute, int step,
+        IReadOnlyList<(string Fader, Hotkey Hk)>? others = null)
     {
         AutoScaleDimensions = new SizeF(96f, 96f);
         AutoScaleMode = AutoScaleMode.Dpi;
         _t = t;
+        _others = others ?? Array.Empty<(string, Hotkey)>();
         _up = Clone(up); _down = Clone(down); _mute = Clone(mute);
 
         Text = "Hotkeys";
@@ -50,7 +56,7 @@ sealed class HotkeyDialog : Form
         ClientSize = new Size(W, H);
         BackColor = _t.Window;
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 7, Padding = new Padding(16), BackColor = Color.Transparent };
+        var root = _root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 7, Padding = new Padding(16), BackColor = Color.Transparent };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         root.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -79,7 +85,7 @@ sealed class HotkeyDialog : Form
         root.Controls.Add(_hint, 0, 6); root.SetColumnSpan(_hint, 3);
 
         // Bottom buttons, pinned below the grid.
-        var btnRow = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, FlowDirection = FlowDirection.RightToLeft, BackColor = Color.Transparent, Padding = new Padding(16, 8, 16, 12) };
+        var btnRow = _btnRow = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, FlowDirection = FlowDirection.RightToLeft, BackColor = Color.Transparent, Padding = new Padding(16, 8, 16, 12) };
         var save = MakeButton("Save", accent: true);
         save.Click += (_, _) => { DialogResult = DialogResult.OK; Close(); };
         var cancel = MakeButton("Cancel", accent: false);
@@ -98,8 +104,8 @@ sealed class HotkeyDialog : Form
         Load += (_, _) =>
         {
             ApplyDark();
-            ClientSize = new Size(LogicalToDeviceUnits(W), LogicalToDeviceUnits(H));
             _step.BackColor = _t.CtlBg; _step.ForeColor = _t.Text; _step.BorderColor = _t.CtlBorder; _step.ChevronColor = _t.Subtle; _step.Surround = _t.Window; _step.SizeToFont();
+            FitHeight();
         };
     }
 
@@ -120,6 +126,7 @@ sealed class HotkeyDialog : Form
         {
             Text = "✕", AutoSize = false, Size = new Size(30, 30), Radius = 7, Anchor = AnchorStyles.None,
             Margin = new Padding(6, 4, 0, 4), Surround = _t.Window, BackColor = _t.CtlBg, ForeColor = _t.Text,
+            AccessibleName = $"Clear {label} binding",
         };
         clear.FlatAppearance.BorderColor = _t.CtlBorder;
         clear.Click += (_, _) => { Set(field, new Hotkey()); _listening = Field.None; RefreshButtons(); UpdateHint(); };
@@ -189,11 +196,41 @@ sealed class HotkeyDialog : Form
 
     void UpdateHint()
     {
-        bool bare = _up.IsBareCommonKey || _down.IsBareCommonKey || _mute.IsBareCommonKey;
-        _hint.Visible = bare;
-        if (bare)
-            _hint.Text = "⚠ A bare everyday key will trigger whenever you press it normally. " +
-                         "Use F13–F24 or add a modifier (Ctrl/Alt/Shift/Win).";
+        var lines = new List<string>();
+        if (_up.IsBareCommonKey || _down.IsBareCommonKey || _mute.IsBareCommonKey)
+            lines.Add("⚠ A bare everyday key will trigger whenever you press it normally. " +
+                      "Use F13–F24 or add a modifier (Ctrl/Alt/Shift/Win).");
+        if (_up.SameAs(_down) || _up.SameAs(_mute) || _down.SameAs(_mute))
+            lines.Add("⚠ The same key is bound to two actions here — only the first " +
+                      "(Up, then Down, then Mute) will fire.");
+        foreach (var (fader, hk) in _others)
+        {
+            var mine = new[] { _up, _down, _mute }.FirstOrDefault(m => m.SameAs(hk));
+            if (mine != null)
+            {
+                lines.Add($"Note: {mine} is also bound on “{fader}” — both faders will respond.");
+                break;
+            }
+        }
+        if (IsMediaKey(_up) || IsMediaKey(_down) || IsMediaKey(_mute))
+            lines.Add("Note: media keys keep their normal Windows function too (they aren't swallowed).");
+
+        _hint.Visible = lines.Count > 0;
+        _hint.Text = string.Join("\n\n", lines);
+        FitHeight();   // warnings can wrap to several lines
+    }
+
+    static bool IsMediaKey(Hotkey h) => h.IsBound && h.Vk >= 0xAD && h.Vk <= 0xB3;
+
+    // Content-fit height (warnings grow the dialog), capped to the screen.
+    void FitHeight()
+    {
+        if (!IsHandleCreated) return;
+        int want = _root.PreferredSize.Height + _btnRow.PreferredSize.Height;
+        int cap = Math.Max(LogicalToDeviceUnits(H),
+            Screen.FromControl(this).WorkingArea.Height - LogicalToDeviceUnits(80));
+        ClientSize = new Size(LogicalToDeviceUnits(W),
+            Math.Min(Math.Max(LogicalToDeviceUnits(H), want), cap));
     }
 
     static Hotkey Clone(Hotkey h) => new() { Vk = h.Vk, Ctrl = h.Ctrl, Alt = h.Alt, Shift = h.Shift, Win = h.Win };

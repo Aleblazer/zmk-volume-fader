@@ -11,9 +11,16 @@ sealed class CategoriesDialog : Form
 {
     public List<Category> Result { get; private set; }
 
+    // Old name -> new name for every pre-existing category renamed here, filled
+    // on Save. The owner re-points fader targets so they follow the rename.
+    public Dictionary<string, string> Renamed { get; } = new();
+
     readonly MainForm.Theme _t;
     readonly (string Key, string Name)[] _apps;   // all seen apps, sorted by name
     readonly IReadOnlyDictionary<string, Image?>? _appIcons;
+    // Each clone's name when the dialog opened (keys are the Result objects).
+    readonly Dictionary<Category, string> _origNames = new();
+    int _lastCat = -1;   // previously-selected index, for commit-on-selection-change
 
     readonly TextBox _name = new() { BorderStyle = BorderStyle.FixedSingle };
     readonly ListBox _catList = new() { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, BorderStyle = BorderStyle.FixedSingle, IntegralHeight = false };
@@ -32,6 +39,7 @@ sealed class CategoriesDialog : Form
         _t = t;
         _appIcons = appIcons;
         Result = categories.Select(c => new Category { Name = c.Name, AppKeys = new(c.AppKeys) }).ToList();
+        foreach (var c in Result) _origNames[c] = c.Name;
         _apps = knownApps.Select(kv => (kv.Key, kv.Value)).OrderBy(a => a.Value, StringComparer.OrdinalIgnoreCase).ToArray();
 
         Text = "Manage Categories";
@@ -82,7 +90,7 @@ sealed class CategoriesDialog : Form
         root.Controls.Add(_appList, 0, 4);
 
         var btnRow = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
-        var save = MakeButton("Save", true); save.Click += (_, _) => { CommitName(); DialogResult = DialogResult.OK; Close(); };
+        var save = MakeButton("Save", true); save.Click += (_, _) => { CommitName(); CollectRenames(); DialogResult = DialogResult.OK; Close(); };
         var cancel = MakeButton("Cancel", false); cancel.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
         btnRow.Controls.Add(save); btnRow.Controls.Add(cancel);
         root.Controls.Add(btnRow, 0, 5);
@@ -96,7 +104,10 @@ sealed class CategoriesDialog : Form
             ApplyDark();
             // Force the DPI-scaled size — auto-scale doesn't reliably resize a
             // FixedDialog, so at 125%+ the content would clip against a ~440px window.
-            ClientSize = new Size(LogicalToDeviceUnits(440), LogicalToDeviceUnits(540));
+            ClientSize = new Size(LogicalToDeviceUnits(440),
+                Math.Min(LogicalToDeviceUnits(540),
+                    Math.Max(LogicalToDeviceUnits(300),
+                        Screen.FromControl(this).WorkingArea.Height - LogicalToDeviceUnits(80))));
             // Row height tracks the DPI-scaled font so text isn't clipped at 125%+.
             _catList.ItemHeight = _catList.Font.Height + LogicalToDeviceUnits(8);
             _appList.ItemHeight = _appList.Font.Height + LogicalToDeviceUnits(8);
@@ -129,33 +140,55 @@ sealed class CategoriesDialog : Form
         int i = _catList.SelectedIndex;
         if (i < 0) return;
         Result.RemoveAt(i);
+        // Indices shift under the removed row — a stale _lastCat would let the
+        // selection-change commit rename the *next* category to the deleted
+        // one's name.
+        _lastCat = -1;
         _catList.Items.RemoveAt(i);
         if (_catList.Items.Count > 0) _catList.SelectedIndex = Math.Min(i, _catList.Items.Count - 1);
         else OnCatSelected();
     }
 
-    string UniqueName(string baseName)
+    string UniqueName(string baseName, Category? self = null)
     {
         string n = baseName;
         int k = 2;
-        while (Result.Any(c => string.Equals(c.Name, n, StringComparison.OrdinalIgnoreCase))) n = $"{baseName} {k++}";
+        while (Result.Any(c => c != self && string.Equals(c.Name, n, StringComparison.OrdinalIgnoreCase))) n = $"{baseName} {k++}";
         return n;
     }
 
     void OnCatSelected()
     {
+        // Commit any name typed for the previously-selected category first, so
+        // clicking another category doesn't silently discard the rename.
+        CommitNameTo(_lastCat);
+        _lastCat = _catList.SelectedIndex;
         _name.Text = Selected?.Name ?? "";
         _appList.Invalidate();
     }
 
-    // Apply the name box to the selected category (on rename / focus change / save).
-    void CommitName()
+    // Apply the name box to the selected category (on rename / selection change / save).
+    void CommitName() => CommitNameTo(_catList.SelectedIndex);
+
+    void CommitNameTo(int index)
     {
-        if (Selected is not { } c) return;
-        var nm = _name.Text.Trim();
+        if (index < 0 || index >= Result.Count) return;
+        var c = Result[index];
+        // '#' marks built-in sentinels (System Sounds, Everything Else) — a
+        // user category can't start with it or it would collide with them.
+        var nm = _name.Text.Trim().TrimStart('#').Trim();
         if (nm.Length == 0 || nm == c.Name) return;
-        c.Name = UniqueName(nm);
+        c.Name = UniqueName(nm, c);
         _catList.Invalidate();
+    }
+
+    // Old->new names of pre-existing categories whose name changed (see Renamed).
+    void CollectRenames()
+    {
+        Renamed.Clear();
+        foreach (var c in Result)
+            if (_origNames.TryGetValue(c, out var old) && old != c.Name)
+                Renamed[old] = c.Name;
     }
 
     void ToggleApp(int index)

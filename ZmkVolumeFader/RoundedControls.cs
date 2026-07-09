@@ -126,14 +126,22 @@ internal sealed class RoundedScrollPanel : Panel, IMessageFilter
     protected override void OnHandleDestroyed(EventArgs e) { Application.RemoveMessageFilter(this); base.OnHandleDestroyed(e); }
 
     const int WM_MOUSEWHEEL = 0x020A;
+
+    [DllImport("user32.dll")]
+    static extern bool IsWindowEnabled(IntPtr hWnd);
+
     public bool PreFilterMessage(ref Message m)
     {
         if (m.Msg != WM_MOUSEWHEEL || !ShowBar || !IsHandleCreated || !Visible) return false;
-        // The message filter is application-wide, so ignore the wheel unless this
-        // panel's form is the active one — otherwise a modal dialog layered over
-        // this window (Options over the main window) would still scroll us.
+        // The message filter is application-wide. Scroll only when this panel's
+        // form can take input: never a form a modal has disabled (Options over
+        // the main window), and never when a *different* form of ours is active.
+        // When the whole app is inactive (ActiveForm == null) still scroll on
+        // hover, matching Windows' scroll-inactive-windows behavior — a mixer is
+        // exactly the app you wheel over while a game holds focus.
         var f = FindForm();
-        if (f is not { Visible: true } || f != Form.ActiveForm) return false;
+        if (f is not { Visible: true } || !IsWindowEnabled(f.Handle)) return false;
+        if (Form.ActiveForm is { } active && active != f) return false;
         if (!RectangleToScreen(ClientRectangle).Contains(Cursor.Position)) return false;
         int delta = (short)((long)m.WParam >> 16 & 0xFFFF);
         ScrollBy(-delta);
