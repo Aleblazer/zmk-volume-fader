@@ -2624,12 +2624,24 @@ public class MainForm : Form
         catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
     }
 
+    // A raw jump beyond this (mV) is real movement, not noise — track it exactly.
+    // Wiper noise is ~±15 mV; the firmware's rest band is 30 mV.
+    const int SnapBand = 60;
+
     void ApplyAxis(Axis a, int raw)
     {
         a.LastRaw = raw;
 
-        // EMA smooth (16-bit value is finer but noisier, ~+/-15 counts).
-        a.Sm = a.Sm < 0 ? raw : a.Sm * 0.85 + raw * 0.15;
+        // EMA smooth (16-bit value is finer but noisier, ~+/-15 mV) — but only
+        // within the noise band. Reports arrive per *change* (plus a slow
+        // heartbeat at rest), so easing a big jump would leave Sm far from the
+        // final value when the reports stop: a fast pull to the end then crept
+        // toward 0% at heartbeat rate and could stall inside the hysteresis
+        // band. Movement past the noise floor snaps; smoothing only ever
+        // filters idle flicker.
+        a.Sm = a.Sm < 0 || Math.Abs(raw - a.Sm) > SnapBand
+            ? raw
+            : a.Sm * 0.85 + raw * 0.15;
         Render(a);
     }
 
