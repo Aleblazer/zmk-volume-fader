@@ -619,6 +619,7 @@ public class MainForm : Form
         public (int v, int pct)[] Curve = Array.Empty<(int, int)>();  // built from Cal
         public double Sm = -1;          // EMA state (smoothed raw value)
         public int LastRaw;             // last raw value (so a cap change can re-render)
+        public bool InMuteZone;         // latched mute-dead-zone state (see Render)
         public int LastApplied = -1;    // last volume % pushed to the device (deadband)
 
         // Ranked output preferences (highest first). The active output is the
@@ -2627,6 +2628,9 @@ public class MainForm : Form
     // A raw jump beyond this (mV) is real movement, not noise — track it exactly.
     // Wiper noise is ~±15 mV; the firmware's rest band is 30 mV.
     const int SnapBand = 60;
+    // The mute dead zone unlatches only this far (mV) above its threshold, so
+    // boundary noise can't toggle the mute.
+    const int MuteExitBand = 15;
 
     void ApplyAxis(Axis a, int raw)
     {
@@ -2684,9 +2688,21 @@ public class MainForm : Form
         // Virtual faders drag straight to the final volume (no taper curve, no cap);
         // physical faders map their smoothed raw value through the calibration curve.
         double faderPct = a.IsVirtual ? a.VCur : Calibration.Eval(a.Curve, (int)Math.Round(a.Sm));
-        // Mute dead zone (physical): below the configured raw reading the fader
-        // is "in the detent" — force full silence instead of hovering at 1%.
-        if (!a.IsVirtual && a.Cal.MuteRaw > 0 && a.Sm < a.Cal.MuteRaw) faderPct = 0;
+        // Mute dead zone (physical): gate on the *instantaneous* raw reading so
+        // crossing the threshold mutes on that very report — the smoothed value
+        // lags on a slow pull and left the output hovering at 1% until it caught
+        // up. Latched with an exit band (threshold + noise) so wiper jitter at
+        // the boundary can't flicker the mute on and off.
+        if (!a.IsVirtual)
+        {
+            if (a.Cal.MuteRaw > 0)
+            {
+                if (a.LastRaw < a.Cal.MuteRaw) a.InMuteZone = true;
+                else if (a.LastRaw > a.Cal.MuteRaw + MuteExitBand) a.InMuteZone = false;
+            }
+            else a.InMuteZone = false;
+            if (a.InMuteZone) faderPct = 0;
+        }
         int cap = a.IsVirtual ? 100 : (int)a.Limit.Value;
         double pf = Math.Clamp(faderPct * cap / 100.0, 0, 100);
 
