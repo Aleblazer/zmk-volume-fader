@@ -344,22 +344,22 @@ sealed class OptionsDialog : Form
         t.Controls.Add(taperPanel, 0, 2);
         t.SetColumnSpan(taperPanel, 2);
 
-        // Mute dead zone: force 0% output while the fader sits below this level
-        // (a mixer-style mute detent; also stops a wiper resting a few mV above
-        // the calibrated Min from hovering at 1%).
+        // Mute dead zone: force 0% output while the raw reading sits below this
+        // value (a mixer-style mute detent; also stops a wiper resting a few mV
+        // above the calibrated Min from hovering at 1%).
         var mutePanel = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 0) };
-        mutePanel.Controls.Add(new Label { Text = "Mute below", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(0, 6, 8, 0) });
+        mutePanel.Controls.Add(new Label { Text = "Mute below raw", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(0, 6, 8, 0) });
         var ms = new MainForm.Stepper
         {
-            Minimum = 0, Maximum = 50, Value = Math.Clamp(_cal[i].MutePct, 0, 50),
+            Minimum = 0, Maximum = 300, Value = Math.Clamp(_cal[i].MuteRaw, 0, 300),
             BackColor = _t.CtlBg, ForeColor = _t.Text, BorderColor = _t.CtlBorder,
             ChevronColor = _t.Subtle, Surround = _t.Card,
         };
-        ms.ValueChanged += (_, _) => _cal[idx].MutePct = ms.Value;
+        ms.ValueChanged += (_, _) => _cal[idx].MuteRaw = ms.Value;
         _muteStep[i] = ms;
         mutePanel.Controls.Add(ms);
-        mutePanel.Controls.Add(new Label { Text = "%   (0 = off)", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(6, 6, 0, 0) });
-        _tip.SetToolTip(ms, "Force 0% volume while the fader sits below this level");
+        mutePanel.Controls.Add(new Label { Text = "(0 = off)", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(6, 6, 0, 0) });
+        _tip.SetToolTip(ms, "Force 0% volume while the raw reading is below this value");
         t.Controls.Add(mutePanel, 0, 3);
         t.SetColumnSpan(mutePanel, 2);
 
@@ -424,7 +424,7 @@ sealed class OptionsDialog : Form
         _rangeLbl[i].Text = _cal[i].Min <= _cal[i].Max ? $"range {_cal[i].Min} – {_cal[i].Max}" : "range —";
 
         int p = Math.Clamp((int)Math.Round(Calibration.Eval(_cal[i].BuildCurve(), v)), 0, 100);
-        if (_cal[i].MutePct > 0 && p < _cal[i].MutePct) p = 0;   // preview the mute dead zone
+        if (_cal[i].MuteRaw > 0 && v < _cal[i].MuteRaw) p = 0;   // preview the mute dead zone
         _previewLbl[i].Text = $"{p}%";
         _bar[i].Value = p;
     }

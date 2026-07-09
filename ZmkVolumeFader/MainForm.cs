@@ -2684,9 +2684,9 @@ public class MainForm : Form
         // Virtual faders drag straight to the final volume (no taper curve, no cap);
         // physical faders map their smoothed raw value through the calibration curve.
         double faderPct = a.IsVirtual ? a.VCur : Calibration.Eval(a.Curve, (int)Math.Round(a.Sm));
-        // Mute dead zone (physical): below the configured level the fader is
-        // "in the detent" — force full silence instead of hovering at 1%.
-        if (!a.IsVirtual && a.Cal.MutePct > 0 && faderPct < a.Cal.MutePct) faderPct = 0;
+        // Mute dead zone (physical): below the configured raw reading the fader
+        // is "in the detent" — force full silence instead of hovering at 1%.
+        if (!a.IsVirtual && a.Cal.MuteRaw > 0 && a.Sm < a.Cal.MuteRaw) faderPct = 0;
         int cap = a.IsVirtual ? 100 : (int)a.Limit.Value;
         double pf = Math.Clamp(faderPct * cap / 100.0, 0, 100);
 

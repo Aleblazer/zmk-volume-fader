@@ -12,11 +12,11 @@ internal sealed class Calibration
     public int Min { get; set; } = 4;
     public int Max { get; set; } = 3215;
     public TaperKind Taper { get; set; } = TaperKind.Linear;
-    // Mute dead zone (fader %): while the mapped position sits below this the
-    // output is forced to 0%, like a mixer's mute detent at the bottom of the
-    // throw. Covers a wiper that rests a few mV above the calibrated Min and
-    // would otherwise hover at ~1%. 0 = off.
-    public int MutePct { get; set; }
+    // Mute dead zone (raw mV): while the smoothed raw reading sits below this
+    // the output is forced to 0%, like a mixer's mute detent at the bottom of
+    // the throw. Covers a wiper that rests a few mV above the calibrated Min
+    // and would otherwise hover at ~1%. 0 = off.
+    public int MuteRaw { get; set; }
 
     // Presets: inverse of the Bourns datasheet output-vs-travel curves
     // (value-fraction% -> volume%), so physical travel maps ~linearly to volume.
@@ -31,7 +31,7 @@ internal sealed class Calibration
         Min = Min,
         Max = Max,
         Taper = Taper,
-        MutePct = MutePct,
+        MuteRaw = MuteRaw,
     };
 
     public (int v, int pct)[] BuildCurve()

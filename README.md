@@ -122,9 +122,9 @@ plus a **Record** button: hit Record, sweep the fader end-to-end, stop, then pic
 taper that matches your pot — the preview updates as you move it. This corrects a slide
 pot's compressed top-of-travel so the throw feels even, and output hysteresis keeps a
 parked level from flip-flopping between two percentages. Each physical fader can also
-set **Mute below** — a mixer-style mute detent that forces 0% while the fader sits
-under the chosen level (handy when a pot's bottom of travel doesn't quite reach its
-calibrated minimum). Virtual faders need no calibration.
+set **Mute below raw** — a mixer-style mute detent that forces 0% while the raw
+reading sits under the chosen value (handy when a pot's bottom of travel doesn't
+quite reach its calibrated minimum). Virtual faders need no calibration.
 
 ## Physical faders — ZMK firmware (optional)
 
