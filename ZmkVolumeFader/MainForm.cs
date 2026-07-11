@@ -690,6 +690,10 @@ public class MainForm : Form
         public CloseBehavior CloseBehavior { get; set; } = CloseBehavior.Ask;
         // App-key -> unix seconds last seen with a live session (for pruning).
         public Dictionary<string, long> AppSeen { get; set; } = new();
+        // Device keys (VID:PID[:serial]) the user has chosen NOT to monitor — e.g.
+        // a Steam Controller puck or other gadget that also exposes a vendor HID
+        // page. Everything matching the fader page is monitored unless listed here.
+        public List<string> IgnoredDevices { get; set; } = new();
 
         // Legacy pre-multi-slider flat fields, read once to migrate settings.json.
         public string? LeftDeviceId { get; set; }
@@ -712,6 +716,14 @@ public class MainForm : Form
     Dictionary<string, DeviceProfile> _devices = new();
     string? _activeKey;
     DeviceProfile? _legacyProfile;
+    // Device keys the user opted out of monitoring (see Settings.IgnoredDevices).
+    // _ignored is the UI-thread working set (edited by the Devices dialog);
+    // _ignoredSnap is an immutable copy the HID discovery thread reads. Publish a
+    // fresh snapshot (never mutate in place) so the reader sees a consistent set.
+    HashSet<string> _ignored = new(StringComparer.OrdinalIgnoreCase);
+    volatile HashSet<string> _ignoredSnap = new(StringComparer.OrdinalIgnoreCase);
+
+    void PublishIgnored() => _ignoredSnap = new HashSet<string>(_ignored, StringComparer.OrdinalIgnoreCase);
 
     // App-volume tracking. _knownApps is every app ever seen in the mixer
     // (persisted, keyed by process name); _appSessions is the live sessions per
@@ -749,7 +761,8 @@ public class MainForm : Form
 
     // ---- controls ---------------------------------------------------------
 
-    readonly RoundedButton _btnRefresh = new() { Text = "Refresh devices", AutoSize = true, Padding = new Padding(12, 6, 12, 6), Margin = new Padding(0) };
+    readonly RoundedButton _btnRefresh = new() { Text = "Refresh", AutoSize = true, Padding = new Padding(12, 6, 12, 6), Margin = new Padding(0) };
+    readonly RoundedButton _btnDevices = new() { Text = "Devices", AutoSize = true, Padding = new Padding(12, 6, 12, 6), Margin = new Padding(8, 0, 0, 0) };
     readonly RoundedButton _btnOptions = new() { Text = "Options", AutoSize = true, Padding = new Padding(12, 6, 12, 6), Margin = new Padding(8, 0, 0, 0) };
     readonly Label _status = new() { Text = "Starting…", AutoSize = true, Anchor = AnchorStyles.Left };
     readonly Label _statusDot = new() { Text = "●", AutoSize = true, Font = new Font("Segoe UI", 8f), Margin = new Padding(0, 3, 6, 0) };
@@ -835,11 +848,14 @@ public class MainForm : Form
         _footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         _footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         _btnRefresh.Click += (_, _) => LoadDevices();
+        _btnDevices.Click += (_, _) => OpenDevices();
         _btnOptions.Click += (_, _) => OpenOptions();
         _tip.SetToolTip(_btnRefresh, "Re-scan audio devices and apps");
+        _tip.SetToolTip(_btnDevices, "Choose which fader devices to monitor or ignore");
         _tip.SetToolTip(_btnOptions, "Calibration, sliders, categories, and preferences");
         var leftBtns = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0) };
         leftBtns.Controls.Add(_btnRefresh);
+        leftBtns.Controls.Add(_btnDevices);
         leftBtns.Controls.Add(_btnOptions);
         _footer.Controls.Add(leftBtns, 0, 0);
         var statusFlow = new FlowLayoutPanel { AutoSize = true, Anchor = AnchorStyles.Right, BackColor = Color.Transparent, Margin = new Padding(0, 6, 0, 0) };
@@ -1270,7 +1286,7 @@ public class MainForm : Form
 
             StyleTabs(s);
         }
-        foreach (var btn in new[] { _btnRefresh, _btnOptions })
+        foreach (var btn in new[] { _btnRefresh, _btnDevices, _btnOptions })
         {
             btn.BackColor = t.CtlBg;
             btn.ForeColor = t.Text;
@@ -2164,6 +2180,8 @@ public class MainForm : Form
             if (s.KnownApps != null) foreach (var kv in s.KnownApps) _knownApps[kv.Key] = kv.Value;
             _appSeen.Clear();
             if (s.AppSeen != null) foreach (var kv in s.AppSeen) _appSeen[kv.Key] = kv.Value;
+            _ignored = new(s.IgnoredDevices ?? new(), StringComparer.OrdinalIgnoreCase);
+            PublishIgnored();
             _categories = s.Categories ?? new();
             _themeMode = s.ThemeMode;
             _closeBehavior = s.CloseBehavior;
@@ -2215,7 +2233,7 @@ public class MainForm : Form
                 };
             }
 
-            var s = new Settings { Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), AppSeen = new(_appSeen), Categories = _categories, ThemeMode = _themeMode, CloseBehavior = _closeBehavior };
+            var s = new Settings { Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), AppSeen = new(_appSeen), IgnoredDevices = _ignored.ToList(), Categories = _categories, ThemeMode = _themeMode, CloseBehavior = _closeBehavior };
             Directory.CreateDirectory(SettingsDir);
             // Write to a temp file then swap it in, so a crash mid-write can't
             // leave a half-written (corrupt) file behind.
@@ -2446,6 +2464,67 @@ public class MainForm : Form
 
     static int ClampLimit(int pct) => Math.Clamp(pct, 1, 100);
 
+    // ---- device manager ---------------------------------------------------
+
+    // Build a friendly one-liner for a candidate: VID:PID, serial, and whether it
+    // exposes our exact fader report or merely shares the vendor page.
+    static string DeviceDetail(FaderCandidate c)
+    {
+        string s = $"{c.Vid:X4}:{c.Pid:X4}";
+        if (!string.IsNullOrWhiteSpace(c.Serial)) s += $"  ·  SN {c.Serial}";
+        s += c.ByUsage ? "  ·  fader report" : "  ·  shares the vendor HID page";
+        return s;
+    }
+
+    // Show the Devices dialog: every detected fader-page unit (plus any ignored
+    // ones, so they can be re-enabled while unplugged) with a monitor/ignore
+    // toggle. On Save, rebuild the ignore set and republish it for the HID thread.
+    void OpenDevices()
+    {
+        var rows = new List<DevicesDialog.Row>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in EnumerateCandidates())
+        {
+            seen.Add(c.Key);
+            rows.Add(new DevicesDialog.Row
+            {
+                Key = c.Key,
+                Name = string.IsNullOrWhiteSpace(c.Name) ? "(unnamed HID device)" : c.Name,
+                Detail = DeviceDetail(c),
+                OurVid = c.OurVid,
+                Connected = ConnectedKeys().Contains(c.Key),
+                Monitored = !_ignored.Contains(c.Key),
+            });
+        }
+        // Ignored units that aren't plugged in right now — still list them so the
+        // choice can be reversed. Fall back to a saved profile name if we have one.
+        foreach (var key in _ignored)
+        {
+            if (!seen.Add(key)) continue;
+            string name = _devices.TryGetValue(key, out var p) && !string.IsNullOrWhiteSpace(p.Name) ? p.Name : "Ignored device";
+            rows.Add(new DevicesDialog.Row { Key = key, Name = name, Detail = $"{key}  ·  not connected", Monitored = false });
+        }
+        rows = rows
+            .OrderByDescending(r => r.Connected)
+            .ThenByDescending(r => r.OurVid)
+            .ThenBy(r => r.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        using var dlg = new DevicesDialog(_theme, rows);
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        _ignored = new HashSet<string>(rows.Where(r => !r.Monitored).Select(r => r.Key), StringComparer.OrdinalIgnoreCase);
+        PublishIgnored();
+        SaveSettings();
+        // A newly-ignored live unit is dropped by the HID loop within ~1 s; a
+        // re-enabled one is picked up on the next discovery scan.
+    }
+
+    // Device keys currently being read. Single-active model for now (Step B makes
+    // this the set of open readers).
+    IEnumerable<string> ConnectedKeys() => _activeKey != null && _activeKey != VirtualKey
+        ? new[] { _activeKey } : Array.Empty<string>();
+
     // ---- options ----------------------------------------------------------
 
     void OpenOptions()
@@ -2536,8 +2615,9 @@ public class MainForm : Form
     // (RGB hubs, receivers, …) is not free — each device is inspected once.
     static readonly HashSet<string> NonFaderPaths = new();
 
-    static HidDevice? FindFader()
+    HidDevice? FindFader()
     {
+        var ignored = _ignoredSnap;
         var all = DeviceList.Local.GetHidDevices()
             .Where(d => !NonFaderPaths.Contains(d.DevicePath)).ToArray();
 
@@ -2546,20 +2626,58 @@ public class MainForm : Form
         // different product id than the USB build, so keying off the usage lets
         // the same app find the device on either transport. Prefer our VID when
         // present, but don't require it. Fallback: any device on our vendor
-        // usage page.
+        // usage page. Devices the user chose to ignore (Devices dialog) are
+        // skipped — that's how an errant gadget on the same page (a Steam
+        // Controller puck, say) stops hijacking the app.
         var byUsage = new List<HidDevice>();
         var byPage = new List<HidDevice>();
         foreach (var d in all)
         {
             var us = TryUsages(d);
             if (us == null) continue;
-            if (us.Contains(FaderUsage)) byUsage.Add(d);
-            else if (us.Any(u => (u >> 16) == 0xFF00)) byPage.Add(d);
-            else NonFaderPaths.Add(d.DevicePath);
+            bool onUsage = us.Contains(FaderUsage);
+            if (!onUsage && !us.Any(u => (u >> 16) == 0xFF00)) { NonFaderPaths.Add(d.DevicePath); continue; }
+            if (ignored.Contains(DeviceKey(d))) continue;
+            if (onUsage) byUsage.Add(d); else byPage.Add(d);
         }
         return byUsage.FirstOrDefault(d => d.VendorID == VID) ?? byUsage.FirstOrDefault()
             ?? byPage.FirstOrDefault(d => d.VendorID == VID)
             ?? byPage.OrderBy(d => d.GetMaxInputReportLength()).FirstOrDefault();
+    }
+
+    // A fader-page HID device the Devices dialog can monitor or ignore. Populated
+    // by a full descriptor scan (unlike FindFader's cached hot path) so the list
+    // is always accurate when the dialog opens.
+    internal sealed class FaderCandidate
+    {
+        public string Key = "";      // DeviceKey (VID:PID[:serial]) — the monitor/ignore identity
+        public string Name = "";     // product name, best effort
+        public int Vid, Pid;
+        public string? Serial;
+        public bool OurVid;          // matches our VID (0x1D50)
+        public bool ByUsage;         // exposes our exact fader usage (vs only the 0xFF00 page)
+    }
+
+    // Every HID device currently on our vendor page, one row per identity. The
+    // Devices dialog unions this with the persisted ignore set so a device can be
+    // re-enabled even while unplugged.
+    static List<FaderCandidate> EnumerateCandidates()
+    {
+        var list = new List<FaderCandidate>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var d in DeviceList.Local.GetHidDevices())
+        {
+            var us = TryUsages(d);
+            if (us == null) continue;
+            bool byUsage = us.Contains(FaderUsage);
+            if (!byUsage && !us.Any(u => (u >> 16) == 0xFF00)) continue;
+            string key = DeviceKey(d);
+            if (!seen.Add(key)) continue;   // collapse the same unit seen twice (e.g. USB + BLE)
+            string name; try { name = d.GetProductName(); } catch { name = ""; }
+            string? serial; try { serial = d.GetSerialNumber(); } catch { serial = null; }
+            list.Add(new FaderCandidate { Key = key, Name = name, Vid = d.VendorID, Pid = d.ProductID, Serial = serial, OurVid = d.VendorID == VID, ByUsage = byUsage });
+        }
+        return list;
     }
 
     void StartHid()
@@ -2577,8 +2695,9 @@ public class MainForm : Form
             if (dev == null) { SetStatus("Dongle not found — plug it in…", false); Thread.Sleep(1500); continue; }
             if (!dev.TryOpen(out HidStream stream)) { SetStatus("Found dongle, but couldn't open it", false); Thread.Sleep(1500); continue; }
 
+            string devKey = DeviceKey(dev);
             string devName; try { devName = dev.GetProductName(); } catch { devName = "ZMK keyboard"; }
-            OnDeviceConnected(DeviceKey(dev), devName);   // load this unit's profile
+            OnDeviceConnected(devKey, devName);   // load this unit's profile
             SetStatus($"Connected to {devName}", true);
             using (stream)
             {
@@ -2586,6 +2705,9 @@ public class MainForm : Form
                 var buf = new byte[dev.GetMaxInputReportLength()];
                 while (_run)
                 {
+                    // Dropped from monitoring in the Devices dialog while live:
+                    // release it so FindFader moves on (and can pick another unit).
+                    if (_ignoredSnap.Contains(devKey)) break;
                     int n;
                     try { n = stream.Read(buf, 0, buf.Length); }
                     catch (TimeoutException) { continue; }
