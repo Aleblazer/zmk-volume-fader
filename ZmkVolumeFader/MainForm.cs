@@ -603,6 +603,11 @@ public class MainForm : Form
         public RoundedButton[] Tabs = Array.Empty<RoundedButton>();  // Output/Apps/Categories
         public RoundedButton? Remove;   // virtual faders only: the delete button
         public RoundedButton? Hotkey;   // virtual faders only: opens the hotkey dialog
+        // Which fader group (device) this slider belongs to — a device key for
+        // physical faders, or VirtualKey for the virtual home. Axis reports from a
+        // device only drive sliders whose GroupKey matches, so two devices can be
+        // live at once without their axes colliding.
+        public string GroupKey = VirtualKey;
         public int AxisIndex;                                 // which HID report axis (0..7) drives this slider
         // Virtual faders have no HID axis; they stand in for the physical throw.
         // VTarget (0..100) is the goal set by mouse drag or a hotkey; VCur eases
@@ -674,6 +679,35 @@ public class MainForm : Form
         public List<SliderConfig> Sliders { get; set; } = new();
     }
 
+    // A live on-screen section: one connected device (or the virtual home). Its
+    // sliders are the same Axis objects that appear, concatenated, in _sliders.
+    // Groups render top-to-bottom with a small header (device name + status).
+    sealed class FaderGroup
+    {
+        public string Key = "";       // device key, or VirtualKey
+        public string Name = "";      // header text
+        public bool IsVirtual;
+        public bool Connected = true; // physical: a reader is open; drives the header dot
+        public List<Axis> Sliders = new();
+        // Header parts, rebuilt each layout and re-themed in place on theme change.
+        public Control? Header;
+        public Label? HeaderDot;
+        public Label? HeaderName;
+        public RoundedButton? HeaderBtn;
+        public void ClearHeaderRefs() { Header = null; HeaderDot = null; HeaderName = null; HeaderBtn = null; }
+    }
+
+    // One open HID device being read on its own background thread. Keyed by device
+    // key in _readers; the thread self-removes on disconnect.
+    sealed class Reader
+    {
+        public string Key = "";
+        public string Name = "";
+        public Thread Thread = null!;
+        public HidStream? Stream;
+        public volatile bool Stop;
+    }
+
     sealed class Settings
     {
         // Per-device layouts keyed by device identity (serial, else VID:PID).
@@ -690,10 +724,13 @@ public class MainForm : Form
         public CloseBehavior CloseBehavior { get; set; } = CloseBehavior.Ask;
         // App-key -> unix seconds last seen with a live session (for pruning).
         public Dictionary<string, long> AppSeen { get; set; } = new();
-        // Device keys (VID:PID[:serial]) the user has chosen NOT to monitor — e.g.
-        // a Steam Controller puck or other gadget that also exposes a vendor HID
-        // page. Everything matching the fader page is monitored unless listed here.
+        // Explicit per-device monitoring overrides. By default a unit is monitored
+        // iff it exposes our exact fader report or matches our VID; a device that
+        // merely shares the vendor HID page (a Steam Controller puck, say) is left
+        // alone. IgnoredDevices force a matching unit OFF; MonitoredDevices opt a
+        // page-only unit IN. Keyed by device key (VID:PID[:serial]).
         public List<string> IgnoredDevices { get; set; } = new();
+        public List<string> MonitoredDevices { get; set; } = new();
 
         // Legacy pre-multi-slider flat fields, read once to migrate settings.json.
         public string? LeftDeviceId { get; set; }
@@ -714,16 +751,38 @@ public class MainForm : Form
     // applied to the sliders. _legacyProfile seeds the first device from migrated
     // old settings.
     Dictionary<string, DeviceProfile> _devices = new();
-    string? _activeKey;
     DeviceProfile? _legacyProfile;
-    // Device keys the user opted out of monitoring (see Settings.IgnoredDevices).
-    // _ignored is the UI-thread working set (edited by the Devices dialog);
-    // _ignoredSnap is an immutable copy the HID discovery thread reads. Publish a
-    // fresh snapshot (never mutate in place) so the reader sees a consistent set.
-    HashSet<string> _ignored = new(StringComparer.OrdinalIgnoreCase);
-    volatile HashSet<string> _ignoredSnap = new(StringComparer.OrdinalIgnoreCase);
+    // On-screen groups (connected devices + the virtual home), top-to-bottom.
+    readonly List<FaderGroup> _groups = new();
+    // Latest raw axes per device key (independent of slider mapping) — the setup
+    // wizard reads a device's array to detect which fader is being moved. UI thread
+    // only.
+    readonly Dictionary<string, int[]> _rawByDevice = new();
 
-    void PublishIgnored() => _ignoredSnap = new HashSet<string>(_ignored, StringComparer.OrdinalIgnoreCase);
+    // Per-device monitoring overrides (see Settings.IgnoredDevices /
+    // MonitoredDevices). _ignored/_allowed are the UI-thread working sets edited by
+    // the Devices dialog; the *Snap copies are immutable snapshots the HID
+    // discovery + reader threads read. Publish fresh snapshots (never mutate in
+    // place) so those threads always see a consistent pair.
+    HashSet<string> _ignored = new(StringComparer.OrdinalIgnoreCase);
+    HashSet<string> _allowed = new(StringComparer.OrdinalIgnoreCase);
+    volatile HashSet<string> _ignoredSnap = new(StringComparer.OrdinalIgnoreCase);
+    volatile HashSet<string> _allowedSnap = new(StringComparer.OrdinalIgnoreCase);
+
+    void PublishDeviceSets()
+    {
+        _ignoredSnap = new HashSet<string>(_ignored, StringComparer.OrdinalIgnoreCase);
+        _allowedSnap = new HashSet<string>(_allowed, StringComparer.OrdinalIgnoreCase);
+    }
+
+    // Default monitoring decision for a candidate the user hasn't overridden: take
+    // units that speak our exact fader report or carry our VID; leave page-only
+    // strangers alone.
+    static bool DefaultMonitor(bool byUsage, bool ourVid) => byUsage || ourVid;
+
+    // Whether discovery should open a candidate, honouring explicit overrides.
+    bool ShouldMonitor(string key, bool byUsage, bool ourVid)
+        => _allowedSnap.Contains(key) || (!_ignoredSnap.Contains(key) && DefaultMonitor(byUsage, ourVid));
 
     // App-volume tracking. _knownApps is every app ever seen in the mixer
     // (persisted, keyed by process name); _appSessions is the live sessions per
@@ -791,13 +850,15 @@ public class MainForm : Form
     volatile int[] _boundVks = Array.Empty<int>();
 
     Axis _left = null!, _right = null!;
-    // All sliders in axis order (count comes from the active device profile).
+    // Every on-screen slider across all groups, in display order (the flat
+    // concatenation of _groups). Rebuilt by RelayoutGroups; most per-slider
+    // machinery (theme, hotkeys, session render) iterates this.
     Axis[] _sliders = Array.Empty<Axis>();
-    // Latest raw value per HID axis (0..5), independent of the slider mapping —
-    // the setup wizard reads this to detect which fader is being moved.
-    readonly int[] _lastAxisRaw = new int[MaxAxes];
 
-    Thread? _hidThread;
+    // HID discovery + one reader thread per open device.
+    readonly object _readersLock = new();
+    readonly Dictionary<string, Reader> _readers = new(StringComparer.OrdinalIgnoreCase);
+    Thread? _discoveryThread;
     volatile bool _run;
     bool _loadingSettings;
     bool _calibrating;   // true while the calibration dialog is open (don't drive devices)
@@ -884,7 +945,7 @@ public class MainForm : Form
         DpiChanged += (_, _) => BeginInvoke(FitWindowHeight);
 
         _vramp.Tick += (_, _) => VrampTick();
-        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); PruneKnownApps(); MaybeActivateVirtualHome(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); StartHotkeys(); };
+        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); PruneKnownApps(); EnsureVirtualGroup(); RelayoutGroups(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); StartHotkeys(); };
         FormClosing += OnFormClosing;
     }
 
@@ -921,6 +982,10 @@ public class MainForm : Form
                 s.Card.Height = inner.PreferredSize.Height + s.Card.Padding.Vertical + LogicalToDeviceUnits(2);
             total += s.Card.Height + s.Card.Margin.Vertical;
         }
+        // Group headers add height too (one per non-empty group).
+        foreach (var g in _groups)
+            if (g.Sliders.Count > 0 && g.Header is { } h)
+                total += h.PreferredSize.Height + h.Margin.Vertical;
         // No faders: size to the empty-state card (treat it like one slider card).
         if (_sliders.Length == 0 && _emptyCard is { } ec)
         {
@@ -947,24 +1012,36 @@ public class MainForm : Form
         _sliderHost.SuspendLayout();
         _sliderHost.Controls.Clear();
         _sliderHost.RowStyles.Clear();
-        // The empty card is rebuilt each time; dispose the old one (Controls.Clear
-        // doesn't) so rebuilds don't leak it, and drop the references.
+        // The empty card and group headers are rebuilt each time; dispose the old
+        // ones (Controls.Clear doesn't) so rebuilds don't leak them.
         if (_emptyCard is { IsDisposed: false } oldEmpty) { ClearTips(oldEmpty); oldEmpty.Dispose(); }
         _emptyCard = null; _emptyTitle = _emptySub = null; _emptyAdd = null;
+        foreach (var g in _groups)
+            if (g.Header is { IsDisposed: false } h) { ClearTips(h); h.Dispose(); g.ClearHeaderRefs(); }
+
+        // Flatten to a single column of rows: a header then each card, per group.
+        var rows = new List<Control>();
         if (_sliders.Length == 0)
         {
-            _sliderHost.RowCount = 1;
-            _sliderHost.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            _sliderHost.Controls.Add(BuildEmptyCard(), 0, 0);
+            rows.Add(BuildEmptyCard());
         }
         else
         {
-            _sliderHost.RowCount = _sliders.Length;
-            for (int i = 0; i < _sliders.Length; i++)
+            bool first = true;
+            foreach (var g in _groups)
             {
-                _sliderHost.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-                _sliderHost.Controls.Add(_sliders[i].Card, 0, i);
+                if (g.Sliders.Count == 0) continue;   // no header for an empty group
+                rows.Add(BuildGroupHeader(g, first));
+                first = false;
+                foreach (var s in g.Sliders) rows.Add(s.Card);
             }
+        }
+
+        _sliderHost.RowCount = rows.Count;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            _sliderHost.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _sliderHost.Controls.Add(rows[i], 0, i);
         }
         _sliderHost.ResumeLayout();
         _scroll?.Reflow();
@@ -983,7 +1060,7 @@ public class MainForm : Form
         _emptyTitle = new Label { Text = "No faders yet", AutoSize = true, Anchor = AnchorStyles.None, Font = new Font("Segoe UI", 13f, FontStyle.Bold), Margin = new Padding(0, 10, 0, 4) };
         _emptySub = new Label { Text = "Add a physical or virtual fader to get started.", AutoSize = true, Anchor = AnchorStyles.None, Margin = new Padding(0, 0, 0, 12) };
         _emptyAdd = new RoundedButton { Text = "Add fader", AutoSize = true, Anchor = AnchorStyles.None, Padding = new Padding(16, 7, 16, 7), Margin = new Padding(0, 0, 0, 4) };
-        _emptyAdd.Click += (_, _) => RunSetupWizard(pulse: true);
+        _emptyAdd.Click += (_, _) => RunSetupWizard(VirtualKey, pulse: true);
         _tip.SetToolTip(_emptyAdd, "Set up your faders");
         t.Controls.Add(_emptyTitle, 0, 0);
         t.Controls.Add(_emptySub, 0, 1);
@@ -1299,6 +1376,8 @@ public class MainForm : Form
         WalkLabels(this, l => { l.ForeColor = t.Subtle; l.BackColor = Color.Transparent; });
         foreach (var s in _sliders) s.Pct.ForeColor = t.Text;
         _statusDot.ForeColor = t.Accent;
+        // Group headers: recolour after WalkLabels, which greyed their labels.
+        foreach (var g in _groups) RethemeHeader(g, t);
 
         // Empty-state card (present only when there are no faders). Set after
         // WalkLabels so the title keeps its primary colour.
@@ -1516,6 +1595,7 @@ public class MainForm : Form
         }
 
         _run = false;
+        StopReaders();   // stop HID reader threads (unblocks their pending reads)
         // Stop new device callbacks first, then the debounce they feed.
         if (_notify != null)
         {
@@ -2097,9 +2177,11 @@ public class MainForm : Form
         if (MessageBox.Show(this, $"Remove the virtual fader “{a.Name.Text}”?",
                 "ZMK Volume Fader", MessageBoxButtons.YesNo, MessageBoxIcon.Question)
             != DialogResult.Yes) return;
-        var configs = _sliders.Where(s => s != a).Select(ToConfig).ToList();
-        if (_activeKey != null && _devices.TryGetValue(_activeKey, out var p)) p.Sliders = configs;
-        RebuildSliders(configs);
+        // Rebuild just the fader's own group, leaving other groups intact.
+        if (_groups.FirstOrDefault(g => g.Key == a.GroupKey) is not { } g) return;
+        var configs = g.Sliders.Where(s => s != a).Select(ToConfig).ToList();
+        BuildGroupCards(g, configs);
+        RelayoutGroups();
         SaveSettings();
     }
 
@@ -2181,7 +2263,8 @@ public class MainForm : Form
             _appSeen.Clear();
             if (s.AppSeen != null) foreach (var kv in s.AppSeen) _appSeen[kv.Key] = kv.Value;
             _ignored = new(s.IgnoredDevices ?? new(), StringComparer.OrdinalIgnoreCase);
-            PublishIgnored();
+            _allowed = new(s.MonitoredDevices ?? new(), StringComparer.OrdinalIgnoreCase);
+            PublishDeviceSets();
             _categories = s.Categories ?? new();
             _themeMode = s.ThemeMode;
             _closeBehavior = s.CloseBehavior;
@@ -2222,18 +2305,12 @@ public class MainForm : Form
     {
         try
         {
-            // Snapshot the live sliders into the connected device's profile.
-            if (_activeKey != null)
-            {
-                string name = _devices.TryGetValue(_activeKey, out var ex) ? ex.Name : "";
-                _devices[_activeKey] = new DeviceProfile
-                {
-                    Name = name,
-                    Sliders = _sliders.Select(ToConfig).ToList(),
-                };
-            }
+            // Snapshot every live group into its own device profile. Disconnected
+            // devices keep their existing profile in _devices untouched.
+            foreach (var g in _groups)
+                _devices[g.Key] = new DeviceProfile { Name = g.Name, Sliders = g.Sliders.Select(ToConfig).ToList() };
 
-            var s = new Settings { Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), AppSeen = new(_appSeen), IgnoredDevices = _ignored.ToList(), Categories = _categories, ThemeMode = _themeMode, CloseBehavior = _closeBehavior };
+            var s = new Settings { Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), AppSeen = new(_appSeen), IgnoredDevices = _ignored.ToList(), MonitoredDevices = _allowed.ToList(), Categories = _categories, ThemeMode = _themeMode, CloseBehavior = _closeBehavior };
             Directory.CreateDirectory(SettingsDir);
             // Write to a temp file then swap it in, so a crash mid-write can't
             // leave a half-written (corrupt) file behind.
@@ -2254,42 +2331,73 @@ public class MainForm : Form
         return string.IsNullOrWhiteSpace(serial) ? vp : $"{vp}:{serial}";
     }
 
-    // From the HID thread: a device connected. Switch to its profile on the UI.
-    void OnDeviceConnected(string key, string name)
+    // From a reader thread: a device connected. Add (or un-grey) its group.
+    void OnDeviceConnected(string key, string name) => SafeUi(() => AddOrConnectGroup(key, name));
+
+    // From a reader thread: a device dropped. Keep its group on screen (frozen at
+    // its last levels) but grey the header dot — a brief USB/BLE blip shouldn't
+    // flash the layout. The group is only removed when the user ignores it.
+    void OnDeviceDisconnected(string key) => SafeUi(() => MarkGroupConnection(key, false));
+
+    // Post an action to the UI thread, swallowing the shutdown race where the
+    // handle is destroyed between the check and the post.
+    void SafeUi(Action a)
     {
         if (!IsHandleCreated) return;
-        try { BeginInvoke(() => ActivateDevice(key, name)); }
+        try { BeginInvoke(a); }
         catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
     }
 
-    void ActivateDevice(string key, string name)
+    void AddOrConnectGroup(string key, string name)
     {
-        if (key == _activeKey) return;   // same unit reconnecting — keep state
-        _activeKey = key;
+        if (_groups.FirstOrDefault(g => g.Key == key) is { } existing)
+        {
+            existing.Connected = true;
+            if (!string.IsNullOrWhiteSpace(name)) { existing.Name = name; if (existing.HeaderName != null) existing.HeaderName.Text = name; }
+            RethemeHeader(existing, CurrentTheme());
+            UpdateAggregateStatus();
+            return;
+        }
         bool freshDefault = false;
         if (!_devices.TryGetValue(key, out var profile))
         {
             // First time we've seen this unit: seed from migrated settings, else a
-            // default two-slider layout that the setup wizard can refine.
+            // default two-slider layout the setup wizard can refine.
             if (_legacyProfile != null) { profile = _legacyProfile; _legacyProfile = null; }
             else { profile = new DeviceProfile { Sliders = DefaultSliders() }; freshDefault = true; }
             profile.Name = name;
             _devices[key] = profile;
         }
-        // Rebuild the cards if this unit's slider count — or its physical/virtual
-        // makeup — differs from what's shown (virtual cards are wired differently,
-        // so ApplyProfile alone can't convert one kind into the other). A saved
-        // 0-slider profile must rebuild too, or the sliders currently on screen
-        // (e.g. the virtual home's) would get snapshotted into this device's
-        // profile by the SaveSettings below.
-        bool needRebuild = profile.Sliders.Count != _sliders.Length ||
-            profile.Sliders.Where((c, i) => c.IsVirtual != _sliders[i].IsVirtual).Any();
-        if (needRebuild)
-            RebuildSliders(profile.Sliders);
-        else
-            ApplyProfile(profile);
+        if (string.IsNullOrEmpty(profile.Name)) profile.Name = name;
+        var group = new FaderGroup { Key = key, Name = profile.Name, IsVirtual = false, Connected = true };
+        _groups.Add(group);
+        BuildGroupCards(group, profile.Sliders);
+        RelayoutGroups();
         SaveSettings();
-        if (freshDefault) PromptSetup(name);
+        UpdateAggregateStatus();
+        if (freshDefault) PromptSetup(group.Key, name);
+    }
+
+    void MarkGroupConnection(string key, bool connected)
+    {
+        if (_groups.FirstOrDefault(g => g.Key == key) is not { } g) return;
+        g.Connected = connected;
+        RethemeHeader(g, CurrentTheme());
+        UpdateAggregateStatus();
+    }
+
+    // Drop a group entirely (user ignored the device): persist its final state,
+    // dispose its cards, and re-lay out. Falls back to the empty card when the
+    // last group goes.
+    void RemoveGroup(string key)
+    {
+        if (_groups.FirstOrDefault(g => g.Key == key) is not { } g) return;
+        _devices[key] = new DeviceProfile { Name = g.Name, Sliders = g.Sliders.Select(ToConfig).ToList() };
+        foreach (var s in g.Sliders) { ClearTips(s.Card); s.Card.Dispose(); }
+        _groups.Remove(g);
+        _rawByDevice.Remove(key);
+        RelayoutGroups();
+        SaveSettings();
     }
 
     static List<SliderConfig> DefaultSliders() => new()
@@ -2298,65 +2406,42 @@ public class MainForm : Form
         new SliderConfig { AxisIndex = 1, Label = "Right fader" },
     };
 
-    // At startup with no physical unit connected, show the saved virtual-fader
-    // home (if any) so people without hardware get their draggable faders back. A
-    // real unit connecting later takes over via ActivateDevice.
-    void MaybeActivateVirtualHome()
+    // Show the saved virtual-fader home (if it has any faders) as its own group so
+    // people without hardware — or alongside it — keep their draggable faders.
+    void EnsureVirtualGroup()
     {
-        if (_activeKey != null) return;
+        if (_groups.Any(g => g.Key == VirtualKey)) return;
         if (_devices.TryGetValue(VirtualKey, out var vp) && vp.Sliders.Count > 0)
         {
-            _activeKey = VirtualKey;
-            RebuildSliders(vp.Sliders);
+            var g = new FaderGroup { Key = VirtualKey, Name = "Virtual faders", IsVirtual = true, Connected = true };
+            _groups.Add(g);
+            BuildGroupCards(g, vp.Sliders);
         }
     }
 
-    // Push a profile onto the live sliders. (Phase 2 keeps the slider count fixed
-    // at two; the wizard will rebuild the host to the profile's count.)
-    void ApplyProfile(DeviceProfile profile)
+    // Ensure a group object exists for a key (used by the setup wizard when adding
+    // faders to the virtual home, or a device whose group isn't built yet).
+    FaderGroup EnsureGroup(string key)
     {
-        _loadingSettings = true;
-        int n = Math.Min(_sliders.Length, profile.Sliders.Count);
-        for (int i = 0; i < n; i++)
-        {
-            var cfg = profile.Sliders[i];
-            var s = _sliders[i];
-            s.AxisIndex = cfg.AxisIndex;
-            if (!string.IsNullOrEmpty(cfg.Label)) s.Name.Text = cfg.Label;
-            s.Prefs = ClonePrefs(cfg.Outputs);
-            s.OverrideId = cfg.OverrideId;
-            s.Target = cfg.Target;
-            s.AppKey = cfg.AppKey;
-            s.CategoryName = cfg.CategoryName;
-            LoadVirtual(s, cfg);
-            if (cfg.Target != TargetKind.Output) s.Limit.Value = ClampLimit(cfg.Max);
-            ApplyCalibration(s, cfg.Cal);
-        }
-        _loadingSettings = false;
-        // Refresh each card to its loaded target: restyle the tab row and refill
-        // the combo for that tab (Output/App/Category) before selecting within it.
-        // Without this the combo still holds the previous tab's items and an
-        // App/Category target can't be re-selected (falls back to no selection).
-        foreach (var s in _sliders)
-        {
-            StyleTabs(s);
-            _applyingActive = true;
-            PopulateCombo(s);
-            _applyingActive = false;
-            ApplyActive(s);   // output cap comes from DeviceMax
-        }
-        UpdateHotkeySnapshot();   // bindings may have changed with the profile
+        if (_groups.FirstOrDefault(g => g.Key == key) is { } g) return g;
+        bool virt = key == VirtualKey;
+        string name = virt ? "Virtual faders"
+            : _devices.TryGetValue(key, out var p) && !string.IsNullOrEmpty(p.Name) ? p.Name : key;
+        g = new FaderGroup { Key = key, Name = name, IsVirtual = virt, Connected = true };
+        _groups.Add(g);
+        return g;
     }
 
-    // Rebuild the on-screen sliders from a profile's slider set (count, axes,
-    // labels, calibration, outputs). Used by the setup wizard and when a connected
-    // unit's layout differs from what's shown.
-    void RebuildSliders(List<SliderConfig> configs)
+    // Build (or rebuild) one group's Axis cards from its slider configs, tagging
+    // each with the group's key so device axes route to the right sliders. Disposes
+    // the group's previous cards.
+    void BuildGroupCards(FaderGroup g, List<SliderConfig> configs)
     {
-        var old = _sliders;
-        _sliders = configs.Select((c, i) =>
+        var old = g.Sliders;
+        g.Sliders = configs.Select((c, i) =>
         {
             var a = BuildSlider(c.AxisIndex, string.IsNullOrEmpty(c.Label) ? $"Fader {i + 1}" : c.Label, c.IsVirtual);
+            a.GroupKey = g.Key;
             a.Prefs = ClonePrefs(c.Outputs);
             a.OverrideId = c.OverrideId;
             a.Target = c.Target;
@@ -2366,37 +2451,89 @@ public class MainForm : Form
             if (c.Target != TargetKind.Output) { _loadingSettings = true; a.Limit.Value = ClampLimit(c.Max); _loadingSettings = false; }
             ApplyCalibration(a, c.Cal);
             return a;
-        }).ToArray();
-        // 0 sliders is valid now (empty-state card). _left/_right are vestigial.
+        }).ToList();
+        foreach (var s in old) { ClearTips(s.Card); s.Card.Dispose(); }
+    }
+
+    // Re-lay out the whole host after any group change: reorder groups (physical
+    // first, virtual home last), rebuild the flat _sliders view, rebuild the host
+    // (headers + cards), and refresh theme/size/combos/hotkeys.
+    void RelayoutGroups()
+    {
+        _groups.Sort((a, b) =>
+            a.IsVirtual != b.IsVirtual ? (a.IsVirtual ? 1 : -1)
+            : string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+        _sliders = _groups.SelectMany(g => g.Sliders).ToArray();
         _left = _sliders.Length > 0 ? _sliders[0] : null!;
         _right = _sliders.Length > 1 ? _sliders[1] : _left;
 
         PopulateSliderHost();
         ApplyTheme(CurrentTheme());
         FitWindowHeight();
-
-        LoadDevices();   // repopulate combos + re-pick active outputs
-        // ToolTip holds a reference per registered control — clear them before
-        // disposing the old cards so rebuilds don't accumulate dead entries.
-        foreach (var s in old) { ClearTips(s.Card); s.Card.Dispose(); }
+        LoadDevices();   // repopulate combos + re-pick active outputs across all cards
         UpdateHotkeySnapshot();
     }
 
-    // Unregister every tooltip under a control tree (see RebuildSliders).
+    // Build a group's header row: a status dot, the device/section name, and a
+    // Set-up (physical) or Add-fader (virtual) button. References are stashed on
+    // the group so ApplyTheme can recolour them in place without a relayout.
+    Control BuildGroupHeader(FaderGroup g, bool first)
+    {
+        var row = new TableLayoutPanel
+        {
+            ColumnCount = 3, RowCount = 1, AutoSize = true, BackColor = Color.Transparent,
+            Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(2, first ? 0 : 12, 2, 4)
+        };
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+        var dot = new Label { Text = "●", AutoSize = true, Font = new Font("Segoe UI", 7f), Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 6, 0) };
+        var name = new Label { Text = g.Name, AutoSize = true, Font = new Font("Segoe UI", 9.75f, FontStyle.Bold), Anchor = AnchorStyles.Left, Margin = new Padding(0, 3, 0, 0) };
+        var btn = new RoundedButton { Text = g.IsVirtual ? "Add fader" : "Set up", AutoSize = true, Padding = new Padding(10, 3, 10, 3), Anchor = AnchorStyles.Right, Margin = new Padding(8, 0, 0, 0) };
+        btn.Click += (_, _) => RunSetupWizard(g.Key, pulse: g.IsVirtual && g.Sliders.Count == 0);
+        _tip.SetToolTip(btn, g.IsVirtual ? "Add or arrange virtual faders" : "Map this device's faders and capture their range");
+
+        row.Controls.Add(dot, 0, 0);
+        row.Controls.Add(name, 1, 0);
+        row.Controls.Add(btn, 2, 0);
+
+        g.Header = row; g.HeaderDot = dot; g.HeaderName = name; g.HeaderBtn = btn;
+        RethemeHeader(g, CurrentTheme());
+        return row;
+    }
+
+    // Recolour a group header for the current theme. The dot is accent while the
+    // device is connected, subtle once it drops (virtual home: always subtle).
+    void RethemeHeader(FaderGroup g, Theme t)
+    {
+        if (g.HeaderDot is { } dot) dot.ForeColor = !g.IsVirtual && g.Connected ? t.Accent : t.Subtle;
+        if (g.HeaderName is { } nm) nm.ForeColor = t.Text;
+        if (g.HeaderBtn is { } btn)
+        {
+            btn.BackColor = t.CtlBg; btn.ForeColor = t.Text;
+            btn.FlatAppearance.BorderColor = t.CtlBorder; btn.Surround = t.Window; btn.Invalidate();
+        }
+    }
+
+    // Unregister every tooltip under a control tree (see BuildGroupCards).
     void ClearTips(Control root)
     {
         _tip.SetToolTip(root, null);
         foreach (Control c in root.Controls) ClearTips(c);
     }
 
-    // Open the fader setup dialog: a reorderable list seeded from the current
-    // faders, with inline physical capture and add-virtual. On Done, rebuild the
-    // layout from the returned order — reusing each existing slider's config
-    // (target/cap/name/calibration) when the item carries its SourceIndex.
-    // pulse animates the dialog's Add buttons (used from the empty-state card).
-    void RunSetupWizard(bool pulse = false)
+    // Open the fader setup dialog for one group: a reorderable list seeded from
+    // that group's faders, with inline physical capture and add-virtual. Physical
+    // capture watches the group's own device axes, so setting up one device never
+    // sees another's movement. On Done, rebuild just that group. The empty-state
+    // card and the virtual header pass VirtualKey (its capture reads nothing —
+    // physical faders are mapped from their own device's "Set up" button).
+    void RunSetupWizard(string groupKey, bool pulse = false)
     {
-        var existing = _sliders.Select((s, i) => new SetupDialog.Item
+        var group = _groups.FirstOrDefault(g => g.Key == groupKey);
+        var seedFrom = group?.Sliders ?? new List<Axis>();
+        var existing = seedFrom.Select((s, i) => new SetupDialog.Item
         {
             Kind = s.IsVirtual ? SetupDialog.ItemKind.Virtual : SetupDialog.ItemKind.Physical,
             Axis = s.AxisIndex,
@@ -2408,7 +2545,7 @@ public class MainForm : Form
 
         bool prev = _calibrating;
         _calibrating = true;   // don't drive outputs mid-sweep
-        using (var dlg = new SetupDialog(_theme, () => (int[])_lastAxisRaw.Clone(), existing, pulse))
+        using (var dlg = new SetupDialog(_theme, () => RawFor(groupKey), existing, pulse))
         {
             var result = dlg.ShowDialog(this);
             _calibrating = prev;
@@ -2421,9 +2558,9 @@ public class MainForm : Form
                     // Seeded rows reuse the existing slider's full config so its
                     // target/cap/calibration survive a reorder; the (possibly edited)
                     // name overrides.
-                    if (item.SourceIndex is int si && si >= 0 && si < _sliders.Length)
+                    if (item.SourceIndex is int si && si >= 0 && si < seedFrom.Count)
                     {
-                        var cfg = ToConfig(_sliders[si]);
+                        var cfg = ToConfig(seedFrom[si]);
                         cfg.Label = label;
                         return cfg;
                     }
@@ -2436,30 +2573,34 @@ public class MainForm : Form
                         }
                         : new SliderConfig { IsVirtual = true, AxisIndex = -1, Label = label, Value = 50 };
                 }).ToList();
-                // With no physical unit connected, virtual faders live in the
-                // synthetic virtual-home profile so they persist and reappear.
-                string key = _activeKey ?? VirtualKey;
-                _activeKey = key;
-                if (!_devices.TryGetValue(key, out var p))
-                {
-                    p = new DeviceProfile { Name = key == VirtualKey ? "Virtual faders" : "" };
-                    _devices[key] = p;
-                }
-                p.Sliders = configs;
-                RebuildSliders(configs);   // 0 configs is valid — shows the empty card
+                var g = EnsureGroup(groupKey);
+                BuildGroupCards(g, configs);
+                RelayoutGroups();   // 0 configs collapses the group (empty card if it was the last)
                 SaveSettings();
             }
         }
         foreach (var s in _sliders) { s.LastApplied = -1; ApplyActive(s); }
     }
 
-    void PromptSetup(string name)
+    // The setup wizard's raw-axis feed for a group: a snapshot of that device's
+    // latest axes (zeros for the virtual home, which has no hardware to capture).
+    int[] RawFor(string key) => _rawByDevice.TryGetValue(key, out var r) ? (int[])r.Clone() : new int[MaxAxes];
+
+    // Which group the Options → "Set up faders" button edits (it isn't group-aware
+    // — each group's own header has a Set-up button too): a connected device first,
+    // else any device, else the virtual home.
+    string DefaultSetupGroupKey()
+        => _groups.FirstOrDefault(g => !g.IsVirtual && g.Connected)?.Key
+        ?? _groups.FirstOrDefault(g => !g.IsVirtual)?.Key
+        ?? VirtualKey;
+
+    void PromptSetup(string key, string name)
     {
         var r = MessageBox.Show(this,
             $"New fader device “{name}” detected.\n\nRun setup to map its faders? " +
             "You'll move each fader fully bottom-to-top so the app can detect it and capture its range.",
             "ZMK Volume Fader", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
-        if (r == DialogResult.Yes) RunSetupWizard();
+        if (r == DialogResult.Yes) RunSetupWizard(key);
     }
 
     static int ClampLimit(int pct) => Math.Clamp(pct, 1, 100);
@@ -2476,33 +2617,40 @@ public class MainForm : Form
         return s;
     }
 
-    // Show the Devices dialog: every detected fader-page unit (plus any ignored
-    // ones, so they can be re-enabled while unplugged) with a monitor/ignore
-    // toggle. On Save, rebuild the ignore set and republish it for the HID thread.
+    // Show the Devices dialog: every detected fader-page unit (plus any the user
+    // explicitly overrode, so a choice can be reversed while unplugged) with a
+    // monitor/ignore toggle. On Save, fold each row's choice back into the
+    // override sets (only where it differs from the default) and reconcile live
+    // readers/groups so a change takes effect at once.
     void OpenDevices()
     {
         var rows = new List<DevicesDialog.Row>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var open = ConnectedKeys();
         foreach (var c in EnumerateCandidates())
         {
             seen.Add(c.Key);
+            bool auto = DefaultMonitor(c.ByUsage, c.OurVid);
             rows.Add(new DevicesDialog.Row
             {
                 Key = c.Key,
                 Name = string.IsNullOrWhiteSpace(c.Name) ? "(unnamed HID device)" : c.Name,
                 Detail = DeviceDetail(c),
                 OurVid = c.OurVid,
-                Connected = ConnectedKeys().Contains(c.Key),
-                Monitored = !_ignored.Contains(c.Key),
+                Connected = open.Contains(c.Key),
+                AutoDefault = auto,
+                Monitored = ShouldMonitor(c.Key, c.ByUsage, c.OurVid),
             });
         }
-        // Ignored units that aren't plugged in right now — still list them so the
-        // choice can be reversed. Fall back to a saved profile name if we have one.
-        foreach (var key in _ignored)
+        // Overridden units that aren't plugged in right now — still list them so a
+        // choice can be reversed. An ignored one defaults to "would monitor" so the
+        // ignore persists if left unticked; an opted-in one to "would not".
+        foreach (var key in _ignored.Concat(_allowed))
         {
             if (!seen.Add(key)) continue;
-            string name = _devices.TryGetValue(key, out var p) && !string.IsNullOrWhiteSpace(p.Name) ? p.Name : "Ignored device";
-            rows.Add(new DevicesDialog.Row { Key = key, Name = name, Detail = $"{key}  ·  not connected", Monitored = false });
+            bool allowed = _allowed.Contains(key);
+            string name = _devices.TryGetValue(key, out var p) && !string.IsNullOrWhiteSpace(p.Name) ? p.Name : (allowed ? "Opted-in device" : "Ignored device");
+            rows.Add(new DevicesDialog.Row { Key = key, Name = name, Detail = $"{key}  ·  not connected", AutoDefault = !allowed, Monitored = allowed });
         }
         rows = rows
             .OrderByDescending(r => r.Connected)
@@ -2513,17 +2661,45 @@ public class MainForm : Form
         using var dlg = new DevicesDialog(_theme, rows);
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
-        _ignored = new HashSet<string>(rows.Where(r => !r.Monitored).Select(r => r.Key), StringComparer.OrdinalIgnoreCase);
-        PublishIgnored();
+        // Apply per-row deltas: clear any prior override for the shown key, then
+        // record one only when the choice differs from the default. Keys not shown
+        // (overridden + unplugged and not surfaced) keep their entries untouched.
+        foreach (var r in rows)
+        {
+            _ignored.Remove(r.Key);
+            _allowed.Remove(r.Key);
+            if (r.Monitored == r.AutoDefault) continue;
+            if (r.Monitored) _allowed.Add(r.Key); else _ignored.Add(r.Key);
+        }
+        PublishDeviceSets();
         SaveSettings();
-        // A newly-ignored live unit is dropped by the HID loop within ~1 s; a
-        // re-enabled one is picked up on the next discovery scan.
+
+        // Reconcile live state: stop reading and drop the group for any device the
+        // user just un-ticked. Newly opted-in units are opened by the next
+        // discovery scan (~1.5 s), which adds their group automatically.
+        foreach (var r in rows)
+            if (!r.Monitored && _groups.Any(g => g.Key == r.Key))
+            {
+                StopReader(r.Key);
+                RemoveGroup(r.Key);
+            }
     }
 
-    // Device keys currently being read. Single-active model for now (Step B makes
-    // this the set of open readers).
-    IEnumerable<string> ConnectedKeys() => _activeKey != null && _activeKey != VirtualKey
-        ? new[] { _activeKey } : Array.Empty<string>();
+    // Signal one device's reader to stop and close its stream.
+    void StopReader(string key)
+    {
+        Reader? r;
+        lock (_readersLock) _readers.TryGetValue(key, out r);
+        if (r == null) return;
+        r.Stop = true;
+        try { r.Stream?.Close(); } catch { }
+    }
+
+    // Device keys currently open for reading.
+    HashSet<string> ConnectedKeys()
+    {
+        lock (_readersLock) return new HashSet<string>(_readers.Keys, StringComparer.OrdinalIgnoreCase);
+    }
 
     // ---- options ----------------------------------------------------------
 
@@ -2571,7 +2747,7 @@ public class MainForm : Form
         // setup dialog is then cancelled.
         foreach (var s in _sliders) s.LastApplied = -1;
         PopulateCombos();
-        if (result == DialogResult.OK && dlg.SetupRequested) RunSetupWizard();
+        if (result == DialogResult.OK && dlg.SetupRequested) RunSetupWizard(DefaultSetupGroupKey());
     }
 
     // Adopt an edited ranked list. Re-ranking returns the fader to automatic
@@ -2610,43 +2786,36 @@ public class MainForm : Form
         catch { return null; }
     }
 
-    // Devices already inspected and found unrelated. FindFader runs every 1.5 s
-    // while disconnected, and parsing every HID device's report descriptor
-    // (RGB hubs, receivers, …) is not free — each device is inspected once.
+    // Devices already inspected and found unrelated. Discovery runs every 1.5 s,
+    // and parsing every HID device's report descriptor (RGB hubs, receivers, …)
+    // is not free — each unrelated device is inspected once.
     static readonly HashSet<string> NonFaderPaths = new();
 
-    HidDevice? FindFader()
+    // Every fader-page device discovery should open right now: one per device
+    // identity, filtered by ShouldMonitor. Matching keys on our vendor fader usage
+    // (0xFF000001) rather than VID/PID lets the same unit be found over USB or BLE
+    // (HID-over-GATT can assign a different product id). A page-only stranger is
+    // skipped unless the user opted it in; an ignored unit is always skipped.
+    List<(HidDevice Dev, string Key)> FindFaders()
     {
-        var ignored = _ignoredSnap;
-        var all = DeviceList.Local.GetHidDevices()
-            .Where(d => !NonFaderPaths.Contains(d.DevicePath)).ToArray();
-
-        // Match on our unique vendor fader usage (0xFF000001) rather than the
-        // exact VID/PID: over Bluetooth (HID-over-GATT) Windows can assign a
-        // different product id than the USB build, so keying off the usage lets
-        // the same app find the device on either transport. Prefer our VID when
-        // present, but don't require it. Fallback: any device on our vendor
-        // usage page. Devices the user chose to ignore (Devices dialog) are
-        // skipped — that's how an errant gadget on the same page (a Steam
-        // Controller puck, say) stops hijacking the app.
-        var byUsage = new List<HidDevice>();
-        var byPage = new List<HidDevice>();
-        foreach (var d in all)
+        var result = new List<(HidDevice, string)>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var d in DeviceList.Local.GetHidDevices().Where(d => !NonFaderPaths.Contains(d.DevicePath)))
         {
             var us = TryUsages(d);
             if (us == null) continue;
-            bool onUsage = us.Contains(FaderUsage);
-            if (!onUsage && !us.Any(u => (u >> 16) == 0xFF00)) { NonFaderPaths.Add(d.DevicePath); continue; }
-            if (ignored.Contains(DeviceKey(d))) continue;
-            if (onUsage) byUsage.Add(d); else byPage.Add(d);
+            bool byUsage = us.Contains(FaderUsage);
+            if (!byUsage && !us.Any(u => (u >> 16) == 0xFF00)) { NonFaderPaths.Add(d.DevicePath); continue; }
+            string key = DeviceKey(d);
+            if (!seen.Add(key)) continue;   // one reader per identity
+            if (!ShouldMonitor(key, byUsage, d.VendorID == VID)) continue;
+            result.Add((d, key));
         }
-        return byUsage.FirstOrDefault(d => d.VendorID == VID) ?? byUsage.FirstOrDefault()
-            ?? byPage.FirstOrDefault(d => d.VendorID == VID)
-            ?? byPage.OrderBy(d => d.GetMaxInputReportLength()).FirstOrDefault();
+        return result;
     }
 
     // A fader-page HID device the Devices dialog can monitor or ignore. Populated
-    // by a full descriptor scan (unlike FindFader's cached hot path) so the list
+    // by a full descriptor scan (unlike discovery's cached hot path) so the list
     // is always accurate when the dialog opens.
     internal sealed class FaderCandidate
     {
@@ -2680,34 +2849,58 @@ public class MainForm : Form
         return list;
     }
 
+    // A single discovery thread scans every ~1.5 s and opens any monitored device
+    // that isn't already being read; each open device gets its own reader thread.
     void StartHid()
     {
         _run = true;
-        _hidThread = new Thread(HidLoop) { IsBackground = true, Name = "fader-hid" };
-        _hidThread.Start();
+        _discoveryThread = new Thread(DiscoveryLoop) { IsBackground = true, Name = "fader-discovery" };
+        _discoveryThread.Start();
     }
 
-    void HidLoop()
+    void DiscoveryLoop()
     {
         while (_run)
         {
-            var dev = FindFader();
-            if (dev == null) { SetStatus("Dongle not found — plug it in…", false); Thread.Sleep(1500); continue; }
-            if (!dev.TryOpen(out HidStream stream)) { SetStatus("Found dongle, but couldn't open it", false); Thread.Sleep(1500); continue; }
+            try
+            {
+                foreach (var (dev, key) in FindFaders())
+                {
+                    lock (_readersLock) if (_readers.ContainsKey(key)) continue;
+                    if (!dev.TryOpen(out HidStream stream)) continue;
+                    StartReader(key, dev, stream);
+                }
+            }
+            catch { }
+            UpdateAggregateStatus();
+            Thread.Sleep(1500);
+        }
+    }
 
-            string devKey = DeviceKey(dev);
-            string devName; try { devName = dev.GetProductName(); } catch { devName = "ZMK keyboard"; }
-            OnDeviceConnected(devKey, devName);   // load this unit's profile
-            SetStatus($"Connected to {devName}", true);
+    void StartReader(string key, HidDevice dev, HidStream stream)
+    {
+        var reader = new Reader { Key = key, Stream = stream };
+        try { reader.Name = dev.GetProductName(); } catch { reader.Name = "ZMK keyboard"; }
+        int reportLen; try { reportLen = dev.GetMaxInputReportLength(); } catch { reportLen = 64; }
+        lock (_readersLock) _readers[key] = reader;
+        reader.Thread = new Thread(() => ReaderLoop(reader, stream, reportLen)) { IsBackground = true, Name = $"fader-hid:{key}" };
+        OnDeviceConnected(key, reader.Name);
+        reader.Thread.Start();
+    }
+
+    void ReaderLoop(Reader reader, HidStream stream, int reportLen)
+    {
+        try
+        {
             using (stream)
             {
                 stream.ReadTimeout = 1000;
-                var buf = new byte[dev.GetMaxInputReportLength()];
-                while (_run)
+                var buf = new byte[reportLen];
+                while (_run && !reader.Stop)
                 {
                     // Dropped from monitoring in the Devices dialog while live:
-                    // release it so FindFader moves on (and can pick another unit).
-                    if (_ignoredSnap.Contains(devKey)) break;
+                    // release it (the group is removed there separately).
+                    if (_ignoredSnap.Contains(reader.Key) && !_allowedSnap.Contains(reader.Key)) break;
                     int n;
                     try { n = stream.Read(buf, 0, buf.Length); }
                     catch (TimeoutException) { continue; }
@@ -2720,28 +2913,59 @@ public class MainForm : Form
                         int count = Math.Min(MaxAxes, (n - 1) / 2);
                         var axes = new int[count];
                         for (int i = 0; i < count; i++) axes[i] = ReadAxis(buf, 1 + 2 * i);
-                        OnFaders(axes);
+                        OnFaders(reader.Key, axes);
                     }
                 }
             }
-            SetStatus("Reconnecting…", false);
         }
+        catch { }
+        finally
+        {
+            lock (_readersLock) { if (_readers.TryGetValue(reader.Key, out var cur) && cur == reader) _readers.Remove(reader.Key); }
+            OnDeviceDisconnected(reader.Key);
+            UpdateAggregateStatus();
+        }
+    }
+
+    // Signal every reader to stop and close its stream (unblocking any pending
+    // read) — called on shutdown so background threads exit promptly.
+    void StopReaders()
+    {
+        List<Reader> snapshot;
+        lock (_readersLock) snapshot = _readers.Values.ToList();
+        foreach (var r in snapshot) { r.Stop = true; try { r.Stream?.Close(); } catch { } }
+    }
+
+    // Footer status from the set of open readers: names when few, a count when many.
+    void UpdateAggregateStatus()
+    {
+        List<string> names;
+        lock (_readersLock) names = _readers.Values.Select(r => r.Name).ToList();
+        if (names.Count == 0) { SetStatus("No fader device — plug one in…", false); return; }
+        if (names.Count == 1) { SetStatus($"Connected to {names[0]}", true); return; }
+        if (names.Count <= 3) { SetStatus($"Connected — {string.Join(", ", names)}", true); return; }
+        SetStatus($"Connected — {names.Count} devices", true);
     }
 
     static int ReadAxis(byte[] b, int i) => (short)(b[i] | (b[i + 1] << 8));
 
-    void OnFaders(int[] axes)
+    // From a reader thread: this device's latest axes. Store them per-device and
+    // drive only the sliders that belong to this device's group.
+    void OnFaders(string key, int[] axes)
     {
         if (!IsHandleCreated) return;
         // The handle can be destroyed between the check and the post during
-        // shutdown; an unhandled throw here is on the HID thread and would crash.
+        // shutdown; an unhandled throw here is on the reader thread and would crash.
         try
         {
             BeginInvoke(() =>
             {
-                for (int i = 0; i < axes.Length && i < MaxAxes; i++) _lastAxisRaw[i] = axes[i];
+                if (!_rawByDevice.TryGetValue(key, out var raw) || raw.Length != MaxAxes)
+                    _rawByDevice[key] = raw = new int[MaxAxes];
+                for (int i = 0; i < axes.Length && i < MaxAxes; i++) raw[i] = axes[i];
                 foreach (var s in _sliders)
-                    if (s.AxisIndex >= 0 && s.AxisIndex < axes.Length) ApplyAxis(s, axes[s.AxisIndex]);
+                    if (s.GroupKey == key && s.AxisIndex >= 0 && s.AxisIndex < axes.Length)
+                        ApplyAxis(s, axes[s.AxisIndex]);
             });
         }
         catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }

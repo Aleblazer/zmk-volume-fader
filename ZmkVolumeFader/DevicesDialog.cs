@@ -17,6 +17,7 @@ sealed class DevicesDialog : Form
         public string Detail = "";
         public bool OurVid;       // matches our VID — almost certainly a real fader unit
         public bool Connected;    // in use right now
+        public bool AutoDefault;  // what monitoring would do with no explicit override
         public bool Monitored;    // in/out: ticked = monitor, unticked = ignore
     }
 
