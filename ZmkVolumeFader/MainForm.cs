@@ -706,6 +706,10 @@ public class MainForm : Form
         public Thread Thread = null!;
         public HidStream? Stream;
         public volatile bool Stop;
+        // Latest axes read but not yet applied. The reader thread stashes every
+        // report here (Interlocked); the UI fader-pump grabs the newest at a fixed
+        // rate, so a device spamming reports can't fan out into per-report UI work.
+        public int[]? Pending;
     }
 
     sealed class Settings
@@ -840,6 +844,9 @@ public class MainForm : Form
     DeviceNotify? _notify;
     // Coalesces bursts of device notifications into a single refresh.
     readonly System.Windows.Forms.Timer _deviceDebounce = new() { Interval = 250 };
+    // Applies the newest axes from each reader at a fixed ~60 Hz, so a device
+    // that spams reports drives at most one update per tick instead of per report.
+    readonly System.Windows.Forms.Timer _faderPump = new() { Interval = 16 };
 
     // Global keyboard hook (observes keys, never swallows) + the smoothing ramp
     // that eases virtual faders toward their hotkey-set target.
@@ -945,6 +952,7 @@ public class MainForm : Form
         DpiChanged += (_, _) => BeginInvoke(FitWindowHeight);
 
         _vramp.Tick += (_, _) => VrampTick();
+        _faderPump.Tick += (_, _) => FaderPumpTick();
         Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); PruneKnownApps(); EnsureVirtualGroup(); RelayoutGroups(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartHid(); StartMaintenance(); RegisterDeviceNotifications(); StartSessionPoll(); StartHotkeys(); };
         FormClosing += OnFormClosing;
     }
@@ -1608,6 +1616,8 @@ public class MainForm : Form
         _sessionPoll.Dispose();
         _vramp.Stop();
         _vramp.Dispose();
+        _faderPump.Stop();
+        _faderPump.Dispose();
         _hook.Dispose();   // unhook the global keyboard hook
         // Release the audio COM wrappers we're holding.
         foreach (var it in _present.Values) { try { it.Device.Dispose(); } catch { } }
@@ -2933,6 +2943,7 @@ public class MainForm : Form
     void StartHid()
     {
         _run = true;
+        _faderPump.Start();
         _discoveryThread = new Thread(DiscoveryLoop) { IsBackground = true, Name = "fader-discovery" };
         _discoveryThread.Start();
     }
@@ -2999,7 +3010,9 @@ public class MainForm : Form
                         int count = Math.Min(MaxAxes, (n - 1) / 2);
                         var axes = new int[count];
                         for (int i = 0; i < count; i++) axes[i] = ReadAxis(buf, 1 + 2 * i);
-                        OnFaders(reader.Key, axes);
+                        // Hand the newest axes to the pump; a report flood collapses
+                        // to whatever the ~60 Hz pump reads, not per-report UI work.
+                        Interlocked.Exchange(ref reader.Pending, axes);
                     }
                 }
             }
@@ -3035,26 +3048,25 @@ public class MainForm : Form
 
     static int ReadAxis(byte[] b, int i) => (short)(b[i] | (b[i + 1] << 8));
 
-    // From a reader thread: this device's latest axes. Store them per-device and
-    // drive only the sliders that belong to this device's group.
-    void OnFaders(string key, int[] axes)
+    // UI thread, ~60 Hz: apply the newest axes each reader has stashed. Coalescing
+    // here means a device spamming reports drives at most one update per tick
+    // instead of marshaling + filtering + driving on every single report.
+    void FaderPumpTick()
     {
         if (!IsHandleCreated) return;
-        // The handle can be destroyed between the check and the post during
-        // shutdown; an unhandled throw here is on the reader thread and would crash.
-        try
+        List<Reader> readers;
+        lock (_readersLock) readers = _readers.Values.ToList();
+        foreach (var r in readers)
         {
-            BeginInvoke(() =>
-            {
-                if (!_rawByDevice.TryGetValue(key, out var raw) || raw.Length != MaxAxes)
-                    _rawByDevice[key] = raw = new int[MaxAxes];
-                for (int i = 0; i < axes.Length && i < MaxAxes; i++) raw[i] = axes[i];
-                foreach (var s in _sliders)
-                    if (s.GroupKey == key && s.AxisIndex >= 0 && s.AxisIndex < axes.Length)
-                        ApplyAxis(s, axes[s.AxisIndex]);
-            });
+            var axes = Interlocked.Exchange(ref r.Pending, null);
+            if (axes == null) continue;
+            if (!_rawByDevice.TryGetValue(r.Key, out var raw) || raw.Length != MaxAxes)
+                _rawByDevice[r.Key] = raw = new int[MaxAxes];
+            for (int i = 0; i < axes.Length && i < MaxAxes; i++) raw[i] = axes[i];
+            foreach (var s in _sliders)
+                if (s.GroupKey == r.Key && s.AxisIndex >= 0 && s.AxisIndex < axes.Length)
+                    ApplyAxis(s, axes[s.AxisIndex]);
         }
-        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
     }
 
     // A raw jump beyond this (mV) is real movement, not noise — track it exactly.
