@@ -2973,7 +2973,15 @@ public class MainForm : Form
         {
             using (stream)
             {
-                stream.ReadTimeout = 1000;
+                // Block until a report arrives. Cancellation is by closing the
+                // stream (StopReader / StopReaders), which unblocks the read. A
+                // *finite* ReadTimeout made HidSharp poll the device continuously,
+                // waking the CPU out of idle hundreds of thousands of times a
+                // second; a real-time power-monitoring ETW consumer couldn't drain
+                // that, and its kernel reply queue ballooned to many GB of paged +
+                // nonpaged pool (PoolMon tags EtwD / Etwr). Blocking cleanly avoids
+                // the poll entirely.
+                stream.ReadTimeout = System.Threading.Timeout.Infinite;
                 var buf = new byte[reportLen];
                 while (_run && !reader.Stop)
                 {
@@ -2982,8 +2990,7 @@ public class MainForm : Form
                     if (_ignoredSnap.Contains(reader.Key) && !_allowedSnap.Contains(reader.Key)) break;
                     int n;
                     try { n = stream.Read(buf, 0, buf.Length); }
-                    catch (TimeoutException) { continue; }
-                    catch { break; }
+                    catch { break; }   // stream closed (cancel) or device gone
                     // Report id 2: up to eight 16-bit LE axes at bytes 1.. (two
                     // bytes each), then a button byte. Read whatever axes are
                     // present so any number of sliders (1..8) can be driven.
