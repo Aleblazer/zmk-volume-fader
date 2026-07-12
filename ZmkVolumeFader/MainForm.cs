@@ -945,7 +945,7 @@ public class MainForm : Form
         DpiChanged += (_, _) => BeginInvoke(FitWindowHeight);
 
         _vramp.Tick += (_, _) => VrampTick();
-        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); PruneKnownApps(); EnsureVirtualGroup(); RelayoutGroups(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartHid(); RegisterDeviceNotifications(); StartSessionPoll(); StartHotkeys(); };
+        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); PruneKnownApps(); EnsureVirtualGroup(); RelayoutGroups(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartHid(); StartMaintenance(); RegisterDeviceNotifications(); StartSessionPoll(); StartHotkeys(); };
         FormClosing += OnFormClosing;
     }
 
@@ -1725,6 +1725,29 @@ public class MainForm : Form
 
     // ---- app volume (audio sessions) --------------------------------------
 
+    // Idle-memory maintenance. The app is a mostly-idle tray utility whose polling
+    // loops generate a steady trickle of short-lived garbage (device scans, audio
+    // session wrappers). All of it is collectable — but the workstation GC, on a
+    // machine with free RAM, defers collecting under no memory pressure, so the
+    // process's committed memory ratchets up for a long time and looks like a leak
+    // in Task Manager. A cheap periodic full collect (the managed heap is ~1 MB)
+    // keeps the footprint flat. Runs off-thread so the brief collect never touches
+    // the UI's responsiveness.
+    void StartMaintenance()
+    {
+        var t = new Thread(() =>
+        {
+            while (_run)
+            {
+                Thread.Sleep(60_000);
+                if (!_run) break;
+                try { GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect(); } catch { }
+            }
+        })
+        { IsBackground = true, Name = "maintenance" };
+        t.Start();
+    }
+
     void StartSessionPoll()
     {
         _sessionPoll.Tick += (_, _) => PollSessions();
@@ -1792,38 +1815,56 @@ public class MainForm : Form
 
             for (int i = 0; i < sessions.Count; i++)
             {
+                AudioSessionControl sc;
+                try { sc = sessions[i]; } catch { continue; }
+                // Each unkept wrapper is disposed in the finally so a second's worth
+                // of COM objects doesn't pile up on the finalizer thread.
+                bool kept = false;
                 try
                 {
-                    var sc = sessions[i];
                     // Any non-expired session = an entry in the Windows mixer.
                     if (sc.State == AudioSessionState.AudioSessionStateExpired) continue;
 
-                    string key, name;
-                    if (sc.IsSystemSoundsSession) { key = SystemAppKey; name = "System sounds"; }
+                    string key;
+                    if (sc.IsSystemSoundsSession) key = SystemAppKey;
                     else
                     {
-                        var k = AppKeyForPid((int)sc.GetProcessID, out name, out var exePath);
+                        var k = AppKeyForPid((int)sc.GetProcessID);
                         if (k == null) continue;
                         key = k;
-                        // Grab the exe icon the first time (upgrade any low-res icon
-                        // left by an older cache). Give up after IconTryMax failures
-                        // — an elevated/protected exe would otherwise be re-tried
-                        // on every poll forever.
-                        if ((!_appIcons.TryGetValue(key, out var have) || have == null || have.Width < IconStore)
-                            && _iconTries.GetValueOrDefault(key) < IconTryMax)
+                    }
+
+                    // Resolve the friendly name + exe icon only the first time we see
+                    // an app (or until its icon loads) — reading MainModule every poll
+                    // is the poll's biggest allocator. System Sounds needs neither.
+                    bool nameKnown = key == SystemAppKey || _knownApps.ContainsKey(key);
+                    bool wantIcon = key != SystemAppKey
+                        && (!_appIcons.TryGetValue(key, out var have) || have == null || have.Width < IconStore)
+                        && _iconTries.GetValueOrDefault(key) < IconTryMax;
+                    if (!nameKnown || wantIcon)
+                    {
+                        ResolveAppDetails((int)sc.GetProcessID, out var name, out var exePath);
+                        if (key == SystemAppKey) name = "System sounds";
+                        else if (string.IsNullOrEmpty(name)) name = _knownApps.GetValueOrDefault(key, key);
+                        if (!_knownApps.TryGetValue(key, out var prev) || prev != name) { _knownApps[key] = name; namesChanged = true; }
+                        // Give up after IconTryMax failures — an elevated/protected exe
+                        // would otherwise be re-tried on every poll forever.
+                        if (wantIcon)
                         {
                             var loaded = LoadExeIcon(exePath);
                             if (loaded != null) { _appIcons[key] = loaded; iconsChanged = true; SaveIconFile(key, loaded); _iconTries.Remove(key); }
                             else { _appIcons.TryAdd(key, null); _iconTries[key] = _iconTries.GetValueOrDefault(key) + 1; }
                         }
                     }
+                    else if (key == SystemAppKey && !_knownApps.ContainsKey(key)) { _knownApps[key] = "System sounds"; namesChanged = true; }
 
                     if (!byApp.TryGetValue(key, out var list)) byApp[key] = list = new();
                     list.Add(sc);
+                    kept = true;
                     _appSeen[key] = nowSec;
-                    if (!_knownApps.TryGetValue(key, out var prev) || prev != name) { _knownApps[key] = name; namesChanged = true; }
                 }
-                catch { continue; }
+                catch { }
+                finally { if (!kept) { try { sc.Dispose(); } catch { } } }
             }
         }
         // The old wrappers are ours alone (SessionCollection builds a fresh
@@ -1849,13 +1890,25 @@ public class MainForm : Form
             if (s.Target != TargetKind.Output) { s.LastApplied = -1; Render(s); }
     }
 
-    // App identity key (lowercased process name) + a friendly display name, and
-    // the exe path (for icon extraction) when the main module is readable.
-    static string? AppKeyForPid(int pid, out string name, out string? exePath)
+    // App identity key (lowercased process name) — the cheap lookup done every
+    // poll. Avoids touching MainModule/FileVersionInfo, which are comparatively
+    // expensive and, called for every session every second, dominate the poll's
+    // allocation churn. The friendly name + exe path come from ResolveAppDetails,
+    // which the poll calls only the first time an app is seen (or until its icon
+    // loads).
+    static string? AppKeyForPid(int pid)
+    {
+        if (pid <= 0) return null;
+        try { using var p = Process.GetProcessById(pid); return p.ProcessName.ToLowerInvariant(); }
+        catch { return null; }
+    }
+
+    // The friendly display name (exe FileDescription, else process name) and exe
+    // path for icon extraction. Reads MainModule, so call sparingly (see above).
+    static void ResolveAppDetails(int pid, out string name, out string? exePath)
     {
         name = "";
         exePath = null;
-        if (pid <= 0) return null;
         try
         {
             using var p = Process.GetProcessById(pid);
@@ -1868,9 +1921,8 @@ public class MainForm : Form
                 if (!string.IsNullOrWhiteSpace(fd)) name = fd!;
             }
             catch { }
-            return p.ProcessName.ToLowerInvariant();
         }
-        catch { return null; }
+        catch { }
     }
 
     // Icons are stored at this size and downscaled when drawn, so they stay crisp
@@ -2786,10 +2838,27 @@ public class MainForm : Form
         catch { return null; }
     }
 
-    // Devices already inspected and found unrelated. Discovery runs every 1.5 s,
-    // and parsing every HID device's report descriptor (RGB hubs, receivers, …)
-    // is not free — each unrelated device is inspected once.
-    static readonly HashSet<string> NonFaderPaths = new();
+    // Per-device classification, cached by DevicePath. Discovery runs continuously
+    // (every 1.5 s), and parsing a report descriptor (TryUsages) plus reading a
+    // serial (DeviceKey) both open the device and allocate — doing it for every
+    // HID device on every scan churns a lot of garbage that, at rest with no GC
+    // pressure, visibly inflates the working set. Each device is inspected once;
+    // the cache is pruned to currently-present paths so it stays bounded.
+    // Discovery-thread only (no locking needed).
+    sealed class DevInfo { public bool Match; public bool ByUsage; public bool OurVid; public string Key = ""; }
+    readonly Dictionary<string, DevInfo> _devInfo = new();
+
+    // Inspect a device once. null = transient read failure (don't cache — retry
+    // next scan); Match=false = definitively not on our page; Match=true carries
+    // its identity key + how it matched.
+    static DevInfo? Classify(HidDevice d)
+    {
+        var us = TryUsages(d);
+        if (us == null) return null;
+        bool byUsage = us.Contains(FaderUsage);
+        if (!byUsage && !us.Any(u => (u >> 16) == 0xFF00)) return new DevInfo { Match = false };
+        return new DevInfo { Match = true, ByUsage = byUsage, OurVid = d.VendorID == VID, Key = DeviceKey(d) };
+    }
 
     // Every fader-page device discovery should open right now: one per device
     // identity, filtered by ShouldMonitor. Matching keys on our vendor fader usage
@@ -2799,18 +2868,28 @@ public class MainForm : Form
     List<(HidDevice Dev, string Key)> FindFaders()
     {
         var result = new List<(HidDevice, string)>();
+        var present = new HashSet<string>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var d in DeviceList.Local.GetHidDevices().Where(d => !NonFaderPaths.Contains(d.DevicePath)))
+        foreach (var d in DeviceList.Local.GetHidDevices())
         {
-            var us = TryUsages(d);
-            if (us == null) continue;
-            bool byUsage = us.Contains(FaderUsage);
-            if (!byUsage && !us.Any(u => (u >> 16) == 0xFF00)) { NonFaderPaths.Add(d.DevicePath); continue; }
-            string key = DeviceKey(d);
-            if (!seen.Add(key)) continue;   // one reader per identity
-            if (!ShouldMonitor(key, byUsage, d.VendorID == VID)) continue;
-            result.Add((d, key));
+            string path = d.DevicePath;
+            present.Add(path);
+            if (!_devInfo.TryGetValue(path, out var info))
+            {
+                info = Classify(d);
+                if (info == null) continue;   // transient — retry next scan, uncached
+                _devInfo[path] = info;
+            }
+            if (!info.Match) continue;
+            if (!seen.Add(info.Key)) continue;   // one reader per identity
+            if (!ShouldMonitor(info.Key, info.ByUsage, info.OurVid)) continue;
+            result.Add((d, info.Key));
         }
+        // Forget devices that have gone away so the cache can't grow unbounded (and
+        // a reconnect re-inspects).
+        if (_devInfo.Count > present.Count)
+            foreach (var stale in _devInfo.Keys.Where(k => !present.Contains(k)).ToList())
+                _devInfo.Remove(stale);
         return result;
     }
 
