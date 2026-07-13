@@ -626,6 +626,14 @@ public class MainForm : Form
         public int LastRaw;             // last raw value (so a cap change can re-render)
         public bool InMuteZone;         // latched mute-dead-zone state (see Render)
         public int LastApplied = -1;    // last volume % pushed to the device (deadband)
+        // Volume writes are rate-limited through the pump (see FlushPendingVolumes):
+        // each Windows volume-set fans an ETW notification out to every process
+        // registered on Microsoft-Windows-Audio, and suspended packaged apps
+        // (ShellExperienceHost during fullscreen games, notably) never drain
+        // theirs — the kernel queues them in pool (EtwD/Etwr) without bound.
+        // Fewer writes = proportionally less of that system-wide leak.
+        public int VolPending = -1;     // latest % awaiting a write, -1 = none
+        public long VolLastWrite;       // Environment.TickCount64 of the last write
 
         // Ranked output preferences (highest first). The active output is the
         // top-most entry whose device is present; if a higher one (re)appears it
@@ -889,6 +897,9 @@ public class MainForm : Form
         var _cid = CommitId();
         if (!string.IsNullOrEmpty(_cid)) Text += $" — {_cid}";
 #endif
+        // Leak-isolation runs show their mode so results can't be misattributed.
+        var _diag = Program.DiagText();
+        if (_diag.Length != 0) Text += $" {_diag}";
         Icon = LoadAppIcon();
         Font = new Font("Segoe UI", 9.75f);
         ClientSize = new Size(460, 364);
@@ -3002,6 +3013,10 @@ public class MainForm : Form
                     int n;
                     try { n = stream.Read(buf, 0, buf.Length); }
                     catch { break; }   // stream closed (cancel) or device gone
+                    // Leak isolation: consume the report and do nothing — if the
+                    // kernel-pool leak still runs in this mode, the HID read path
+                    // alone is the trigger and nothing downstream matters.
+                    if (Program.DiagSink) continue;
                     // Report id 2: up to eight 16-bit LE axes at bytes 1.. (two
                     // bytes each), then a button byte. Read whatever axes are
                     // present so any number of sliders (1..8) can be driven.
@@ -3060,6 +3075,9 @@ public class MainForm : Form
         {
             var axes = Interlocked.Exchange(ref r.Pending, null);
             if (axes == null) continue;
+            // Synth isolation: drain real reports but let the synthetic motion
+            // below be the only thing driving the sliders.
+            if (Program.DiagSynth) continue;
             if (!_rawByDevice.TryGetValue(r.Key, out var raw) || raw.Length != MaxAxes)
                 _rawByDevice[r.Key] = raw = new int[MaxAxes];
             for (int i = 0; i < axes.Length && i < MaxAxes; i++) raw[i] = axes[i];
@@ -3067,6 +3085,23 @@ public class MainForm : Form
                 if (s.GroupKey == r.Key && s.AxisIndex >= 0 && s.AxisIndex < axes.Length)
                     ApplyAxis(s, axes[s.AxisIndex]);
         }
+        if (Program.DiagSynth) SynthTick();
+        FlushPendingVolumes();
+    }
+
+    // Synthetic fader motion (--diag-synth): sweep every physical slider through
+    // a 2..30% triangle (~1 s per cycle) injected below the HID layer, so the
+    // draw / tray / volume channels run at full per-tick rate with the hardware
+    // untouched. Attributes the kernel-pool leak without hand-riding a fader.
+    double _synthPhase;
+    void SynthTick()
+    {
+        _synthPhase += _faderPump.Interval / 1000.0;
+        double t = _synthPhase % 1.0;
+        double pct = 2 + (t < 0.5 ? t * 2 : (1 - t) * 2) * 28;
+        foreach (var s in _sliders)
+            if (!s.IsVirtual && s.AxisIndex >= 0 && s.Curve.Length > 0)
+                ApplyAxis(s, (int)Math.Round(Calibration.InvEval(s.Curve, pct)));
     }
 
     // A raw jump beyond this (mV) is real movement, not noise — track it exactly.
@@ -3126,7 +3161,8 @@ public class MainForm : Form
 
     void Render(Axis a)
     {
-        UpdateSliderState(a);
+        // no-draw isolation: the muted tint / % color are paint work too.
+        if (!Program.DiagNoDraw) UpdateSliderState(a);
         if (!a.IsVirtual && a.Sm < 0) return;
 
         // Virtual faders drag straight to the final volume (no taper curve, no cap);
@@ -3155,14 +3191,46 @@ public class MainForm : Form
             ? (int)Math.Round(pf)
             : a.LastApplied;
 
-        a.Bar.Value = applied;
-        a.Pct.Text = $"{applied}%";
+        if (!Program.DiagNoDraw)
+        {
+            a.Bar.Value = applied;
+            a.Pct.Text = $"{applied}%";
+        }
 
         if (applied == a.LastApplied) return;
         a.LastApplied = applied;
-        UpdateTrayText();
+        if (!Program.DiagNoDraw && !Program.DiagNoTray) UpdateTrayText();
         if (_calibrating) return;   // visualize, but don't drive anything while calibrating
+        if (Program.DiagNoVolume) return;   // leak isolation: never touch the audio APIs
 
+        // Queue rather than write: FlushPendingVolumes rate-limits the actual
+        // Windows calls (see the VolPending comment for why).
+        a.VolPending = applied;
+    }
+
+    // Minimum gap between volume writes per slider (~20/s). Inaudible vs the
+    // ~60/s the pump can produce, and it cuts the ETW-notification kernel-pool
+    // leak those writes trigger by the same factor.
+    const int MinVolWriteMs = 50;
+
+    // Called every pump tick: write each slider's newest pending volume once
+    // it's out of the rate-limit window. The pump keeps ticking after reports
+    // stop, so the final settled value always lands within MinVolWriteMs.
+    void FlushPendingVolumes()
+    {
+        long now = Environment.TickCount64;
+        foreach (var a in _sliders)
+        {
+            if (a.VolPending < 0 || now - a.VolLastWrite < MinVolWriteMs) continue;
+            int applied = a.VolPending;
+            a.VolPending = -1;
+            a.VolLastWrite = now;
+            WriteVolume(a, applied);
+        }
+    }
+
+    void WriteVolume(Axis a, int applied)
+    {
         float scalar = applied / 100f;
         if (a.Target == TargetKind.App)
         {

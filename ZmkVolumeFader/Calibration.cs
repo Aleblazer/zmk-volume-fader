@@ -58,6 +58,23 @@ internal sealed class Calibration
         return pts;
     }
 
+    // Inverse of Eval: the raw value whose mapped percentage is pct (clamps to
+    // the curve ends). Used by the --diag-synth leak-isolation mode to inject
+    // realistic raw values for a target percentage.
+    public static double InvEval((int v, int pct)[] curve, double pct)
+    {
+        if (curve.Length == 0) return 0;
+        if (pct <= curve[0].pct) return curve[0].v;
+        for (int i = 1; i < curve.Length; i++)
+            if (pct <= curve[i].pct)
+            {
+                var (v0, p0) = curve[i - 1];
+                var (v1, p1) = curve[i];
+                return p1 == p0 ? v1 : v0 + (pct - p0) / (p1 - p0) * (v1 - v0);
+            }
+        return curve[^1].v;
+    }
+
     // Piecewise-linear lookup; clamps to the end points (continuous dead bands).
     public static double Eval((int v, int pct)[] curve, int v)
     {

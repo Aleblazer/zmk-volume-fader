@@ -23,14 +23,49 @@ static class Program
     // handles it — hidden/tray windows receive broadcasts too).
     internal static readonly int WM_SHOWME = RegisterWindowMessage("ZmkVolumeFader.ShowMe");
 
+    // ---- kernel-pool / ETW leak isolation switches ------------------------
+    // The system-wide EtwD/Etwr pool leak tracks a fader actively streaming
+    // reports, but "streaming" drives four distinct channels at once: the HID
+    // read itself, GDI repaints, the tray-icon text, and the audio volume set.
+    // Each switch surgically disables exactly one channel so a leak run can
+    // attribute the flood. Diagnostic-only; no effect unless passed.
+    //   --diag-sink       read + discard HID reports (nothing downstream runs)
+    //   --diag-no-draw    full pipeline, but no bar/label repaints or tray text
+    //   --diag-no-tray    full pipeline, but no tray-icon text updates
+    //   --diag-no-volume  full pipeline + UI, but never touch the audio APIs
+    //   --diag-synth      ignore real reports; synthesize continuous fader motion
+    //                     (2..30% triangle) below the HID layer, so draw/tray/volume
+    //                     run at full rate with the hardware untouched
+    internal static bool DiagSink, DiagNoDraw, DiagNoTray, DiagNoVolume, DiagSynth;
+
+    internal static string DiagText()
+    {
+        var on = new List<string>();
+        if (DiagSink) on.Add("sink");
+        if (DiagNoDraw) on.Add("no-draw");
+        if (DiagNoTray) on.Add("no-tray");
+        if (DiagNoVolume) on.Add("no-volume");
+        if (DiagSynth) on.Add("synth");
+        return on.Count == 0 ? "" : $"[diag: {string.Join(" ", on)}]";
+    }
+
     static string LogPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ZmkVolumeFader", "error.log");
 
     static bool _errorShown;
 
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
+        foreach (var a in args)
+        {
+            if (a.Equals("--diag-sink", StringComparison.OrdinalIgnoreCase)) DiagSink = true;
+            else if (a.Equals("--diag-no-draw", StringComparison.OrdinalIgnoreCase)) DiagNoDraw = true;
+            else if (a.Equals("--diag-no-tray", StringComparison.OrdinalIgnoreCase)) DiagNoTray = true;
+            else if (a.Equals("--diag-no-volume", StringComparison.OrdinalIgnoreCase)) DiagNoVolume = true;
+            else if (a.Equals("--diag-synth", StringComparison.OrdinalIgnoreCase)) DiagSynth = true;
+        }
+
         // Single instance: a second copy would fight over the HID stream, the
         // settings file, and the target volumes. Surface the running one instead.
         using var mutex = new Mutex(true, @"Local\ZmkVolumeFader-single-instance", out bool first);
