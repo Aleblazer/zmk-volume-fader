@@ -9,9 +9,9 @@
     <RootNamespace>ZmkVolumeFader</RootNamespace>
     <AssemblyName>ZmkVolumeFader</AssemblyName>
     <ApplicationIcon>app.ico</ApplicationIcon>
-    <Version>1.4.4</Version>
-    <FileVersion>1.4.4.0</FileVersion>
-    <AssemblyVersion>1.4.4.0</AssemblyVersion>
+    <Version>1.4.5</Version>
+    <FileVersion>1.4.5.0</FileVersion>
+    <AssemblyVersion>1.4.5.0</AssemblyVersion>
     <Product>ZMK Volume Fader</Product>
     <Company>Aleblazer</Company>
     <!-- Per-monitor DPI so WinForms auto-scales the (hand-coded) layout at 125%+
