@@ -18,12 +18,16 @@ sealed class OptionsDialog : Form
     public bool StartWithWindows => _startup.Checked;
     public ThemeMode SelectedTheme => (ThemeMode)Math.Clamp(_themeCombo.SelectedIndex, 0, 2);
     public CloseBehavior SelectedClose => (CloseBehavior)Math.Clamp(_closeCombo.SelectedIndex, 0, 2);
+    public bool SoftTakeover => _softTakeover.Checked;
     // Old -> new names for categories renamed in this Options session (possibly
     // across several visits to Manage Categories); the owner re-points fader
     // targets on Save so a rename doesn't detach them.
     public Dictionary<string, string> CategoryRenames { get; } = new();
     // Set when the user clicks "Set up sliders…"; the owner runs the wizard.
     public bool SetupRequested { get; private set; }
+    public bool ImportRequested { get; private set; }
+    public bool ExportRequested { get; private set; }
+    public bool DiagnosticsRequested { get; private set; }
 
     readonly int _n;
     readonly Calibration[] _cal;
@@ -32,6 +36,7 @@ sealed class OptionsDialog : Form
     List<Category> _categories;
     readonly IReadOnlyDictionary<string, string> _knownApps;
     readonly IReadOnlyDictionary<string, Image?>? _appIcons;
+    readonly IReadOnlySet<string> _liveApps;
     readonly string[] _labels;
     readonly IReadOnlyList<OutputPref> _known;
     readonly string[] _presentIds;
@@ -50,6 +55,7 @@ sealed class OptionsDialog : Form
     readonly bool[] _previewCurveValid;
 
     readonly CheckBox _startup = new() { Text = "Start with Windows", AutoSize = true, FlatStyle = FlatStyle.Standard, Margin = new Padding(0, 0, 0, 0) };
+    readonly CheckBox _softTakeover = new() { Text = "Soft takeover for physical faders", AutoSize = true, FlatStyle = FlatStyle.Standard, Margin = new Padding(0, 6, 0, 0) };
     readonly RoundedComboBox _themeCombo = new() { Width = 190 };
     readonly RoundedComboBox _closeCombo = new() { Width = 190 };
 
@@ -68,15 +74,17 @@ sealed class OptionsDialog : Form
     [DllImport("dwmapi.dll")]
     static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
-    public OptionsDialog(MainForm.Theme theme, ThemeMode themeMode, bool startWithWindows, CloseBehavior closeBehavior,
+    public OptionsDialog(MainForm.Theme theme, ThemeMode themeMode, bool startWithWindows, CloseBehavior closeBehavior, bool softTakeover,
         Calibration[] cals, Func<int>[] raws, List<OutputPref>[] outs, string[] labels,
         IReadOnlyList<OutputPref> known, IEnumerable<string> presentIds,
         List<Category> categories, IReadOnlyDictionary<string, string> knownApps,
-        IReadOnlyDictionary<string, Image?>? appIcons = null, bool[]? virtuals = null)
+        IReadOnlyDictionary<string, Image?>? appIcons = null, bool[]? virtuals = null,
+        IReadOnlySet<string>? liveApps = null)
     {
         AutoScaleDimensions = new SizeF(96f, 96f);
         AutoScaleMode = AutoScaleMode.Dpi;
         _appIcons = appIcons;
+        _liveApps = liveApps ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         _t = theme;
         _n = cals.Length;
         _cal = cals;
@@ -116,7 +124,7 @@ sealed class OptionsDialog : Form
         for (int r = 0; r < rows; r++) _root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         int row = 0;
-        _root.Controls.Add(BuildGeneral(themeMode, startWithWindows, closeBehavior), 0, row++);
+        _root.Controls.Add(BuildGeneral(themeMode, startWithWindows, closeBehavior, softTakeover), 0, row++);
         if (anyPhysical)
             _root.Controls.Add(new Label
             {
@@ -224,20 +232,25 @@ sealed class OptionsDialog : Form
         return t;
     }
 
-    Panel BuildGeneral(ThemeMode mode, bool startup, CloseBehavior close)
+    Panel BuildGeneral(ThemeMode mode, bool startup, CloseBehavior close, bool softTakeover)
     {
         // Auto-size so the wrapped button row (Set up / Set Default Outputs /
         // Manage Categories) is never clipped at any scaling.
         var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 4), Padding = new Padding(12), BackColor = _t.Card };
 
-        var t = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, RowCount = 4, BackColor = Color.Transparent };
+        var t = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, RowCount = 5, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int r = 0; r < 4; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        for (int r = 0; r < 5; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         _startup.ForeColor = _t.Text;
         _startup.BackColor = Color.Transparent;
         _startup.Checked = startup;
         t.Controls.Add(_startup, 0, 0);
+        _softTakeover.ForeColor = _t.Text;
+        _softTakeover.BackColor = Color.Transparent;
+        _softTakeover.Checked = softTakeover;
+        _tip.SetToolTip(_softTakeover, "Prevent sudden jumps by waiting for a physical fader to meet the current Windows volume");
+        t.Controls.Add(_softTakeover, 0, 1);
 
         var themeRow = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 8, 0, 0) };
         themeRow.Controls.Add(new Label { Text = "Theme", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(0, 6, 8, 0) });
@@ -247,7 +260,7 @@ sealed class OptionsDialog : Form
         _themeCombo.Items.AddRange(ThemeItems);
         _themeCombo.SelectedIndex = Math.Clamp((int)mode, 0, ThemeItems.Length - 1);
         themeRow.Controls.Add(_themeCombo);
-        t.Controls.Add(themeRow, 0, 1);
+        t.Controls.Add(themeRow, 0, 2);
 
         // What the window's X button does (ask / tray / exit).
         var closeRow = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 8, 0, 0) };
@@ -258,18 +271,18 @@ sealed class OptionsDialog : Form
         _closeCombo.Items.AddRange(CloseItems);
         _closeCombo.SelectedIndex = Math.Clamp((int)close, 0, CloseItems.Length - 1);
         closeRow.Controls.Add(_closeCombo);
-        t.Controls.Add(closeRow, 0, 2);
+        t.Controls.Add(closeRow, 0, 3);
 
         // Setup wizard, ranked-output editor, and category editor. A 2-column
         // table (not a wrapping FlowLayoutPanel — that mis-sizes its height inside
         // an auto-size parent) keeps the card tight to its content.
-        var btnGrid = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, RowCount = 2, BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
+        var btnGrid = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, RowCount = 3, BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
         btnGrid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         btnGrid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        var setupBtn = MakeButton("Set up sliders…", accent: false, surround: _t.Card);
+        var setupBtn = MakeButton("Configure faders…", accent: false, surround: _t.Card);
         setupBtn.Margin = new Padding(0, 0, 6, 6);
         setupBtn.Click += (_, _) => { SetupRequested = true; DialogResult = DialogResult.OK; Close(); };
-        var outBtn = MakeButton("Set Default Outputs…", accent: false, surround: _t.Card);
+        var outBtn = MakeButton("Output fallback order…", accent: false, surround: _t.Card);
         outBtn.Margin = new Padding(0, 0, 0, 6);
         outBtn.Click += (_, _) => OpenOutputs();
         var catBtn = MakeButton("Manage Categories…", accent: false, surround: _t.Card);
@@ -278,7 +291,19 @@ sealed class OptionsDialog : Form
         btnGrid.Controls.Add(setupBtn, 0, 0);
         btnGrid.Controls.Add(outBtn, 1, 0);
         btnGrid.Controls.Add(catBtn, 0, 1);
-        t.Controls.Add(btnGrid, 0, 3);
+        var diagnosticsBtn = MakeButton("Diagnostics…", accent: false, surround: _t.Card);
+        diagnosticsBtn.Margin = new Padding(0, 0, 0, 6);
+        diagnosticsBtn.Click += (_, _) => { DiagnosticsRequested = true; DialogResult = DialogResult.Cancel; Close(); };
+        btnGrid.Controls.Add(diagnosticsBtn, 1, 1);
+        var importBtn = MakeButton("Import settings…", accent: false, surround: _t.Card);
+        importBtn.Margin = new Padding(0, 0, 6, 0);
+        importBtn.Click += (_, _) => { ImportRequested = true; DialogResult = DialogResult.Cancel; Close(); };
+        var exportBtn = MakeButton("Export settings…", accent: false, surround: _t.Card);
+        exportBtn.Margin = new Padding(0);
+        exportBtn.Click += (_, _) => { ExportRequested = true; DialogResult = DialogResult.Cancel; Close(); };
+        btnGrid.Controls.Add(importBtn, 0, 2);
+        btnGrid.Controls.Add(exportBtn, 1, 2);
+        t.Controls.Add(btnGrid, 0, 4);
 
         card.Controls.Add(t);
         return card;
@@ -293,7 +318,7 @@ sealed class OptionsDialog : Form
 
     void OpenCategories()
     {
-        using var dlg = new CategoriesDialog(_t, _categories, _knownApps, _appIcons);
+        using var dlg = new CategoriesDialog(_t, _categories, _knownApps, _appIcons, _liveApps);
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
         _categories = dlg.Result;
         // Merge into the session's rename map, chaining across repeat visits

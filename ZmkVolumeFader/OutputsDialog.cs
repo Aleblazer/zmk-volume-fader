@@ -4,7 +4,7 @@ using NAudio.CoreAudioApi;
 namespace ZmkVolumeFader;
 
 /// <summary>
-/// Ranked output editor reached from Options ("Set Default Outputs…"). Each slider
+/// Ranked output editor reached from Options ("Output fallback order…"). Each slider
 /// gets an ordered list of outputs; the app drives the highest one that's plugged
 /// in and switches automatically as devices come and go. Reorder with the arrows,
 /// remove with ✕, and add from the picker (which lists every known output,
@@ -45,7 +45,7 @@ sealed class OutputsDialog : Form
         _present = new HashSet<string>(presentIds);
         _list = new ListBox[_n]; _add = new RoundedComboBox[_n]; _addBtn = new RoundedButton[_n];
 
-        Text = "Set Default Outputs";
+        Text = "Output Fallback Order";
         Font = UiFonts.Get(9.75f);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;

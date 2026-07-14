@@ -16,13 +16,15 @@ sealed class CategoriesDialog : Form
     public Dictionary<string, string> Renamed { get; } = new();
 
     readonly MainForm.Theme _t;
-    readonly (string Key, string Name)[] _apps;   // all seen apps, sorted by name
+    readonly (string Key, string Name, bool Live)[] _apps;   // all seen apps, sorted by name
+    readonly List<(string Key, string Name, bool Live)> _filteredApps = new();
     readonly IReadOnlyDictionary<string, Image?>? _appIcons;
     // Each clone's name when the dialog opened (keys are the Result objects).
     readonly Dictionary<Category, string> _origNames = new();
     int _lastCat = -1;   // previously-selected index, for commit-on-selection-change
 
     readonly TextBox _name = new() { BorderStyle = BorderStyle.FixedSingle };
+    readonly TextBox _search = new() { BorderStyle = BorderStyle.FixedSingle, PlaceholderText = "Search apps…" };
     readonly ListBox _catList = new() { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, BorderStyle = BorderStyle.FixedSingle, IntegralHeight = false };
     readonly ListBox _appList = new() { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, BorderStyle = BorderStyle.FixedSingle, IntegralHeight = false };
 
@@ -32,7 +34,7 @@ sealed class CategoriesDialog : Form
     static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
     public CategoriesDialog(MainForm.Theme t, List<Category> categories, IReadOnlyDictionary<string, string> knownApps,
-        IReadOnlyDictionary<string, Image?>? appIcons = null)
+        IReadOnlyDictionary<string, Image?>? appIcons = null, IReadOnlySet<string>? liveApps = null)
     {
         AutoScaleDimensions = new SizeF(96f, 96f);
         AutoScaleMode = AutoScaleMode.Dpi;
@@ -40,7 +42,9 @@ sealed class CategoriesDialog : Form
         _appIcons = appIcons;
         Result = categories.Select(c => new Category { Name = c.Name, AppKeys = new(c.AppKeys) }).ToList();
         foreach (var c in Result) _origNames[c] = c.Name;
-        _apps = knownApps.Select(kv => (kv.Key, kv.Value)).OrderBy(a => a.Value, StringComparer.OrdinalIgnoreCase).ToArray();
+        _apps = knownApps.Select(kv => (kv.Key, kv.Value, liveApps?.Contains(kv.Key) == true))
+            .OrderBy(a => a.Value, StringComparer.OrdinalIgnoreCase).ToArray();
+        _filteredApps.AddRange(_apps);
 
         Text = "Manage Categories";
         Font = UiFonts.Get(9.75f);
@@ -51,12 +55,13 @@ sealed class CategoriesDialog : Form
         ClientSize = new Size(440, 540);
         BackColor = _t.Window;
 
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 6, Padding = new Padding(14), BackColor = Color.Transparent };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 7, Padding = new Padding(14), BackColor = Color.Transparent };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // name row
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // new/rename/delete
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 116)); // categories list
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // "apps in category"
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // app search
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));  // apps list
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // save/cancel
 
@@ -83,17 +88,24 @@ sealed class CategoriesDialog : Form
 
         root.Controls.Add(new Label { Text = "Apps in this category — click to toggle:", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(0, 0, 0, 4) }, 0, 3);
 
+        _search.BackColor = _t.CtlBg;
+        _search.ForeColor = _t.Text;
+        _search.Dock = DockStyle.Fill;
+        _search.Margin = new Padding(0, 0, 0, 6);
+        _search.TextChanged += (_, _) => RebuildAppFilter();
+        root.Controls.Add(_search, 0, 4);
+
         _appList.BackColor = _t.CtlBg; _appList.ForeColor = _t.Text; _appList.Dock = DockStyle.Fill; _appList.Margin = new Padding(0);
         _appList.DrawItem += (s, e) => DrawApp(e);
         _appList.MouseDown += (s, e) => ToggleApp(_appList.IndexFromPoint(e.Location));
-        foreach (var a in _apps) _appList.Items.Add(a.Name);
-        root.Controls.Add(_appList, 0, 4);
+        foreach (var a in _filteredApps) _appList.Items.Add(AppText(a));
+        root.Controls.Add(_appList, 0, 5);
 
         var btnRow = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
         var save = MakeButton("Save", true); save.Click += (_, _) => { CommitName(); CollectRenames(); DialogResult = DialogResult.OK; Close(); };
         var cancel = MakeButton("Cancel", false); cancel.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
         btnRow.Controls.Add(save); btnRow.Controls.Add(cancel);
-        root.Controls.Add(btnRow, 0, 5);
+        root.Controls.Add(btnRow, 0, 6);
 
         Controls.Add(root);
         CancelButton = cancel;
@@ -194,8 +206,23 @@ sealed class CategoriesDialog : Form
     void ToggleApp(int index)
     {
         if (index < 0 || Selected is not { } c) return;
-        string key = _apps[index].Key;
-        if (!c.AppKeys.Remove(key)) c.AppKeys.Add(key);
+        string key = _filteredApps[index].Key;
+        int removed = c.AppKeys.RemoveAll(k => k.Equals(key, StringComparison.OrdinalIgnoreCase));
+        if (removed == 0) c.AppKeys.Add(key);
+        _appList.Invalidate();
+    }
+
+    void RebuildAppFilter()
+    {
+        string query = _search.Text.Trim();
+        _filteredApps.Clear();
+        _filteredApps.AddRange(query.Length == 0 ? _apps : _apps.Where(a =>
+            a.Name.Contains(query, StringComparison.OrdinalIgnoreCase)
+            || a.Key.Contains(query, StringComparison.OrdinalIgnoreCase)));
+        _appList.BeginUpdate();
+        _appList.Items.Clear();
+        foreach (var app in _filteredApps) _appList.Items.Add(AppText(app));
+        _appList.EndUpdate();
         _appList.Invalidate();
     }
 
@@ -214,17 +241,19 @@ sealed class CategoriesDialog : Form
     void DrawApp(DrawItemEventArgs e)
     {
         if (e.Index < 0) { e.DrawBackground(); return; }
-        bool member = Selected != null && Selected.AppKeys.Contains(_apps[e.Index].Key);
+        if (e.Index >= _filteredApps.Count) return;
+        var app = _filteredApps[e.Index];
+        bool member = Selected != null && Selected.AppKeys.Contains(app.Key, StringComparer.OrdinalIgnoreCase);
         bool sel = (e.State & DrawItemState.Selected) != 0;
         using (var b = new SolidBrush(sel ? _t.Accent : _t.CtlBg)) e.Graphics.FillRectangle(b, e.Bounds);
-        Color fg = sel ? AccentText() : _t.Text;
+        Color fg = sel ? AccentText() : app.Live ? _t.Text : _t.Subtle;
         // Checkbox glyph in a fixed lead column.
         var boxRect = new Rectangle(e.Bounds.X + LogicalToDeviceUnits(6), e.Bounds.Y, LogicalToDeviceUnits(20), e.Bounds.Height);
         TextRenderer.DrawText(e.Graphics, member ? "☑" : "☐", _appList.Font, boxRect, fg,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
         int left = boxRect.Right + LogicalToDeviceUnits(2);
         // App icon, if we have one.
-        if (_appIcons != null && _appIcons.TryGetValue(_apps[e.Index].Key, out var img) && img != null)
+        if (_appIcons != null && _appIcons.TryGetValue(app.Key, out var img) && img != null)
         {
             int isz = LogicalToDeviceUnits(18);
             var ir = new Rectangle(left, e.Bounds.Y + (e.Bounds.Height - isz) / 2, isz, isz);
@@ -233,9 +262,12 @@ sealed class CategoriesDialog : Form
             left = ir.Right + LogicalToDeviceUnits(5);
         }
         var r = new Rectangle(left, e.Bounds.Y, e.Bounds.Right - left - 2, e.Bounds.Height);
-        TextRenderer.DrawText(e.Graphics, _apps[e.Index].Name, _appList.Font, r, fg,
+        TextRenderer.DrawText(e.Graphics, AppText(app), _appList.Font, r, fg,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
     }
+
+    static string AppText((string Key, string Name, bool Live) app) =>
+        app.Live ? app.Name : $"{app.Name}  (not running)";
 
     RoundedButton MakeButton(string text, bool accent)
     {

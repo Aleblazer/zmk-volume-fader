@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using HidSharp;
 using Microsoft.Win32;
@@ -142,6 +144,7 @@ public class MainForm : Form
     Theme _theme = LightTheme;
     ThemeMode _themeMode = ThemeMode.Auto;   // Auto follows the OS; Light/Dark force it
     CloseBehavior _closeBehavior = CloseBehavior.Ask;   // what the X button does
+    bool _softTakeover = true;               // require a physical fader to meet the current Windows volume first
 
     // ---- custom controls --------------------------------------------------
 
@@ -156,11 +159,25 @@ public class MainForm : Form
         public Color Track { get; set; } = Color.Gray;       // unfilled groove
         public Color Fill { get; set; } = Color.LimeGreen;   // green (low)
         public Color Mid { get; set; } = Color.FromArgb(0xF2, 0xC4, 0x3D);   // yellow (mid)
-        public Color Hot { get; set; } = Color.FromArgb(0xE0, 0x4F, 0x4F);   // red (high)
+        public Color Hot { get; set; } = Color.FromArgb(0xF0, 0x8A, 0x3C);   // warm orange (high)
         public Color Knob { get; set; } = Color.White;
         public Color KnobEdge { get; set; } = Color.Gray;
         public Color Tick { get; set; } = Color.Gray;
         public bool ShowTicks { get; set; } = true;
+        int? _pickupPosition;
+        // While soft takeover is armed, Value is the current Windows level and
+        // this marker shows where the physical fader currently sits.
+        public int? PickupPosition
+        {
+            get => _pickupPosition;
+            set
+            {
+                int? v = value is null ? null : Math.Clamp(value.Value, 0, 100);
+                if (v == _pickupPosition) return;
+                _pickupPosition = v;
+                Invalidate();
+            }
+        }
         // When true the fill/knob are drawn desaturated — the target isn't being
         // driven right now (unit unplugged, or an app target that isn't playing).
         bool _muted;
@@ -340,6 +357,20 @@ public class MainForm : Form
                 float px = w - 7f;
                 g.DrawLine(sp, px - 3.5f, cy, px + 3.5f, cy);        // plus (horizontal)
                 g.DrawLine(sp, px, cy - 3.5f, px, cy + 3.5f);        // plus (vertical)
+            }
+
+            // Soft-takeover marker: a small outlined diamond at the physical
+            // position, while the main knob remains at the Windows volume.
+            if (_pickupPosition is int pickup)
+            {
+                float px = left + (right - left) * pickup / 100f;
+                float r = Math.Max(3.5f, knobR * 0.48f);
+                PointF[] diamond =
+                {
+                    new(px, cy - r), new(px + r, cy), new(px, cy + r), new(px - r, cy),
+                };
+                using var pp = new Pen(Knob, 1.8f) { LineJoin = LineJoin.Round };
+                g.DrawPolygon(pp, diamond);
             }
 
             // Knob: soft shadow, light body, themed edge, center dot tinted to level.
@@ -540,7 +571,8 @@ public class MainForm : Form
     {
         public required string Key;
         public required string Name;
-        public override string ToString() => Name;
+        public bool Live;
+        public override string ToString() => Live ? Name : $"{Name}  (not running)";
     }
 
     // A target that is a category of apps.
@@ -572,9 +604,10 @@ public class MainForm : Form
     // (System Sounds counts as unassigned on purpose.)
     IEnumerable<string> UnassignedKeys() =>
         _liveApps.Where(k =>
-            !_categories.Any(c => c.AppKeys.Contains(k))
+            !_categories.Any(c => c.AppKeys.Contains(k, StringComparer.OrdinalIgnoreCase))
             && !_sliders.Any(s => IsFaderConnected(s)
-                                  && s.Target == TargetKind.App && s.AppKey == k));
+                                  && s.Target == TargetKind.App
+                                  && string.Equals(s.AppKey, k, StringComparison.OrdinalIgnoreCase)));
 
     // Fires a callback whenever the set of audio endpoints changes (plug/unplug,
     // enable/disable) so the app can re-pick each fader's active output live.
@@ -602,6 +635,8 @@ public class MainForm : Form
         public RoundedButton[] Tabs = Array.Empty<RoundedButton>();  // Output/Apps/Categories
         public RoundedButton? Remove;   // virtual faders only: the delete button
         public RoundedButton? Hotkey;   // virtual faders only: opens the hotkey dialog
+        public RoundedButton? Mute;
+        public RoundedButton? Reset;    // virtual faders only: return to 100%
         // Which fader group (device) this slider belongs to — a device key for
         // physical faders, or VirtualKey for the virtual home. Axis reports from a
         // device only drive sliders whose GroupKey matches, so two devices can be
@@ -616,6 +651,13 @@ public class MainForm : Form
         public double VCur = 50;
         public bool VMuted;
         public int VPreMute = 50;       // level to restore when unmuting
+        // Physical soft takeover: Windows stays at PickupTarget until the real
+        // fader reaches/crosses it. PickupPosition is the previous mapped sample.
+        public bool PickupArmed;
+        public bool PickupReady;
+        public int PickupTarget;
+        public int? PickupPosition;
+        public int PickupGeneration;
         // Per-fader hotkey bindings + step (virtual faders only; persisted).
         public Hotkey HkUp = new(), HkDown = new(), HkMute = new();
         public int Step = 5;
@@ -738,6 +780,7 @@ public class MainForm : Form
         public List<Category> Categories { get; set; } = new();
         public ThemeMode ThemeMode { get; set; } = ThemeMode.Auto;
         public CloseBehavior CloseBehavior { get; set; } = CloseBehavior.Ask;
+        public bool SoftTakeover { get; set; } = true;
         // App-key -> unix seconds last seen with a live session (for pruning).
         public Dictionary<string, long> AppSeen { get; set; } = new();
         // Explicit per-device monitoring overrides. By default a unit is monitored
@@ -801,22 +844,23 @@ public class MainForm : Form
         => _allowedSnap.Contains(key) || (!_ignoredSnap.Contains(key) && DefaultMonitor(byUsage, ourVid));
 
     // App-volume tracking. _knownApps is every app ever seen in the mixer
-    // (persisted, keyed by process name); _liveApps is supplied by the
+    // (persisted, keyed by executable identity with a process-name fallback);
+    // _liveApps is supplied by the
     // event-driven AudioController; the target combos list
     // both outputs and known apps.
-    readonly Dictionary<string, string> _knownApps = new();
+    readonly Dictionary<string, string> _knownApps = new(StringComparer.OrdinalIgnoreCase);
     HashSet<string> _liveApps = new();   // apps with a session right now (i.e. in the mixer)
     // App-key -> extracted 16px exe icon (null once = couldn't extract, retried
     // up to IconTryMax times). Kept for the app lifetime.
-    readonly Dictionary<string, Image?> _appIcons = new();
+    readonly Dictionary<string, Image?> _appIcons = new(StringComparer.OrdinalIgnoreCase);
     // App-key -> failed extraction attempts, so an inaccessible exe (elevated
     // process, missing file) isn't re-tried on every 1s poll forever.
-    readonly Dictionary<string, int> _iconTries = new();
+    readonly Dictionary<string, int> _iconTries = new(StringComparer.OrdinalIgnoreCase);
     const int IconTryMax = 3;
     // App-key -> unix seconds the app last had a live session (persisted).
     // PruneKnownApps drops long-unseen, unreferenced apps at startup so the
     // known-apps list and icon cache don't grow forever.
-    readonly Dictionary<string, long> _appSeen = new();
+    readonly Dictionary<string, long> _appSeen = new(StringComparer.OrdinalIgnoreCase);
     List<Category> _categories = new();
     AudioController? _audio;
     System.Windows.Forms.Timer? _audioStats;
@@ -893,6 +937,8 @@ public class MainForm : Form
     readonly AutoResetEvent _discoveryWake = new(false);
     EventHandler<DeviceListChangedEventArgs>? _hidChanged;
     Thread? _discoveryThread;
+    long _hidReportCount;
+    long _desiredSnapshotCount;
     volatile bool _run;
     bool _loadingSettings;
     bool _calibrating;   // true while the calibration dialog is open (don't drive devices)
@@ -1167,18 +1213,28 @@ public class MainForm : Form
         t.Controls.Add(combo, 0, 3);
         // Physical faders show a Max % cap; virtual faders drag straight to the
         // final volume (no cap needed) and show Hotkeys + Remove buttons instead.
+        axis.Mute = MuteButton(axis);
         if (isVirtual)
         {
+            axis.Reset = ResetButton(axis);
             axis.Hotkey = HotkeyButton(axis);
             axis.Remove = RemoveButton(axis);
             // Compact side-by-side (Hotkeys + a small ✕) so the cell is about as
             // wide as the physical cards' "Max %" and doesn't widen the card.
             var vbtns = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Anchor = AnchorStyles.Right, Margin = new Padding(10, 0, 0, 0) };
+            vbtns.Controls.Add(axis.Mute);
+            vbtns.Controls.Add(axis.Reset);
             vbtns.Controls.Add(axis.Hotkey);
             vbtns.Controls.Add(axis.Remove);
             t.Controls.Add(vbtns, 1, 3);
         }
-        else t.Controls.Add(MaxCap(limit), 1, 3);
+        else
+        {
+            var controls = MaxCap(limit);
+            axis.Mute.Margin = new Padding(8, 0, 0, 0);
+            controls.Controls.Add(axis.Mute);
+            t.Controls.Add(controls, 1, 3);
+        }
         card.Controls.Add(t);
 
         combo.SelectedIndexChanged += (_, _) => OnDevicePicked(axis);
@@ -1206,6 +1262,33 @@ public class MainForm : Form
             limit.ValueChanged += (_, _) => OnLimitChanged(axis);
         }
         return axis;
+    }
+
+    RoundedButton MuteButton(Axis axis)
+    {
+        var b = new RoundedButton
+        {
+            Text = "Mute", AutoSize = true, Font = UiFonts.Get(8.25f),
+            Padding = new Padding(8, 4, 8, 4), Margin = new Padding(0, 0, 4, 0),
+            Anchor = AnchorStyles.None, Radius = 7, AccessibleName = "Mute fader",
+        };
+        b.Click += (_, _) => ToggleMute(axis);
+        _tip.SetToolTip(b, "Mute this fader's target; click again to restore it");
+        return b;
+    }
+
+    RoundedButton ResetButton(Axis axis)
+    {
+        var b = new RoundedButton
+        {
+            Text = "↺", AutoSize = false, Font = UiFonts.Get(10f),
+            Size = new Size(26, 26), Margin = new Padding(0, 0, 4, 0),
+            Anchor = AnchorStyles.None, Radius = 7,
+            AccessibleName = "Reset fader to 100 percent",
+        };
+        b.Click += (_, _) => ResetVirtual(axis);
+        _tip.SetToolTip(b, "Reset this virtual fader to 100%");
+        return b;
     }
 
     // Small buttons shown on a virtual fader's card (where a physical fader shows
@@ -1289,6 +1372,7 @@ public class MainForm : Form
         a.LastApplied = -1;
         TakeTargetOwnership(a);
         ApplyActive(a);
+        ArmPickup(a);
         if (!_loadingSettings) SaveSettings();
     }
 
@@ -1398,7 +1482,7 @@ public class MainForm : Form
             var u = s.Limit;
             u.BackColor = t.CtlBg; u.ForeColor = t.Text; u.BorderColor = t.CtlBorder; u.ChevronColor = t.Subtle; u.Surround = t.Card; u.Invalidate();
 
-            foreach (var vb in new[] { s.Remove, s.Hotkey })
+            foreach (var vb in new[] { s.Remove, s.Hotkey, s.Mute, s.Reset })
                 if (vb is { } btn)
                 {
                     btn.BackColor = t.CtlBg; btn.ForeColor = t.Text;
@@ -1443,6 +1527,7 @@ public class MainForm : Form
         _scroll.Invalidate();
 
         SetTitleBarDark(t.Dark);
+        UpdateConflictHints();
         RefreshStatus();   // recompute the dot/text colour for the current state
     }
 
@@ -1468,6 +1553,7 @@ public class MainForm : Form
         if (e.Index >= 0)
         {
             var item = cb.Items[e.Index];
+            if (!hi && item is AppItem { Live: false }) fg = _theme.Subtle;
             int isz = LogicalToDeviceUnits(18);
             var ir = new Rectangle(e.Bounds.X + LogicalToDeviceUnits(5), e.Bounds.Y + (e.Bounds.Height - isz) / 2, isz, isz);
             DrawComboIcon(e.Graphics, ir, item, fg);
@@ -1725,6 +1811,49 @@ public class MainForm : Form
         foreach (var s in _sliders) PopulateCombo(s);
         _applyingActive = false;
         foreach (var s in _sliders) ApplyActive(s);
+        UpdateConflictHints();
+    }
+
+    HashSet<string> ConfiguredTargetKeys(Axis a)
+    {
+        var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!IsFaderConnected(a)) return keys;
+        if (a.Target == TargetKind.Output)
+        {
+            if (Resolve(a) is string id) keys.Add($"output:{id}");
+        }
+        else if (a.Target == TargetKind.App)
+        {
+            if (a.AppKey != null) keys.Add($"app:{a.AppKey}");
+        }
+        else if (a.CategoryName == UnassignedCategory)
+        {
+            foreach (string key in _knownApps.Keys.Where(k =>
+                         !_categories.Any(c => c.AppKeys.Contains(k, StringComparer.OrdinalIgnoreCase))
+                         && !_sliders.Any(s => s != a && IsFaderConnected(s)
+                             && s.Target == TargetKind.App
+                             && string.Equals(s.AppKey, k, StringComparison.OrdinalIgnoreCase))))
+                keys.Add($"app:{key}");
+        }
+        else if (_categories.FirstOrDefault(c => c.Name == a.CategoryName) is { } category)
+            foreach (string key in category.AppKeys) keys.Add($"app:{key}");
+        return keys;
+    }
+
+    void UpdateConflictHints()
+    {
+        var targets = _sliders.ToDictionary(a => a, ConfiguredTargetKeys);
+        foreach (var a in _sliders)
+        {
+            var conflicts = _sliders.Where(other => other != a && targets[a].Overlaps(targets[other]))
+                .Select(other => other.Name.Text).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            bool conflict = conflicts.Length > 0;
+            a.Combo.BorderColor = conflict ? Color.FromArgb(0xF0, 0x8A, 0x3C) : _theme.CtlBorder;
+            a.Combo.Invalidate();
+            _tip.SetToolTip(a.Combo, conflict
+                ? $"Also controlled by {string.Join(", ", conflicts)}. The most recently moved fader wins."
+                : "Pick what this fader controls");
+        }
     }
 
     // Fill one slider's combo with the items for its active tab.
@@ -1743,7 +1872,12 @@ public class MainForm : Form
                 var keys = _liveApps.ToHashSet();
                 if (a.AppKey != null) keys.Add(a.AppKey);
                 cb.Items.AddRange(keys
-                    .Select(k => new AppItem { Key = k, Name = _knownApps.TryGetValue(k, out var nm) ? nm : k })
+                    .Select(k => new AppItem
+                    {
+                        Key = k,
+                        Name = _knownApps.TryGetValue(k, out var nm) ? nm : k,
+                        Live = _liveApps.Contains(k),
+                    })
                     .OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase)
                     .Cast<object>().ToArray());
                 break;
@@ -1817,6 +1951,7 @@ public class MainForm : Form
                     "Windows audio control was interrupted and is reconnecting.", ToolTipIcon.Warning);
             });
         });
+        ArmAllPhysicalPickups();
         PublishDesiredVolumes();
         if (Program.DiagAudioStats)
         {
@@ -1900,11 +2035,14 @@ public class MainForm : Form
     {
         bool namesChanged = false;
         bool iconsChanged = false;
+        bool identitiesChanged = false;
         long nowSec = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
         foreach (var app in snapshot)
         {
             string key = app.Key;
+            if (!key.Equals(app.LegacyKey, StringComparison.OrdinalIgnoreCase))
+                identitiesChanged |= MigrateAppIdentity(app.LegacyKey, key);
             _appSeen[key] = nowSec;
             if (key == SystemAppKey)
             {
@@ -1948,19 +2086,82 @@ public class MainForm : Form
             }
         }
 
+        var previousLive = _liveApps;
         var live = new HashSet<string>(snapshot.Select(a => a.Key), StringComparer.OrdinalIgnoreCase);
         bool liveChanged = !live.SetEquals(_liveApps);
         _liveApps = live;
-        if (namesChanged || liveChanged)
+        if (namesChanged || identitiesChanged || liveChanged)
         {
-            if (namesChanged) SaveSettings();
+            if (namesChanged || identitiesChanged) SaveSettings();
             PopulateCombos();
         }
         else if (iconsChanged)
             foreach (var s in _sliders) s.Combo.Invalidate();
 
+        if (liveChanged)
+        {
+            var added = live.Where(k => !previousLive.Contains(k)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var a in _sliders.Where(a => !a.IsVirtual && TargetIncludesAny(a, added)))
+                ArmPickup(a, publish: false);
+        }
+
         UpdateAllSliderStates();
         PublishDesiredVolumes();
+    }
+
+    // Upgrade legacy process-name assignments to an executable identity when a
+    // live session gives us one. Existing categories, faders, icons, and history
+    // follow the migration automatically.
+    bool MigrateAppIdentity(string oldKey, string newKey)
+    {
+        if (oldKey.Equals(newKey, StringComparison.OrdinalIgnoreCase)) return false;
+        bool changed = false;
+
+        if (_knownApps.Remove(oldKey, out string? oldName))
+        {
+            _knownApps.TryAdd(newKey, oldName);
+            changed = true;
+        }
+        if (_appSeen.Remove(oldKey, out long oldSeen))
+        {
+            _appSeen[newKey] = Math.Max(oldSeen, _appSeen.GetValueOrDefault(newKey));
+            changed = true;
+        }
+        if (_iconTries.Remove(oldKey, out int tries))
+            _iconTries[newKey] = Math.Max(tries, _iconTries.GetValueOrDefault(newKey));
+        if (_appIcons.Remove(oldKey, out var oldIcon))
+        {
+            bool transferred = false;
+            if (!_appIcons.TryGetValue(newKey, out var current) || current == null)
+            { _appIcons[newKey] = oldIcon; transferred = true; }
+            else if (oldIcon != null && !ReferenceEquals(oldIcon, current))
+                oldIcon.Dispose();
+            if (transferred && oldIcon != null) SaveIconFile(newKey, oldIcon);
+            changed = true;
+        }
+
+        foreach (var category in _categories)
+        {
+            bool replaced = false;
+            for (int i = 0; i < category.AppKeys.Count; i++)
+                if (category.AppKeys[i].Equals(oldKey, StringComparison.OrdinalIgnoreCase))
+                { category.AppKeys[i] = newKey; replaced = true; }
+            if (!replaced) continue;
+            category.AppKeys = category.AppKeys.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            changed = true;
+        }
+        foreach (var axis in _sliders)
+            if (axis.AppKey?.Equals(oldKey, StringComparison.OrdinalIgnoreCase) == true)
+            { axis.AppKey = newKey; changed = true; }
+        foreach (var profile in _devices.Values)
+            foreach (var config in profile.Sliders)
+                if (config.AppKey?.Equals(oldKey, StringComparison.OrdinalIgnoreCase) == true)
+                { config.AppKey = newKey; changed = true; }
+
+        string oldIconFile = IconFile(oldKey);
+        if (!oldIconFile.Equals(IconFile(newKey), StringComparison.OrdinalIgnoreCase))
+            try { File.Delete(oldIconFile); } catch { }
+        return changed;
     }
 
     // The friendly display name (exe FileDescription, else process name) and exe
@@ -2016,8 +2217,16 @@ public class MainForm : Form
     // Icons are cached to disk so a known app shows its real icon even when it
     // isn't currently running (extracted while it was open, kept across restarts).
     static string IconDir => Path.Combine(SettingsDir, "icons");
-    static string IconFile(string key) =>
-        Path.Combine(IconDir, string.Concat(key.Select(c => Array.IndexOf(Path.GetInvalidFileNameChars(), c) < 0 ? c : '_')) + ".png");
+    static string IconFile(string key)
+    {
+        if (key.StartsWith("exe:", StringComparison.OrdinalIgnoreCase))
+        {
+            string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key))).ToLowerInvariant();
+            return Path.Combine(IconDir, $"exe-{hash}.png");
+        }
+        return Path.Combine(IconDir,
+            string.Concat(key.Select(c => Array.IndexOf(Path.GetInvalidFileNameChars(), c) < 0 ? c : '_')) + ".png");
+    }
 
     static void SaveIconFile(string key, Image img)
     {
@@ -2087,6 +2296,102 @@ public class MainForm : Form
     string? Resolve(Axis a) =>
         a.OverrideId != null && _present.ContainsKey(a.OverrideId) ? a.OverrideId : AutoTarget(a);
 
+    bool TargetIncludesAny(Axis a, HashSet<string> appKeys)
+    {
+        if (a.Target == TargetKind.App) return a.AppKey != null && appKeys.Contains(a.AppKey);
+        if (a.Target != TargetKind.Category) return false;
+        if (a.CategoryName == UnassignedCategory) return UnassignedKeys().Any(appKeys.Contains);
+        return _categories.FirstOrDefault(c => c.Name == a.CategoryName)?.AppKeys.Any(appKeys.Contains) == true;
+    }
+
+    void PickupTargetKeys(Axis a, out string[] endpoints, out string[] apps)
+    {
+        endpoints = Array.Empty<string>();
+        apps = Array.Empty<string>();
+        if (a.Target == TargetKind.Output)
+        {
+            if (Resolve(a) is string id) endpoints = new[] { id };
+        }
+        else if (a.Target == TargetKind.App)
+        {
+            if (a.AppKey != null && _liveApps.Contains(a.AppKey)) apps = new[] { a.AppKey };
+        }
+        else if (a.CategoryName == UnassignedCategory)
+            apps = UnassignedKeys().ToArray();
+        else
+            apps = _categories.FirstOrDefault(c => c.Name == a.CategoryName)?.AppKeys
+                .Where(_liveApps.Contains).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
+                ?? Array.Empty<string>();
+    }
+
+    void ArmAllPhysicalPickups()
+    {
+        foreach (var a in _sliders.Where(a => !a.IsVirtual)) ArmPickup(a, publish: false);
+    }
+
+    void ArmPickup(Axis a, bool publish = true)
+    {
+        if (!_softTakeover)
+        {
+            CancelPickup(a);
+            return;
+        }
+        if (a.IsVirtual || a.VMuted || _audio == null || !IsFaderConnected(a)) return;
+        PickupTargetKeys(a, out var endpoints, out var apps);
+        if (endpoints.Length == 0 && apps.Length == 0) { CancelPickup(a); return; }
+
+        int generation = ++a.PickupGeneration;
+        a.PickupArmed = true;
+        a.PickupReady = false;
+        a.PickupPosition = null;
+        if (!Program.DiagNoDraw)
+        {
+            a.Pct.Text = "Syncing…";
+            a.Pct.ForeColor = _theme.Accent;
+        }
+        if (publish) PublishDesiredVolumes();
+
+        if (_audio.RequestCurrentVolumes(endpoints, apps, snapshot => SafeUi(() =>
+            CompletePickup(a, generation, endpoints, apps, snapshot)))) return;
+        CancelPickup(a);
+    }
+
+    void CompletePickup(Axis a, int generation, string[] endpoints, string[] apps,
+        AudioController.VolumeSnapshot snapshot)
+    {
+        if (a.PickupGeneration != generation || !a.PickupArmed) return;
+        var values = endpoints.Where(snapshot.Endpoints.ContainsKey).Select(id => snapshot.Endpoints[id])
+            .Concat(apps.Where(snapshot.Apps.ContainsKey).Select(key => snapshot.Apps[key]))
+            .ToArray();
+        if (values.Length == 0)
+        {
+            CancelPickup(a);
+            a.LastApplied = -1;
+            Render(a);
+            return;
+        }
+        int currentLevel = Math.Clamp((int)Math.Round(values.Average() * 100), 0, 100);
+        // A configured cap can make the current Windows level unreachable. In
+        // that case, taking control at the fader's maximum is the safest handoff.
+        a.PickupTarget = Math.Min(currentLevel, (int)a.Limit.Value);
+        a.PickupReady = true;
+        a.PickupPosition = null;
+        a.LastApplied = a.PickupTarget;
+        Render(a);
+    }
+
+    void CancelPickup(Axis a)
+    {
+        a.PickupGeneration++;
+        a.PickupArmed = false;
+        a.PickupReady = false;
+        a.PickupPosition = null;
+        a.Bar.PickupPosition = null;
+        _tip.SetToolTip(a.Bar, a.IsVirtual
+            ? "Drag to set the volume (or focus it and use the arrow keys)"
+            : "Physical fader position");
+    }
+
     // Reflect a slider's active target in its combo and re-push. App targets just
     // select the app; output targets resolve the ranked list and load the cap.
     void ApplyActive(Axis a)
@@ -2116,6 +2421,7 @@ public class MainForm : Form
             a.Limit.Value = MaxForDevice(id);
             _loadingSettings = prevLoad;
             a.LastApplied = -1;                      // force a re-push to the (possibly new) device
+            ArmPickup(a);
         }
         Render(a);
     }
@@ -2159,6 +2465,7 @@ public class MainForm : Form
             a.LastApplied = -1;
             TakeTargetOwnership(a);
             ApplyActive(a);
+            ArmPickup(a);
             SaveSettings();
             return;
         }
@@ -2169,6 +2476,7 @@ public class MainForm : Form
             a.LastApplied = -1;
             TakeTargetOwnership(a);
             ApplyActive(a);
+            ArmPickup(a);
             SaveSettings();
             return;
         }
@@ -2179,6 +2487,7 @@ public class MainForm : Form
         a.OverrideId = (picked != null && picked == AutoTarget(a)) ? null : picked;
         TakeTargetOwnership(a);
         ApplyActive(a);
+        ArmPickup(a);
         SaveSettings();
     }
 
@@ -2203,6 +2512,7 @@ public class MainForm : Form
         a.VTarget = value;
         a.VCur = value;
         a.VMuted = false;
+        UpdateMuteButton(a);
         Render(a, takeOwnership: true);
         if (committed && !_loadingSettings) SaveSettings();
     }
@@ -2216,7 +2526,7 @@ public class MainForm : Form
             if (!a.IsVirtual) continue;
             if (a.HkUp.Matches(vk, ctrl, alt, shift, win)) NudgeVirtual(a, a.Step);
             else if (a.HkDown.Matches(vk, ctrl, alt, shift, win)) NudgeVirtual(a, -a.Step);
-            else if (a.HkMute.Matches(vk, ctrl, alt, shift, win)) ToggleMuteVirtual(a);
+            else if (a.HkMute.Matches(vk, ctrl, alt, shift, win)) ToggleMute(a);
         }
     }
 
@@ -2225,15 +2535,47 @@ public class MainForm : Form
     void NudgeVirtual(Axis a, int delta)
     {
         a.VMuted = false;
+        UpdateMuteButton(a);
         a.VTarget = Math.Clamp(a.VTarget + delta, 0, 100);
         EnsureRamp();
     }
 
-    void ToggleMuteVirtual(Axis a)
+    void ToggleMute(Axis a)
     {
-        if (a.VMuted) { a.VTarget = a.VPreMute; a.VMuted = false; }
-        else { a.VPreMute = a.VTarget; a.VTarget = 0; a.VMuted = true; }
-        EnsureRamp();
+        CancelPickup(a);
+        if (a.IsVirtual)
+        {
+            if (a.VMuted) { a.VTarget = a.VPreMute; a.VMuted = false; }
+            else { a.VPreMute = a.VTarget; a.VTarget = 0; a.VMuted = true; }
+            EnsureRamp();
+        }
+        else
+        {
+            if (!a.VMuted) a.VPreMute = Math.Max(0, a.LastApplied);
+            a.VMuted = !a.VMuted;
+            a.LastApplied = -1;
+            Render(a, takeOwnership: true);
+            if (!_loadingSettings) SaveSettings();
+        }
+        UpdateMuteButton(a);
+    }
+
+    void ResetVirtual(Axis a)
+    {
+        if (!a.IsVirtual) return;
+        a.VMuted = false;
+        UpdateMuteButton(a);
+        a.VTarget = 100;
+        a.VCur = 100;
+        Render(a, takeOwnership: true);
+        if (!_loadingSettings) SaveSettings();
+    }
+
+    void UpdateMuteButton(Axis a)
+    {
+        if (a.Mute == null) return;
+        a.Mute.Text = a.VMuted ? "Unmute" : "Mute";
+        a.Mute.AccessibleName = a.VMuted ? "Unmute fader" : "Mute fader";
     }
 
     void EnsureRamp() { if (!_vramp.Enabled) _vramp.Start(); }
@@ -2417,6 +2759,7 @@ public class MainForm : Form
             _categories = s.Categories ?? new();
             _themeMode = s.ThemeMode;
             _closeBehavior = s.CloseBehavior;
+            _softTakeover = s.SoftTakeover;
 
             // No per-device profiles yet but old flat settings present -> build a
             // seed profile to apply to the first device that connects.
@@ -2459,7 +2802,7 @@ public class MainForm : Form
             foreach (var g in _groups)
                 _devices[g.Key] = new DeviceProfile { Name = g.Name, Sliders = g.Sliders.Select(ToConfig).ToList() };
 
-            var s = new Settings { SchemaVersion = CurrentSettingsSchema, Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), AppSeen = new(_appSeen), IgnoredDevices = _ignored.ToList(), MonitoredDevices = _allowed.ToList(), Categories = _categories, ThemeMode = _themeMode, CloseBehavior = _closeBehavior };
+            var s = new Settings { SchemaVersion = CurrentSettingsSchema, Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), AppSeen = new(_appSeen), IgnoredDevices = _ignored.ToList(), MonitoredDevices = _allowed.ToList(), Categories = _categories, ThemeMode = _themeMode, CloseBehavior = _closeBehavior, SoftTakeover = _softTakeover };
             Directory.CreateDirectory(SettingsDir);
             // Write to a temp file then swap it in, so a crash mid-write can't
             // leave a half-written (corrupt) file behind.
@@ -2525,7 +2868,11 @@ public class MainForm : Form
             if (!string.IsNullOrWhiteSpace(name)) { existing.Name = name; if (existing.HeaderName != null) existing.HeaderName.Text = name; }
             RethemeHeader(existing, CurrentTheme());
             UpdateAggregateStatus();
-            if (reconnected) PublishDesiredVolumes();
+            if (reconnected)
+            {
+                foreach (var a in existing.Sliders) ArmPickup(a, publish: false);
+                PublishDesiredVolumes();
+            }
             return;
         }
         bool freshDefault = false;
@@ -2545,6 +2892,7 @@ public class MainForm : Form
         RelayoutGroups();
         SaveSettings();
         UpdateAggregateStatus();
+        foreach (var a in group.Sliders) ArmPickup(a, publish: false);
         PublishDesiredVolumes();
         if (freshDefault) PromptSetup(group.Key, name);
     }
@@ -2554,6 +2902,10 @@ public class MainForm : Form
         if (_groups.FirstOrDefault(g => g.Key == key) is not { } g) return;
         if (g.Connected == connected) return;
         g.Connected = connected;
+        if (connected)
+            foreach (var a in g.Sliders) ArmPickup(a, publish: false);
+        else
+            foreach (var a in g.Sliders) CancelPickup(a);
         RethemeHeader(g, CurrentTheme());
         UpdateAggregateStatus();
         UpdateAllSliderStates();
@@ -2622,6 +2974,7 @@ public class MainForm : Form
             a.AppKey = c.AppKey;
             a.CategoryName = c.CategoryName;
             LoadVirtual(a, c);
+            UpdateMuteButton(a);
             if (c.Target != TargetKind.Output) { _loadingSettings = true; a.Limit.Value = ClampLimit(c.Max); _loadingSettings = false; }
             ApplyCalibration(a, c.Cal);
             return a;
@@ -2646,6 +2999,7 @@ public class MainForm : Form
         FitWindowHeight();
         LoadDevices();   // repopulate combos + re-pick active outputs across all cards
         UpdateHotkeySnapshot();
+        ArmAllPhysicalPickups();
         PublishDesiredVolumes();
     }
 
@@ -2665,7 +3019,7 @@ public class MainForm : Form
 
         var dot = new Label { Text = "●", AutoSize = true, Font = UiFonts.Get(7f), Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 6, 0) };
         var name = new Label { Text = g.Name, AutoSize = true, Font = UiFonts.Get(9.75f, FontStyle.Bold), Anchor = AnchorStyles.Left, Margin = new Padding(0, 3, 0, 0) };
-        var btn = new RoundedButton { Text = g.IsVirtual ? "Add fader" : "Set up", AutoSize = true, Padding = new Padding(10, 3, 10, 3), Anchor = AnchorStyles.Right, Margin = new Padding(8, 0, 0, 0) };
+        var btn = new RoundedButton { Text = g.IsVirtual ? "Add fader" : "Configure", AutoSize = true, Padding = new Padding(10, 3, 10, 3), Anchor = AnchorStyles.Right, Margin = new Padding(8, 0, 0, 0) };
         btn.Click += (_, _) => RunSetupWizard(g.Key, pulse: g.IsVirtual && g.Sliders.Count == 0);
         _tip.SetToolTip(btn, g.IsVirtual ? "Add or arrange virtual faders" : "Map this device's faders and capture their range");
 
@@ -2887,11 +3241,14 @@ public class MainForm : Form
         var labels = _sliders.Select(s => s.Name.Text).ToArray();
         var cats = _categories.Select(c => new Category { Name = c.Name, AppKeys = new(c.AppKeys) }).ToList();
         var virtuals = _sliders.Select(s => s.IsVirtual).ToArray();
-        using var dlg = new OptionsDialog(_theme, _themeMode, GetStartWithWindows(), _closeBehavior,
-            cals, raws, outs, labels, AllKnownOutputs(), _present.Keys.ToArray(), cats, _knownApps, _appIcons, virtuals);
+        using var dlg = new OptionsDialog(_theme, _themeMode, GetStartWithWindows(), _closeBehavior, _softTakeover,
+            cals, raws, outs, labels, AllKnownOutputs(), _present.Keys.ToArray(), cats, _knownApps, _appIcons, virtuals, _liveApps);
         _calibrating = true;                 // stop driving devices while sweeping
         var result = dlg.ShowDialog(this);
         _calibrating = false;
+        if (dlg.DiagnosticsRequested) { OpenDiagnostics(); return; }
+        if (dlg.ExportRequested) { ExportSettings(); return; }
+        if (dlg.ImportRequested) { ImportSettings(); return; }
         if (result == DialogResult.OK)
         {
             for (int i = 0; i < _sliders.Length; i++)
@@ -2914,6 +3271,7 @@ public class MainForm : Form
             }
             _themeMode = dlg.SelectedTheme;
             _closeBehavior = dlg.SelectedClose;
+            _softTakeover = dlg.SoftTakeover;
             ApplyTheme(CurrentTheme());
             SetStartWithWindows(dlg.StartWithWindows);
             SaveSettings();
@@ -2923,7 +3281,126 @@ public class MainForm : Form
         // setup dialog is then cancelled.
         foreach (var s in _sliders) s.LastApplied = -1;
         PopulateCombos();
+        if (_softTakeover) ArmAllPhysicalPickups();
+        else foreach (var s in _sliders) CancelPickup(s);
+        PublishDesiredVolumes();
         if (result == DialogResult.OK && dlg.SetupRequested) RunSetupWizard(DefaultSetupGroupKey());
+    }
+
+    void OpenDiagnostics()
+    {
+        using var dialog = new DiagnosticsDialog(_theme, BuildDiagnosticReport);
+        dialog.ShowDialog(this);
+    }
+
+    string BuildDiagnosticReport()
+    {
+        using var process = Process.GetCurrentProcess();
+        process.Refresh();
+        var readers = _readerSnapshot;
+        var sb = new StringBuilder();
+        sb.AppendLine("ZMK Volume Fader diagnostics");
+        sb.AppendLine($"Generated: {DateTimeOffset.Now:O}");
+        sb.AppendLine($"Build: {VersionText()}");
+        sb.AppendLine($"Runtime: {RuntimeInformation.FrameworkDescription}");
+        sb.AppendLine($"OS: {RuntimeInformation.OSDescription}");
+        sb.AppendLine($"Process uptime: {DateTime.UtcNow - Program.StartedAtUtc:g}");
+        sb.AppendLine();
+        sb.AppendLine("Process resources");
+        sb.AppendLine($"  Working set: {process.WorkingSet64 / 1024d / 1024d:F1} MB");
+        sb.AppendLine($"  Private memory: {process.PrivateMemorySize64 / 1024d / 1024d:F1} MB");
+        sb.AppendLine($"  Managed heap: {GC.GetTotalMemory(false) / 1024d / 1024d:F1} MB");
+        sb.AppendLine($"  Handles: {process.HandleCount}");
+        sb.AppendLine($"  Threads: {process.Threads.Count}");
+        sb.AppendLine();
+        sb.AppendLine("HID");
+        sb.AppendLine($"  Open readers: {readers.Length}");
+        sb.AppendLine($"  Reports received: {Interlocked.Read(ref _hidReportCount)}");
+        foreach (var reader in readers) sb.AppendLine($"  Device: {reader.Name} ({reader.Key})");
+        sb.AppendLine();
+        sb.AppendLine("Core Audio");
+        sb.AppendLine($"  Endpoints: {_audio?.EndpointCount ?? 0}");
+        sb.AppendLine($"  Sessions: {_audio?.SessionCount ?? 0}");
+        sb.AppendLine($"  Live app keys: {_liveApps.Count}");
+        sb.AppendLine($"  Endpoint setters: {_audio?.EndpointSetCalls ?? 0}");
+        sb.AppendLine($"  Session setters: {_audio?.SessionSetCalls ?? 0}");
+        sb.AppendLine($"  Desired snapshots: {Interlocked.Read(ref _desiredSnapshotCount)}");
+        sb.AppendLine();
+        sb.AppendLine("Faders");
+        sb.AppendLine($"  Total: {_sliders.Length}");
+        sb.AppendLine($"  Soft takeover enabled: {_softTakeover}");
+        sb.AppendLine($"  Soft takeover armed: {_sliders.Count(a => a.PickupArmed)}");
+        sb.AppendLine($"  Muted: {_sliders.Count(a => a.VMuted)}");
+        foreach (var a in _sliders)
+            sb.AppendLine($"  {a.Name.Text}: {(a.IsVirtual ? "virtual" : $"axis {a.AxisIndex + 1}")}, {a.Target}, {a.LastApplied}%");
+        sb.AppendLine();
+        sb.AppendLine($"Settings: {SettingsPath}");
+        sb.AppendLine($"Error log: {Program.ErrorLogPath} ({(File.Exists(Program.ErrorLogPath) ? "present" : "not present")})");
+        return sb.ToString();
+    }
+
+    void ExportSettings()
+    {
+        SaveSettings();
+        using var dialog = new SaveFileDialog
+        {
+            Title = "Export ZMK Volume Fader settings",
+            Filter = "ZMK Volume Fader settings (*.json)|*.json|All files (*.*)|*.*",
+            FileName = $"ZmkVolumeFader-settings-{DateTime.Now:yyyyMMdd}.json",
+            AddExtension = true,
+            DefaultExt = "json",
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        try
+        {
+            File.Copy(SettingsPath, dialog.FileName, overwrite: true);
+            MessageBox.Show(this, "Settings exported successfully.", "Export settings",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            Program.Log(ex, "Exporting settings");
+            MessageBox.Show(this, $"Settings could not be exported.\n\n{ex.Message}", "Export settings",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    void ImportSettings()
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Title = "Import ZMK Volume Fader settings",
+            Filter = "ZMK Volume Fader settings (*.json)|*.json|All files (*.*)|*.*",
+            CheckFileExists = true,
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        try
+        {
+            var imported = JsonSerializer.Deserialize<Settings>(File.ReadAllText(dialog.FileName));
+            if (imported == null) throw new InvalidDataException("The selected file does not contain settings.");
+            if (imported.SchemaVersion > CurrentSettingsSchema)
+                throw new InvalidDataException($"Settings schema {imported.SchemaVersion} is newer than this app supports ({CurrentSettingsSchema}).");
+            if (MessageBox.Show(this,
+                    "Importing will replace the current configuration and restart the app. Continue?",
+                    "Import settings", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+
+            Directory.CreateDirectory(SettingsDir);
+            string temp = SettingsPath + ".import";
+            File.Copy(dialog.FileName, temp, overwrite: true);
+            if (File.Exists(SettingsPath))
+                File.Replace(temp, SettingsPath, SettingsPath + ".pre-import.bak", ignoreMetadataErrors: true);
+            else
+                File.Move(temp, SettingsPath);
+
+            _exiting = true;
+            Application.Restart();
+        }
+        catch (Exception ex)
+        {
+            Program.Log(ex, "Importing settings");
+            MessageBox.Show(this, $"Settings could not be imported.\n\n{ex.Message}", "Import settings",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     // Adopt an edited ranked list. Re-ranking returns the fader to automatic
@@ -3131,6 +3608,7 @@ public class MainForm : Form
                     int n;
                     try { n = stream.Read(buf, 0, buf.Length); }
                     catch { break; }   // stream closed (cancel) or device gone
+                    if (n > 0) Interlocked.Increment(ref _hidReportCount);
                     // Leak isolation: consume the report and do nothing — if the
                     // kernel-pool leak still runs in this mode, the HID read path
                     // alone is the trigger and nothing downstream matters.
@@ -3200,9 +3678,9 @@ public class MainForm : Form
     {
         var names = _readerSnapshot.Select(r => r.Name).ToList();
         if (names.Count == 0) { SetStatus("No fader device — plug one in…", false); return; }
-        if (names.Count == 1) { SetStatus($"Connected to {names[0]}", true); return; }
-        if (names.Count <= 3) { SetStatus($"Connected — {string.Join(", ", names)}", true); return; }
-        SetStatus($"Connected — {names.Count} devices", true);
+        if (names.Count == 1) { SetStatus($"Connected · {names[0]}", true); return; }
+        if (names.Count <= 3) { SetStatus($"Connected · {string.Join(", ", names)}", true); return; }
+        SetStatus($"Connected · {names.Count} devices", true);
     }
 
     static int ReadAxis(byte[] b, int i) => (short)(b[i] | (b[i + 1] << 8));
@@ -3367,6 +3845,38 @@ public class MainForm : Form
         int cap = a.IsVirtual ? 100 : (int)a.Limit.Value;
         double pf = Math.Clamp(faderPct * cap / 100.0, 0, 100);
 
+        if (!a.IsVirtual && a.VMuted) pf = 0;
+
+        if (!a.IsVirtual && a.PickupArmed && !a.VMuted)
+        {
+            int position = (int)Math.Round(pf);
+            a.Bar.PickupPosition = position;
+            if (!a.PickupReady)
+            {
+                if (!Program.DiagNoDraw)
+                {
+                    a.Pct.Text = "Syncing…";
+                    a.Pct.ForeColor = _theme.Accent;
+                }
+                return;
+            }
+
+            int? previous = a.PickupPosition;
+            a.PickupPosition = position;
+            bool reached = PickupLogic.HasReached(previous, position, a.PickupTarget);
+            if (!Program.DiagNoDraw)
+            {
+                a.Bar.Value = a.PickupTarget;
+                a.Pct.Text = $"Pickup {a.PickupTarget}%";
+                a.Pct.ForeColor = _theme.Accent;
+                _tip.SetToolTip(a.Bar, $"Move the physical fader to {a.PickupTarget}% to take control");
+            }
+            if (!reached) return;
+
+            CancelPickup(a);
+            a.LastApplied = -1;
+        }
+
         // Hysteresis: hold the current integer % until pf moves > Hyst off it.
         int applied = a.LastApplied < 0 || Math.Abs(pf - a.LastApplied) > Hyst
             ? (int)Math.Round(pf)
@@ -3427,7 +3937,7 @@ public class MainForm : Form
             // fader wins if two logical targets overlap.
             foreach (var a in _sliders.OrderBy(a => a.DriveSequence))
             {
-                if (a.LastApplied < 0 || !IsFaderConnected(a)) continue;
+                if (a.LastApplied < 0 || !IsFaderConnected(a) || a.PickupArmed) continue;
                 float scalar = a.LastApplied / 100f;
                 if (a.Target == TargetKind.Output)
                 {
@@ -3436,7 +3946,7 @@ public class MainForm : Form
                 }
                 else if (a.Target == TargetKind.App)
                 {
-                    if (a.AppKey != null) apps[a.AppKey] = scalar;
+                    if (a.AppKey != null && _liveApps.Contains(a.AppKey)) apps[a.AppKey] = scalar;
                 }
                 else if (a.CategoryName == UnassignedCategory)
                 {
@@ -3446,11 +3956,12 @@ public class MainForm : Form
                 {
                     var category = _categories.FirstOrDefault(c => c.Name == a.CategoryName);
                     if (category != null)
-                        foreach (var key in category.AppKeys) apps[key] = scalar;
+                        foreach (var key in category.AppKeys.Where(_liveApps.Contains)) apps[key] = scalar;
                 }
             }
         }
         _audio.SetDesiredVolumes(endpoints, apps);
+        Interlocked.Increment(ref _desiredSnapshotCount);
     }
 
     void SetStatus(string text, bool connected)

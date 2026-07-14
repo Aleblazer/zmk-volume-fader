@@ -19,10 +19,15 @@ jobs:
           dotnet-version: 8.0.x
 
       - name: Restore
-        run: dotnet restore ZmkVolumeFader/ZmkVolumeFader.csproj
+        run: |
+          dotnet restore ZmkVolumeFader/ZmkVolumeFader.csproj
+          dotnet restore ZmkVolumeFader.Tests/ZmkVolumeFader.Tests.csproj
 
       - name: Build
         run: dotnet build ZmkVolumeFader/ZmkVolumeFader.csproj -c Release --no-restore
+
+      - name: Logic tests
+        run: dotnet run --project ZmkVolumeFader.Tests/ZmkVolumeFader.Tests.csproj -c Release --no-restore
 
       - name: Publish single-file Windows build
         if: github.event_name != 'pull_request'

@@ -51,8 +51,9 @@ static class Program
         return on.Count == 0 ? "" : $"[diag: {string.Join(" ", on)}]";
     }
 
-    static string LogPath => Path.Combine(
+    internal static string ErrorLogPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ZmkVolumeFader", "error.log");
+    internal static readonly DateTime StartedAtUtc = DateTime.UtcNow;
 
     static bool _errorShown;
     static readonly object LogLock = new();
@@ -98,7 +99,7 @@ static class Program
         _errorShown = true;
         try
         {
-            MessageBox.Show($"Something went wrong:\n\n{ex.Message}\n\nDetails were saved to:\n{LogPath}",
+            MessageBox.Show($"Something went wrong:\n\n{ex.Message}\n\nDetails were saved to:\n{ErrorLogPath}",
                 "ZMK Volume Fader", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         catch { }
@@ -124,11 +125,11 @@ static class Program
     {
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!);
-            var f = new FileInfo(LogPath);
+            Directory.CreateDirectory(Path.GetDirectoryName(ErrorLogPath)!);
+            var f = new FileInfo(ErrorLogPath);
             if (f.Exists && f.Length > 512 * 1024) f.Delete();   // keep the log bounded
             string prefix = context == null ? "" : $"{context}: ";
-            File.AppendAllText(LogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {prefix}{ex}\n\n");
+            File.AppendAllText(ErrorLogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {prefix}{ex}\n\n");
         }
         catch { }
     }

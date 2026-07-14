@@ -17,7 +17,10 @@ namespace ZmkVolumeFader;
 /// </summary>
 sealed class AudioController : IDisposable
 {
-    internal sealed record AppSnapshot(string Key, int Pid);
+    internal sealed record AppSnapshot(string Key, int Pid, string LegacyKey);
+    internal sealed record VolumeSnapshot(
+        IReadOnlyDictionary<string, float> Endpoints,
+        IReadOnlyDictionary<string, float> Apps);
 
     const string SystemAppKey = "#system";
     const int MinOsCallIntervalMs = 25;       // system-wide ceiling: 40 setters/s
@@ -51,8 +54,11 @@ sealed class AudioController : IDisposable
     bool _appsDirty;
 
     long _endpointSetCalls, _sessionSetCalls;
+    volatile int _endpointCount, _sessionCount;
     internal long EndpointSetCalls => Interlocked.Read(ref _endpointSetCalls);
     internal long SessionSetCalls => Interlocked.Read(ref _sessionSetCalls);
+    internal int EndpointCount => _endpointCount;
+    internal int SessionCount => _sessionCount;
 
     sealed record DesiredSnapshot(Dictionary<string, float> Endpoints, Dictionary<string, float> Apps);
 
@@ -100,6 +106,7 @@ sealed class AudioController : IDisposable
         public required string Id;
         public required string EndpointId;
         public required int Pid;
+        public required string LegacyKey;
         public required AudioSessionControl Control;
         public override bool IsEndpoint => false;
 
@@ -153,6 +160,51 @@ sealed class AudioController : IDisposable
             }
             _wake.Set();
         }
+    }
+
+    /// <summary>
+    /// Read current target levels on the COM owner thread. Used only when arming
+    /// physical-fader pickup; it is event driven and never becomes a poll.
+    /// </summary>
+    public bool RequestCurrentVolumes(IEnumerable<string> endpointIds, IEnumerable<string> appKeys,
+        Action<VolumeSnapshot> completed)
+    {
+        var endpointSet = endpointIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var appSet = appKeys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return TryPost(() =>
+        {
+            var endpoints = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+            var apps = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (string id in endpointSet)
+            {
+                if (!_endpoints.TryGetValue(id, out var endpoint)) continue;
+                try { endpoint.RefreshActual(); endpoints[id] = endpoint.LastKnown; }
+                catch (Exception ex) { Program.LogRateLimited($"audio-read:{id}", ex, "Reading an audio endpoint"); }
+            }
+
+            foreach (string key in appSet)
+            {
+                float total = 0;
+                int count = 0;
+                foreach (var session in _sessions.Values.Where(s =>
+                             s.DesiredKey.Equals(key, StringComparison.OrdinalIgnoreCase)))
+                {
+                    try
+                    {
+                        session.RefreshActual();
+                        if (!float.IsNaN(session.LastKnown)) { total += session.LastKnown; count++; }
+                    }
+                    catch (Exception ex)
+                    {
+                        Program.LogRateLimited($"audio-read:{key}", ex, "Reading an app audio session");
+                    }
+                }
+                if (count > 0) apps[key] = total / count;
+            }
+
+            try { completed(new VolumeSnapshot(endpoints, apps)); } catch { }
+        });
     }
 
     bool TryPost(Action action)
@@ -245,6 +297,8 @@ sealed class AudioController : IDisposable
         _sessions.Clear();
         foreach (var e in _endpoints.Values) e.Dispose();
         _endpoints.Clear();
+        _endpointCount = 0;
+        _sessionCount = 0;
         _writeOrder.Clear();
         try { _enumerator?.Dispose(); } catch { }
         _enumerator = null;
@@ -382,6 +436,7 @@ sealed class AudioController : IDisposable
     {
         var endpoint = new EndpointEntry { Id = id, DesiredKey = id, Device = device };
         _endpoints[id] = endpoint;
+        _endpointCount = _endpoints.Count;
         _writeOrder.Add(endpoint);
         if (_desiredEndpoints.ContainsKey(id))
         {
@@ -443,14 +498,14 @@ sealed class AudioController : IDisposable
             }
 
             int pid = 0;
-            string appKey;
-            if (control.IsSystemSoundsSession) appKey = SystemAppKey;
+            string appKey, legacyKey;
+            if (control.IsSystemSoundsSession) appKey = legacyKey = SystemAppKey;
             else
             {
                 pid = checked((int)control.GetProcessID);
-                var key = AppKeyForPid(pid);
-                if (key == null) { control.Dispose(); return false; }
-                appKey = key;
+                var identity = AppIdentityForPid(pid);
+                if (identity == null) { control.Dispose(); return false; }
+                (appKey, legacyKey) = identity.Value;
             }
 
             string instanceId;
@@ -468,10 +523,12 @@ sealed class AudioController : IDisposable
                 Id = id,
                 EndpointId = endpointId,
                 DesiredKey = appKey,
+                LegacyKey = legacyKey,
                 Pid = pid,
                 Control = control,
             };
             _sessions[id] = session;
+            _sessionCount = _sessions.Count;
             _writeOrder.Add(session);
             _appsDirty = true;
             if (_desiredApps.ContainsKey(appKey))
@@ -491,6 +548,7 @@ sealed class AudioController : IDisposable
     bool RemoveEndpoint(string id)
     {
         if (!_endpoints.Remove(id, out var endpoint)) return false;
+        _endpointCount = _endpoints.Count;
         _writeOrder.Remove(endpoint);
         foreach (var sessionId in _sessions.Values
                      .Where(s => s.EndpointId.Equals(id, StringComparison.OrdinalIgnoreCase))
@@ -504,6 +562,7 @@ sealed class AudioController : IDisposable
     void RemoveSession(string id)
     {
         if (!_sessions.Remove(id, out var session)) return;
+        _sessionCount = _sessions.Count;
         _writeOrder.Remove(session);
         session.Dispose();
         _appsDirty = true;
@@ -534,18 +593,30 @@ sealed class AudioController : IDisposable
     {
         var apps = _sessions.Values
             .GroupBy(s => s.DesiredKey, StringComparer.OrdinalIgnoreCase)
-            .Select(g => new AppSnapshot(g.Key, g.Select(x => x.Pid).FirstOrDefault(pid => pid != 0)))
+            .Select(g =>
+            {
+                var first = g.First();
+                return new AppSnapshot(g.Key, g.Select(x => x.Pid).FirstOrDefault(pid => pid != 0), first.LegacyKey);
+            })
             .OrderBy(a => a.Key, StringComparer.OrdinalIgnoreCase)
             .ToArray();
         try { _appsChanged(apps); } catch { }
     }
 
-    static string? AppKeyForPid(int pid)
+    static (string Key, string LegacyKey)? AppIdentityForPid(int pid)
     {
         try
         {
             using var p = Process.GetProcessById(pid);
-            return p.ProcessName.ToLowerInvariant();
+            string legacy = p.ProcessName.ToLowerInvariant();
+            try
+            {
+                string? path = p.MainModule?.FileName;
+                if (!string.IsNullOrWhiteSpace(path))
+                    return (AppIdentityLogic.KeyFor(legacy, path), legacy);
+            }
+            catch { }
+            return (legacy, legacy);
         }
         catch { return null; }
     }
