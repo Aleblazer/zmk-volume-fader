@@ -93,7 +93,7 @@ public class MainForm : Form
     const int MaxAxes = 8;   // hid-io vendor report carries up to eight 16-bit axes
 
     // The git short hash the SetGitCommit build target embedded into
-    // AssemblyInformationalVersion ("1.1.0+<hash>"), or "" when unavailable.
+    // AssemblyInformationalVersion ("<version>+<hash>"), or "" when unavailable.
     static string CommitId()
     {
         var info = typeof(MainForm).Assembly
@@ -106,13 +106,10 @@ public class MainForm : Form
     // (Debug) builds show the commit so you can tell dev builds apart.
     public static string VersionText()
     {
-#if DEBUG
         string commit = CommitId();
-        return string.IsNullOrEmpty(commit) ? "dev build" : $"dev · {commit}";
-#else
         var ver = typeof(MainForm).Assembly.GetName().Version;
-        return ver is null ? "" : $"v{ver.Major}.{ver.Minor}.{ver.Build}";
-#endif
+        string version = ver is null ? "" : $"v{ver.Major}.{ver.Minor}.{ver.Build}";
+        return string.IsNullOrEmpty(commit) ? version : $"{version} · {commit}";
     }
 
     // The per-fader value->% mapping lives in each Axis.Cal / Axis.Curve (see
@@ -403,7 +400,9 @@ public class MainForm : Form
             p.AddArc(Width - d - 1, Height - d - 1, d, d, 0, 90);
             p.AddArc(0, Height - d - 1, d, d, 90, 90);
             p.CloseFigure();
+            var old = Region;
             Region = new Region(p);
+            old?.Dispose();
         }
     }
 
@@ -532,7 +531,6 @@ public class MainForm : Form
     {
         public required string Id;
         public required string Name;
-        public required MMDevice Device;
         public override string ToString() => Name;
     }
 
@@ -573,9 +571,10 @@ public class MainForm : Form
     // excluded, so "Everything Else" never fights a dedicated app fader.
     // (System Sounds counts as unassigned on purpose.)
     IEnumerable<string> UnassignedKeys() =>
-        _appSessions.Keys.Where(k =>
+        _liveApps.Where(k =>
             !_categories.Any(c => c.AppKeys.Contains(k))
-            && !_sliders.Any(s => s.Target == TargetKind.App && s.AppKey == k));
+            && !_sliders.Any(s => IsFaderConnected(s)
+                                  && s.Target == TargetKind.App && s.AppKey == k));
 
     // Fires a callback whenever the set of audio endpoints changes (plug/unplug,
     // enable/disable) so the app can re-pick each fader's active output live.
@@ -625,15 +624,15 @@ public class MainForm : Form
         public double Sm = -1;          // EMA state (smoothed raw value)
         public int LastRaw;             // last raw value (so a cap change can re-render)
         public bool InMuteZone;         // latched mute-dead-zone state (see Render)
-        public int LastApplied = -1;    // last volume % pushed to the device (deadband)
-        // Volume writes are rate-limited through the pump (see FlushPendingVolumes):
-        // each Windows volume-set fans an ETW notification out to every process
-        // registered on Microsoft-Windows-Audio, and suspended packaged apps
-        // (ShellExperienceHost during fullscreen games, notably) never drain
-        // theirs — the kernel queues them in pool (EtwD/Etwr) without bound.
-        // Fewer writes = proportionally less of that system-wide leak.
-        public int VolPending = -1;     // latest % awaiting a write, -1 = none
-        public long VolLastWrite;       // Environment.TickCount64 of the last write
+        public int LastApplied = -1;    // last desired integer volume % (deadband)
+        // Resolves overlapping output/app/category assignments. The fader with
+        // the greatest sequence is the one the user acted on most recently.
+        public long DriveSequence;
+        // Logical changes are coalesced here before publishing a complete desired
+        // target map. AudioController applies a global limit after category fan-out,
+        // so this per-slider state can never multiply into an OS-call flood.
+        public int VolPending = -1;     // latest % awaiting publication, -1 = none
+        public long VolLastWrite;       // tick of the last desired-state publication
 
         // Ranked output preferences (highest first). The active output is the
         // top-most entry whose device is present; if a higher one (re)appears it
@@ -714,14 +713,19 @@ public class MainForm : Form
         public Thread Thread = null!;
         public HidStream? Stream;
         public volatile bool Stop;
-        // Latest axes read but not yet applied. The reader thread stashes every
-        // report here (Interlocked); the UI fader-pump grabs the newest at a fixed
-        // rate, so a device spamming reports can't fan out into per-report UI work.
-        public int[]? Pending;
+        // Reused producer/consumer buffers. HID reports can arrive thousands of
+        // times per second; keeping these per reader avoids one managed allocation
+        // for every report while still letting the UI consume only the newest.
+        public readonly object PendingLock = new();
+        public readonly int[] PendingAxes = new int[MaxAxes];
+        public readonly int[] SnapshotAxes = new int[MaxAxes];
+        public int PendingCount;
+        public volatile bool HasPending;
     }
 
     sealed class Settings
     {
+        public int SchemaVersion { get; set; } = CurrentSettingsSchema;
         // Per-device layouts keyed by device identity (serial, else VID:PID).
         public Dictionary<string, DeviceProfile> Devices { get; set; } = new();
         // Per-output max-volume cap, keyed by audio endpoint id (global across
@@ -797,12 +801,11 @@ public class MainForm : Form
         => _allowedSnap.Contains(key) || (!_ignoredSnap.Contains(key) && DefaultMonitor(byUsage, ourVid));
 
     // App-volume tracking. _knownApps is every app ever seen in the mixer
-    // (persisted, keyed by process name); _appSessions is the live sessions per
-    // app, refreshed by the poll timer; the target combos list both outputs and
-    // known apps.
+    // (persisted, keyed by process name); _liveApps is supplied by the
+    // event-driven AudioController; the target combos list
+    // both outputs and known apps.
     readonly Dictionary<string, string> _knownApps = new();
     HashSet<string> _liveApps = new();   // apps with a session right now (i.e. in the mixer)
-    Dictionary<string, List<AudioSessionControl>> _appSessions = new();
     // App-key -> extracted 16px exe icon (null once = couldn't extract, retried
     // up to IconTryMax times). Kept for the app lifetime.
     readonly Dictionary<string, Image?> _appIcons = new();
@@ -815,7 +818,14 @@ public class MainForm : Form
     // known-apps list and icon cache don't grow forever.
     readonly Dictionary<string, long> _appSeen = new();
     List<Category> _categories = new();
-    readonly System.Windows.Forms.Timer _sessionPoll = new() { Interval = 1000 };
+    AudioController? _audio;
+    System.Windows.Forms.Timer? _audioStats;
+    string? _audioStatsBaseTitle;
+    readonly object _audioSnapshotLock = new();
+    IReadOnlyList<AudioController.AppSnapshot>? _pendingAudioSnapshot;
+    bool _audioSnapshotQueued;
+    bool _audioFaultShown;
+    long _nextDriveSequence;
 
     // Currently-present render endpoints (id -> item), rebuilt by LoadDevices.
     readonly Dictionary<string, DeviceItem> _present = new();
@@ -829,6 +839,8 @@ public class MainForm : Form
     // settings.json; the old file is read once to migrate.
     static string SettingsPath => Path.Combine(SettingsDir, "settings.v2.json");
     static string LegacySettingsPath => Path.Combine(SettingsDir, "settings.json");
+    const int CurrentSettingsSchema = 3;
+    bool _settingsFaultShown;
 
     // ---- controls ---------------------------------------------------------
 
@@ -836,7 +848,7 @@ public class MainForm : Form
     readonly RoundedButton _btnDevices = new() { Text = "Devices", AutoSize = true, Padding = new Padding(12, 6, 12, 6), Margin = new Padding(8, 0, 0, 0) };
     readonly RoundedButton _btnOptions = new() { Text = "Options", AutoSize = true, Padding = new Padding(12, 6, 12, 6), Margin = new Padding(8, 0, 0, 0) };
     readonly Label _status = new() { Text = "Starting…", AutoSize = true, Anchor = AnchorStyles.Left };
-    readonly Label _statusDot = new() { Text = "●", AutoSize = true, Font = new Font("Segoe UI", 8f), Margin = new Padding(0, 3, 6, 0) };
+    readonly Label _statusDot = new() { Text = "●", AutoSize = true, Font = UiFonts.Get(8f), Margin = new Padding(0, 3, 6, 0) };
 
     // Slider cards are built dynamically into _sliderHost (one row each); it lives
     // inside _scroll, a custom scroll viewport that sizes the cards around its own
@@ -852,9 +864,13 @@ public class MainForm : Form
     DeviceNotify? _notify;
     // Coalesces bursts of device notifications into a single refresh.
     readonly System.Windows.Forms.Timer _deviceDebounce = new() { Interval = 250 };
+    int _deviceRefreshQueued;
     // Applies the newest axes from each reader at a fixed ~60 Hz, so a device
     // that spams reports drives at most one update per tick instead of per report.
     readonly System.Windows.Forms.Timer _faderPump = new() { Interval = 16 };
+    readonly System.Windows.Forms.Timer _trayUpdate = new() { Interval = 250 };
+    volatile bool _pumpActive;
+    int _pumpStartQueued;
 
     // Global keyboard hook (observes keys, never swallows) + the smoothing ramp
     // that eases virtual faders toward their hotkey-set target.
@@ -873,6 +889,9 @@ public class MainForm : Form
     // HID discovery + one reader thread per open device.
     readonly object _readersLock = new();
     readonly Dictionary<string, Reader> _readers = new(StringComparer.OrdinalIgnoreCase);
+    volatile Reader[] _readerSnapshot = Array.Empty<Reader>();
+    readonly AutoResetEvent _discoveryWake = new(false);
+    EventHandler<DeviceListChangedEventArgs>? _hidChanged;
     Thread? _discoveryThread;
     volatile bool _run;
     bool _loadingSettings;
@@ -883,6 +902,10 @@ public class MainForm : Form
     readonly NotifyIcon _tray = new() { Text = "ZMK Volume Fader", Icon = LoadAppIcon() };
     bool _exiting;
     bool _trayHintShown;   // one-time "still running in the tray" balloon
+    string? _pendingTrayText, _lastTrayText;
+    readonly object _statusPostLock = new();
+    string? _lastStatusText;
+    bool? _lastStatusConnected;
     readonly ToolTip _tip = new() { AutoPopDelay = 8000, InitialDelay = 450, ReshowDelay = 150 };
 
     public MainForm()
@@ -901,7 +924,7 @@ public class MainForm : Form
         var _diag = Program.DiagText();
         if (_diag.Length != 0) Text += $" {_diag}";
         Icon = LoadAppIcon();
-        Font = new Font("Segoe UI", 9.75f);
+        Font = UiFonts.Get(9.75f);
         ClientSize = new Size(460, 364);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
@@ -964,7 +987,8 @@ public class MainForm : Form
 
         _vramp.Tick += (_, _) => VrampTick();
         _faderPump.Tick += (_, _) => FaderPumpTick();
-        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); PruneKnownApps(); EnsureVirtualGroup(); RelayoutGroups(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartHid(); StartMaintenance(); RegisterDeviceNotifications(); StartSessionPoll(); StartHotkeys(); };
+        _trayUpdate.Tick += (_, _) => FlushTrayText();
+        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); PruneKnownApps(); EnsureVirtualGroup(); RelayoutGroups(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartAudio(); StartHid(); RegisterDeviceNotifications(); StartHotkeys(); };
         FormClosing += OnFormClosing;
     }
 
@@ -1076,7 +1100,7 @@ public class MainForm : Form
         t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        _emptyTitle = new Label { Text = "No faders yet", AutoSize = true, Anchor = AnchorStyles.None, Font = new Font("Segoe UI", 13f, FontStyle.Bold), Margin = new Padding(0, 10, 0, 4) };
+        _emptyTitle = new Label { Text = "No faders yet", AutoSize = true, Anchor = AnchorStyles.None, Font = UiFonts.Get(13f, FontStyle.Bold), Margin = new Padding(0, 10, 0, 4) };
         _emptySub = new Label { Text = "Add a physical or virtual fader to get started.", AutoSize = true, Anchor = AnchorStyles.None, Margin = new Padding(0, 0, 0, 12) };
         _emptyAdd = new RoundedButton { Text = "Add fader", AutoSize = true, Anchor = AnchorStyles.None, Padding = new Padding(16, 7, 16, 7), Margin = new Padding(0, 0, 0, 4) };
         _emptyAdd.Click += (_, _) => RunSetupWizard(VirtualKey, pulse: true);
@@ -1100,7 +1124,7 @@ public class MainForm : Form
         // clip against the card edge at 150% scaling.
         var combo = new RoundedComboBox { DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = 22, Margin = new Padding(0), Dock = DockStyle.Fill, Placeholder = "No target selected" };
         var bar = new FaderBar { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4), Interactive = isVirtual };
-        var pct = new Label { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 15f) };
+        var pct = new Label { Text = "—", AutoSize = true, Anchor = AnchorStyles.Right, Font = UiFonts.Get(15f) };
         var nameLbl = new Label { Text = name, AutoSize = true, Anchor = AnchorStyles.Left | AnchorStyles.Bottom, Margin = new Padding(0, 6, 0, 0) };
         var limit = new Stepper { Minimum = 1, Maximum = 100, Value = 100 };
         var card = new CardPanel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, Height = 168, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 10, 16, 12) };
@@ -1125,7 +1149,7 @@ public class MainForm : Form
         var tabs = new RoundedButton[3];
         string[] tabNames = { "Output", "Apps", "Categories" };
         Action<Graphics, Rectangle, Color>[] tabIcons = { GlyphSpeaker, GlyphApps, GlyphTag };
-        var tabFont = new Font("Segoe UI", 8.25f);
+        var tabFont = UiFonts.Get(8.25f);
         const int tabIconSz = 11, tabH = 27;
         for (int k = 0; k < 3; k++)
         {
@@ -1190,7 +1214,7 @@ public class MainForm : Form
     {
         var b = new RoundedButton
         {
-            Text = "Hotkeys", AutoSize = true, Font = new Font("Segoe UI", 8.25f),
+            Text = "Hotkeys", AutoSize = true, Font = UiFonts.Get(8.25f),
             Padding = new Padding(9, 4, 9, 4), Margin = new Padding(0, 0, 4, 0),
             Anchor = AnchorStyles.None, Radius = 7,
         };
@@ -1203,7 +1227,7 @@ public class MainForm : Form
     {
         var b = new RoundedButton
         {
-            Text = "✕", AutoSize = false, Font = new Font("Segoe UI", 8.25f),
+            Text = "✕", AutoSize = false, Font = UiFonts.Get(8.25f),
             Size = new Size(24, 26), Margin = new Padding(0, 0, 0, 0),
             Anchor = AnchorStyles.None, Radius = 7,
             AccessibleName = "Remove fader",
@@ -1263,6 +1287,7 @@ public class MainForm : Form
         PopulateCombo(a);
         _applyingActive = false;
         a.LastApplied = -1;
+        TakeTargetOwnership(a);
         ApplyActive(a);
         if (!_loadingSettings) SaveSettings();
     }
@@ -1613,8 +1638,7 @@ public class MainForm : Form
             }
         }
 
-        _run = false;
-        StopReaders();   // stop HID reader threads (unblocks their pending reads)
+        StopHid();       // stops discovery/readers and unblocks pending HID reads
         // Stop new device callbacks first, then the debounce they feed.
         if (_notify != null)
         {
@@ -1623,19 +1647,33 @@ public class MainForm : Form
         }
         _deviceDebounce.Stop();
         _deviceDebounce.Dispose();
-        _sessionPoll.Stop();
-        _sessionPoll.Dispose();
         _vramp.Stop();
         _vramp.Dispose();
         _faderPump.Stop();
         _faderPump.Dispose();
+        _trayUpdate.Stop();
+        _trayUpdate.Dispose();
         _hook.Dispose();   // unhook the global keyboard hook
-        // Release the audio COM wrappers we're holding.
-        foreach (var it in _present.Values) { try { it.Device.Dispose(); } catch { } }
+        _audioStats?.Dispose();
+        _audioStats = null;
+        _audio?.Dispose(); // releases all Core Audio COM objects on their MTA owner
+        _audio = null;
         _present.Clear();
         try { _enum.Dispose(); } catch { }
+        _tip.Dispose();
+        foreach (var image in _appIcons.Values.Where(i => i != null).Distinct()) image!.Dispose();
+        _appIcons.Clear();
+        var trayIcon = _tray.Icon;
+        var trayMenu = _tray.ContextMenuStrip;
+        var formIcon = Icon;
+        _tray.Icon = null;
+        _tray.ContextMenuStrip = null;
+        Icon = null;
         _tray.Visible = false;
         _tray.Dispose();
+        trayMenu?.Dispose();
+        trayIcon?.Dispose();
+        formIcon?.Dispose();
     }
 
     static Icon LoadAppIcon()
@@ -1651,20 +1689,29 @@ public class MainForm : Form
 
     void LoadDevices()
     {
-        var items = _enum.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
-            .Select(d => new DeviceItem { Id = d.ID, Name = d.FriendlyName, Device = d })
-            .OrderBy(d => d.Name)
-            .ToArray();
-
-        // Old MMDevice COM wrappers are about to be replaced; release them after
-        // the rebuild (the new active device gets a fresh instance below).
-        var stale = _present.Values.ToArray();
+        // The UI keeps only immutable endpoint metadata. AudioController owns the
+        // long-lived MMDevice objects; these short enumeration wrappers are always
+        // released immediately after their ID/name has been copied.
+        var items = new List<DeviceItem>();
+        try
+        {
+            foreach (var d in _enum.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
+            {
+                try { items.Add(new DeviceItem { Id = d.ID, Name = d.FriendlyName }); }
+                catch { }
+                finally { try { d.Dispose(); } catch { } }
+            }
+        }
+        catch (Exception ex)
+        {
+            Program.LogRateLimited("audio-device-list", ex, "Refreshing audio devices");
+            return;
+        }
         _present.Clear();
-        foreach (var it in items) _present[it.Id] = it;
+        foreach (var it in items.OrderBy(d => d.Name)) _present[it.Id] = it;
 
         PopulateCombos();
-
-        foreach (var it in stale) { try { it.Device.Dispose(); } catch { } }
+        _audio?.RefreshEndpoints();
     }
 
     // Fill each slider's target combo with present output devices, then every
@@ -1716,11 +1763,16 @@ public class MainForm : Form
     {
         try
         {
-            _deviceDebounce.Tick += (_, _) => { _deviceDebounce.Stop(); LoadDevices(); };
+            _deviceDebounce.Tick += (_, _) =>
+            {
+                _deviceDebounce.Stop();
+                Interlocked.Exchange(ref _deviceRefreshQueued, 0);
+                LoadDevices();
+            };
             _notify = new DeviceNotify(OnAudioDevicesChanged);
             _enum.RegisterEndpointNotificationCallback(_notify);
         }
-        catch { }
+        catch (Exception ex) { Program.LogRateLimited("audio-device-notify", ex, "Registering audio device notifications"); }
     }
 
     // An endpoint appeared/vanished/changed state. Callbacks arrive on a COM
@@ -1728,52 +1780,80 @@ public class MainForm : Form
     // short debounce on the UI thread and do a single LoadDevices when it settles.
     void OnAudioDevicesChanged()
     {
-        try
+        if (Interlocked.Exchange(ref _deviceRefreshQueued, 1) != 0) return;
+        SafeUi(() =>
         {
-            if (IsHandleCreated)
-                BeginInvoke((Action)(() => { _deviceDebounce.Stop(); _deviceDebounce.Start(); }));
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
+            _deviceDebounce.Stop();
+            _deviceDebounce.Start();
+        });
     }
 
     // All outputs we could rank, including unplugged/disabled ones, for the editor.
-    IReadOnlyList<OutputPref> AllKnownOutputs() =>
-        _enum.EnumerateAudioEndPoints(DataFlow.Render,
-                DeviceState.Active | DeviceState.Unplugged | DeviceState.Disabled)
-            .Select(d => new OutputPref { Id = d.ID, Name = d.FriendlyName })
-            .OrderBy(o => o.Name)
-            .ToList();
+    IReadOnlyList<OutputPref> AllKnownOutputs()
+    {
+        var result = new List<OutputPref>();
+        foreach (var d in _enum.EnumerateAudioEndPoints(DataFlow.Render,
+                     DeviceState.Active | DeviceState.Unplugged | DeviceState.Disabled))
+        {
+            try { result.Add(new OutputPref { Id = d.ID, Name = d.FriendlyName }); }
+            catch { }
+            finally { try { d.Dispose(); } catch { } }
+        }
+        return result.OrderBy(o => o.Name).ToList();
+    }
 
     // ---- app volume (audio sessions) --------------------------------------
 
-    // Idle-memory maintenance. The app is a mostly-idle tray utility whose polling
-    // loops generate a steady trickle of short-lived garbage (device scans, audio
-    // session wrappers). All of it is collectable — but the workstation GC, on a
-    // machine with free RAM, defers collecting under no memory pressure, so the
-    // process's committed memory ratchets up for a long time and looks like a leak
-    // in Task Manager. A cheap periodic full collect (the managed heap is ~1 MB)
-    // keeps the footprint flat. Runs off-thread so the brief collect never touches
-    // the UI's responsiveness.
-    void StartMaintenance()
+    void StartAudio()
     {
-        var t = new Thread(() =>
+        _audio = new AudioController(QueueAudioSnapshot, ex =>
         {
-            while (_run)
+            Program.LogRateLimited("audio-worker", ex, "Core Audio worker restarted");
+            SafeUi(() =>
             {
-                Thread.Sleep(60_000);
-                if (!_run) break;
-                try { GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect(); } catch { }
-            }
-        })
-        { IsBackground = true, Name = "maintenance" };
-        t.Start();
+                if (_audioFaultShown) return;
+                _audioFaultShown = true;
+                _tray.ShowBalloonTip(4000, "ZMK Volume Fader",
+                    "Windows audio control was interrupted and is reconnecting.", ToolTipIcon.Warning);
+            });
+        });
+        PublishDesiredVolumes();
+        if (Program.DiagAudioStats)
+        {
+            _audioStatsBaseTitle = Text;
+            _audioStats = new System.Windows.Forms.Timer { Interval = 5_000 };
+            _audioStats.Tick += (_, _) =>
+            {
+                if (_audio != null)
+                    Text = $"{_audioStatsBaseTitle} [sets endpoint={_audio.EndpointSetCalls} session={_audio.SessionSetCalls}]";
+            };
+            _audioStats.Start();
+        }
     }
 
-    void StartSessionPoll()
+    // Session bursts can arrive in clusters when a browser/game starts. Keep only
+    // the newest immutable snapshot and post at most one UI callback at a time.
+    void QueueAudioSnapshot(IReadOnlyList<AudioController.AppSnapshot> snapshot)
     {
-        _sessionPoll.Tick += (_, _) => PollSessions();
-        _sessionPoll.Start();
-        PollSessions();
+        lock (_audioSnapshotLock)
+        {
+            _pendingAudioSnapshot = snapshot;
+            if (_audioSnapshotQueued) return;
+            _audioSnapshotQueued = true;
+        }
+        SafeUi(DrainAudioSnapshot);
+    }
+
+    void DrainAudioSnapshot()
+    {
+        IReadOnlyList<AudioController.AppSnapshot>? snapshot;
+        lock (_audioSnapshotLock)
+        {
+            snapshot = _pendingAudioSnapshot;
+            _pendingAudioSnapshot = null;
+            _audioSnapshotQueued = false;
+        }
+        if (snapshot != null) ApplyAudioSnapshot(snapshot);
     }
 
     // Start the global keyboard hook. It lives on its own thread (so a busy UI
@@ -1814,114 +1894,73 @@ public class MainForm : Form
             .Distinct()
             .ToArray();
 
-    // Enumerate every render endpoint's audio sessions, group live sessions by
-    // app, and learn any app we haven't seen before (persisted). Refreshes the
-    // target combos and re-drives app sliders when the app set changes.
-    void PollSessions()
+    // Called only when the controller's live app set changes. Friendly-name and
+    // icon work therefore happens on session arrival, never on a timer.
+    void ApplyAudioSnapshot(IReadOnlyList<AudioController.AppSnapshot> snapshot)
     {
-        var byApp = new Dictionary<string, List<AudioSessionControl>>();
         bool namesChanged = false;
         bool iconsChanged = false;
         long nowSec = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        foreach (var di in _present.Values)
+
+        foreach (var app in snapshot)
         {
-            SessionCollection sessions;
-            try
+            string key = app.Key;
+            _appSeen[key] = nowSec;
+            if (key == SystemAppKey)
             {
-                var mgr = di.Device.AudioSessionManager;
-                mgr.RefreshSessions();
-                sessions = mgr.Sessions;
-            }
-            catch { continue; }
-
-            for (int i = 0; i < sessions.Count; i++)
-            {
-                AudioSessionControl sc;
-                try { sc = sessions[i]; } catch { continue; }
-                // Each unkept wrapper is disposed in the finally so a second's worth
-                // of COM objects doesn't pile up on the finalizer thread.
-                bool kept = false;
-                try
+                if (!_knownApps.ContainsKey(key))
                 {
-                    // Any non-expired session = an entry in the Windows mixer.
-                    if (sc.State == AudioSessionState.AudioSessionStateExpired) continue;
-
-                    string key;
-                    if (sc.IsSystemSoundsSession) key = SystemAppKey;
-                    else
-                    {
-                        var k = AppKeyForPid((int)sc.GetProcessID);
-                        if (k == null) continue;
-                        key = k;
-                    }
-
-                    // Resolve the friendly name + exe icon only the first time we see
-                    // an app (or until its icon loads) — reading MainModule every poll
-                    // is the poll's biggest allocator. System Sounds needs neither.
-                    bool nameKnown = key == SystemAppKey || _knownApps.ContainsKey(key);
-                    bool wantIcon = key != SystemAppKey
-                        && (!_appIcons.TryGetValue(key, out var have) || have == null || have.Width < IconStore)
-                        && _iconTries.GetValueOrDefault(key) < IconTryMax;
-                    if (!nameKnown || wantIcon)
-                    {
-                        ResolveAppDetails((int)sc.GetProcessID, out var name, out var exePath);
-                        if (key == SystemAppKey) name = "System sounds";
-                        else if (string.IsNullOrEmpty(name)) name = _knownApps.GetValueOrDefault(key, key);
-                        if (!_knownApps.TryGetValue(key, out var prev) || prev != name) { _knownApps[key] = name; namesChanged = true; }
-                        // Give up after IconTryMax failures — an elevated/protected exe
-                        // would otherwise be re-tried on every poll forever.
-                        if (wantIcon)
-                        {
-                            var loaded = LoadExeIcon(exePath);
-                            if (loaded != null) { _appIcons[key] = loaded; iconsChanged = true; SaveIconFile(key, loaded); _iconTries.Remove(key); }
-                            else { _appIcons.TryAdd(key, null); _iconTries[key] = _iconTries.GetValueOrDefault(key) + 1; }
-                        }
-                    }
-                    else if (key == SystemAppKey && !_knownApps.ContainsKey(key)) { _knownApps[key] = "System sounds"; namesChanged = true; }
-
-                    if (!byApp.TryGetValue(key, out var list)) byApp[key] = list = new();
-                    list.Add(sc);
-                    kept = true;
-                    _appSeen[key] = nowSec;
+                    _knownApps[key] = "System sounds";
+                    namesChanged = true;
                 }
-                catch { }
-                finally { if (!kept) { try { sc.Dispose(); } catch { } } }
+                continue;
+            }
+
+            bool nameKnown = _knownApps.ContainsKey(key);
+            bool wantIcon = (!_appIcons.TryGetValue(key, out var have) || have == null || have.Width < IconStore)
+                && _iconTries.GetValueOrDefault(key) < IconTryMax;
+            if (nameKnown && !wantIcon) continue;
+
+            ResolveAppDetails(app.Pid, out var name, out var exePath);
+            if (string.IsNullOrEmpty(name)) name = _knownApps.GetValueOrDefault(key, key);
+            if (!_knownApps.TryGetValue(key, out var previous) || previous != name)
+            {
+                _knownApps[key] = name;
+                namesChanged = true;
+            }
+            if (wantIcon)
+            {
+                var loaded = LoadExeIcon(exePath);
+                if (loaded != null)
+                {
+                    if (_appIcons.TryGetValue(key, out var old) && old != null && !ReferenceEquals(old, loaded))
+                        old.Dispose();
+                    _appIcons[key] = loaded;
+                    iconsChanged = true;
+                    SaveIconFile(key, loaded);
+                    _iconTries.Remove(key);
+                }
+                else
+                {
+                    _appIcons.TryAdd(key, null);
+                    _iconTries[key] = _iconTries.GetValueOrDefault(key) + 1;
+                }
             }
         }
-        // The old wrappers are ours alone (SessionCollection builds a fresh
-        // AudioSessionControl per access), so dispose them instead of leaving a
-        // second's worth of COM wrappers to the finalizer every poll.
-        var oldSessions = _appSessions;
-        _appSessions = byApp;
-        foreach (var list in oldSessions.Values)
-            foreach (var sc in list) { try { sc.Dispose(); } catch { } }
 
-        // Repopulate the target lists when the set of mixer apps changes.
-        var live = new HashSet<string>(byApp.Keys);
-        if (namesChanged || !live.SetEquals(_liveApps))
+        var live = new HashSet<string>(snapshot.Select(a => a.Key), StringComparer.OrdinalIgnoreCase);
+        bool liveChanged = !live.SetEquals(_liveApps);
+        _liveApps = live;
+        if (namesChanged || liveChanged)
         {
-            _liveApps = live;
             if (namesChanged) SaveSettings();
             PopulateCombos();
         }
         else if (iconsChanged)
-            foreach (var s in _sliders) s.Combo.Invalidate();   // late-loaded icon
-        // Push app/category sliders in case their sessions just (re)appeared.
-        foreach (var s in _sliders)
-            if (s.Target != TargetKind.Output) { s.LastApplied = -1; Render(s); }
-    }
+            foreach (var s in _sliders) s.Combo.Invalidate();
 
-    // App identity key (lowercased process name) — the cheap lookup done every
-    // poll. Avoids touching MainModule/FileVersionInfo, which are comparatively
-    // expensive and, called for every session every second, dominate the poll's
-    // allocation churn. The friendly name + exe path come from ResolveAppDetails,
-    // which the poll calls only the first time an app is seen (or until its icon
-    // loads).
-    static string? AppKeyForPid(int pid)
-    {
-        if (pid <= 0) return null;
-        try { using var p = Process.GetProcessById(pid); return p.ProcessName.ToLowerInvariant(); }
-        catch { return null; }
+        UpdateAllSliderStates();
+        PublishDesiredVolumes();
     }
 
     // The friendly display name (exe FileDescription, else process name) and exe
@@ -2117,6 +2156,8 @@ public class MainForm : Form
             // Switch this slider to controlling an app's volume (everywhere it plays).
             a.Target = TargetKind.App;
             a.AppKey = app.Key;
+            a.LastApplied = -1;
+            TakeTargetOwnership(a);
             ApplyActive(a);
             SaveSettings();
             return;
@@ -2125,6 +2166,8 @@ public class MainForm : Form
         {
             a.Target = TargetKind.Category;
             a.CategoryName = cat.Name;
+            a.LastApplied = -1;
+            TakeTargetOwnership(a);
             ApplyActive(a);
             SaveSettings();
             return;
@@ -2134,6 +2177,7 @@ public class MainForm : Form
         a.Target = TargetKind.Output;
         string? picked = (item as DeviceItem)?.Id;
         a.OverrideId = (picked != null && picked == AutoTarget(a)) ? null : picked;
+        TakeTargetOwnership(a);
         ApplyActive(a);
         SaveSettings();
     }
@@ -2148,7 +2192,7 @@ public class MainForm : Form
                 _deviceMax[id] = (int)a.Limit.Value;
             SaveSettings();
         }
-        Render(a);
+        Render(a, takeOwnership: true);
     }
 
     // The user dragged a virtual fader. Drag is direct (no smoothing ramp — you're
@@ -2159,7 +2203,7 @@ public class MainForm : Form
         a.VTarget = value;
         a.VCur = value;
         a.VMuted = false;
-        Render(a);
+        Render(a, takeOwnership: true);
         if (committed && !_loadingSettings) SaveSettings();
     }
 
@@ -2205,11 +2249,11 @@ public class MainForm : Form
             double diff = a.VTarget - a.VCur;
             if (Math.Abs(diff) < 0.5)
             {
-                if (a.VCur != a.VTarget) { a.VCur = a.VTarget; Render(a); }
+                if (a.VCur != a.VTarget) { a.VCur = a.VTarget; Render(a, takeOwnership: true); }
                 continue;
             }
             a.VCur += diff * 0.35;   // exponential ease-out
-            Render(a);
+            Render(a, takeOwnership: true);
             moving = true;
         }
         if (!moving)
@@ -2317,17 +2361,49 @@ public class MainForm : Form
             string? path = File.Exists(SettingsPath) ? SettingsPath
                 : File.Exists(LegacySettingsPath) ? LegacySettingsPath : null;
             if (path == null) return;
-            Settings? s;
-            try { s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(path)); }
-            catch
+            Settings? s = null;
+            Exception? readError = null;
+            string? loadedFrom = null;
+            string[] candidates = path == SettingsPath
+                ? new[] { path, SettingsPath + ".bak" }
+                : new[] { path };
+            foreach (string candidate in candidates)
+            {
+                if (!File.Exists(candidate)) continue;
+                try
+                {
+                    s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(candidate));
+                    if (s != null) { loadedFrom = candidate; break; }
+                }
+                catch (Exception ex) { readError = ex; }
+            }
+            if (s == null)
             {
                 // Unreadable (corrupt, truncated, or locked mid-scan): keep a copy
                 // for recovery — otherwise the next SaveSettings would overwrite
                 // every profile with the empty defaults we're falling back to.
                 try { File.Copy(path, path + ".bad", overwrite: true); } catch { }
+                if (readError != null) Program.Log(readError, "Loading settings");
                 return;
             }
-            if (s == null) return;
+            if (loadedFrom != path)
+            {
+                // Preserve the broken primary for inspection, then restore the
+                // known-good backup so the next atomic save does not rotate the
+                // corrupt file over that backup.
+                try
+                {
+                    File.Copy(path, path + ".bad", overwrite: true);
+                    File.Copy(loadedFrom!, path, overwrite: true);
+                }
+                catch (Exception ex) { Program.Log(ex, "Restoring settings backup"); }
+            }
+            if (s.SchemaVersion > CurrentSettingsSchema)
+            {
+                Program.Log(new InvalidDataException(
+                    $"Settings schema {s.SchemaVersion} is newer than supported schema {CurrentSettingsSchema}."));
+                return;
+            }
 
             _deviceMax = s.DeviceMax != null ? new(s.DeviceMax) : new();
             _devices = s.Devices != null ? new(s.Devices) : new();
@@ -2349,7 +2425,7 @@ public class MainForm : Form
 
             ApplyTheme(CurrentTheme());
         }
-        catch { }
+        catch (Exception ex) { Program.Log(ex, "Applying settings"); }
         finally { _loadingSettings = false; }
     }
 
@@ -2383,15 +2459,34 @@ public class MainForm : Form
             foreach (var g in _groups)
                 _devices[g.Key] = new DeviceProfile { Name = g.Name, Sliders = g.Sliders.Select(ToConfig).ToList() };
 
-            var s = new Settings { Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), AppSeen = new(_appSeen), IgnoredDevices = _ignored.ToList(), MonitoredDevices = _allowed.ToList(), Categories = _categories, ThemeMode = _themeMode, CloseBehavior = _closeBehavior };
+            var s = new Settings { SchemaVersion = CurrentSettingsSchema, Devices = _devices, DeviceMax = _deviceMax, KnownApps = new(_knownApps), AppSeen = new(_appSeen), IgnoredDevices = _ignored.ToList(), MonitoredDevices = _allowed.ToList(), Categories = _categories, ThemeMode = _themeMode, CloseBehavior = _closeBehavior };
             Directory.CreateDirectory(SettingsDir);
             // Write to a temp file then swap it in, so a crash mid-write can't
             // leave a half-written (corrupt) file behind.
             string tmp = SettingsPath + ".tmp";
             File.WriteAllText(tmp, JsonSerializer.Serialize(s));
-            File.Move(tmp, SettingsPath, overwrite: true);
+            if (File.Exists(SettingsPath))
+            {
+                try { File.Replace(tmp, SettingsPath, SettingsPath + ".bak", ignoreMetadataErrors: true); }
+                catch (PlatformNotSupportedException)
+                {
+                    File.Copy(SettingsPath, SettingsPath + ".bak", overwrite: true);
+                    File.Move(tmp, SettingsPath, overwrite: true);
+                }
+            }
+            else File.Move(tmp, SettingsPath);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Program.LogRateLimited("settings-save", ex, "Saving settings");
+            SafeUi(() =>
+            {
+                if (_settingsFaultShown) return;
+                _settingsFaultShown = true;
+                _tray.ShowBalloonTip(4000, "ZMK Volume Fader",
+                    "Settings could not be saved. Details were written to error.log.", ToolTipIcon.Warning);
+            });
+        }
     }
 
     // ---- per-device profiles ----------------------------------------------
@@ -2425,10 +2520,12 @@ public class MainForm : Form
     {
         if (_groups.FirstOrDefault(g => g.Key == key) is { } existing)
         {
+            bool reconnected = !existing.Connected;
             existing.Connected = true;
             if (!string.IsNullOrWhiteSpace(name)) { existing.Name = name; if (existing.HeaderName != null) existing.HeaderName.Text = name; }
             RethemeHeader(existing, CurrentTheme());
             UpdateAggregateStatus();
+            if (reconnected) PublishDesiredVolumes();
             return;
         }
         bool freshDefault = false;
@@ -2448,15 +2545,19 @@ public class MainForm : Form
         RelayoutGroups();
         SaveSettings();
         UpdateAggregateStatus();
+        PublishDesiredVolumes();
         if (freshDefault) PromptSetup(group.Key, name);
     }
 
     void MarkGroupConnection(string key, bool connected)
     {
         if (_groups.FirstOrDefault(g => g.Key == key) is not { } g) return;
+        if (g.Connected == connected) return;
         g.Connected = connected;
         RethemeHeader(g, CurrentTheme());
         UpdateAggregateStatus();
+        UpdateAllSliderStates();
+        PublishDesiredVolumes();
     }
 
     // Drop a group entirely (user ignored the device): persist its final state,
@@ -2545,6 +2646,7 @@ public class MainForm : Form
         FitWindowHeight();
         LoadDevices();   // repopulate combos + re-pick active outputs across all cards
         UpdateHotkeySnapshot();
+        PublishDesiredVolumes();
     }
 
     // Build a group's header row: a status dot, the device/section name, and a
@@ -2561,8 +2663,8 @@ public class MainForm : Form
         row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-        var dot = new Label { Text = "●", AutoSize = true, Font = new Font("Segoe UI", 7f), Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 6, 0) };
-        var name = new Label { Text = g.Name, AutoSize = true, Font = new Font("Segoe UI", 9.75f, FontStyle.Bold), Anchor = AnchorStyles.Left, Margin = new Padding(0, 3, 0, 0) };
+        var dot = new Label { Text = "●", AutoSize = true, Font = UiFonts.Get(7f), Anchor = AnchorStyles.Left, Margin = new Padding(0, 6, 6, 0) };
+        var name = new Label { Text = g.Name, AutoSize = true, Font = UiFonts.Get(9.75f, FontStyle.Bold), Anchor = AnchorStyles.Left, Margin = new Padding(0, 3, 0, 0) };
         var btn = new RoundedButton { Text = g.IsVirtual ? "Add fader" : "Set up", AutoSize = true, Padding = new Padding(10, 3, 10, 3), Anchor = AnchorStyles.Right, Margin = new Padding(8, 0, 0, 0) };
         btn.Click += (_, _) => RunSetupWizard(g.Key, pulse: g.IsVirtual && g.Sliders.Count == 0);
         _tip.SetToolTip(btn, g.IsVirtual ? "Add or arrange virtual faders" : "Map this device's faders and capture their range");
@@ -2746,6 +2848,7 @@ public class MainForm : Form
         }
         PublishDeviceSets();
         SaveSettings();
+        _discoveryWake.Set();
 
         // Reconcile live state: stop reading and drop the group for any device the
         // user just un-ticked. Newly opted-in units are opened by the next
@@ -2949,12 +3052,19 @@ public class MainForm : Form
         return list;
     }
 
-    // A single discovery thread scans every ~1.5 s and opens any monitored device
-    // that isn't already being read; each open device gets its own reader thread.
+    // A discovery thread wakes on HidSharp device changes (plus a slow safety
+    // retry) and opens monitored devices; each gets its own blocking reader thread.
     void StartHid()
     {
         _run = true;
-        _faderPump.Start();
+        UpdateAggregateStatus();
+        if (Program.DiagSynth) RequestFaderPump();
+        _hidChanged = (_, _) =>
+        {
+            try { _discoveryWake.Set(); }
+            catch (ObjectDisposedException) { } // notification already in flight at shutdown
+        };
+        DeviceList.Local.Changed += _hidChanged;
         _discoveryThread = new Thread(DiscoveryLoop) { IsBackground = true, Name = "fader-discovery" };
         _discoveryThread.Start();
     }
@@ -2972,18 +3082,26 @@ public class MainForm : Form
                     StartReader(key, dev, stream);
                 }
             }
-            catch { }
-            UpdateAggregateStatus();
-            Thread.Sleep(1500);
+            catch (Exception ex) { Program.LogRateLimited("hid-discovery", ex, "Discovering fader devices"); }
+            // DeviceList.Changed wakes this immediately for plug/unplug. The slow
+            // fallback covers a missed OS notification or a transient open failure
+            // without continuously enumerating every HID device on the machine.
+            _discoveryWake.WaitOne(_readerSnapshot.Length == 0 ? 10_000 : 60_000);
         }
     }
+
+    void PublishReaderSnapshotLocked() => _readerSnapshot = _readers.Values.ToArray();
 
     void StartReader(string key, HidDevice dev, HidStream stream)
     {
         var reader = new Reader { Key = key, Stream = stream };
         try { reader.Name = dev.GetProductName(); } catch { reader.Name = "ZMK keyboard"; }
         int reportLen; try { reportLen = dev.GetMaxInputReportLength(); } catch { reportLen = 64; }
-        lock (_readersLock) _readers[key] = reader;
+        lock (_readersLock)
+        {
+            _readers[key] = reader;
+            PublishReaderSnapshotLocked();
+        }
         reader.Thread = new Thread(() => ReaderLoop(reader, stream, reportLen)) { IsBackground = true, Name = $"fader-hid:{key}" };
         OnDeviceConnected(key, reader.Name);
         reader.Thread.Start();
@@ -3023,38 +3141,64 @@ public class MainForm : Form
                     if (n >= 3 && buf[0] == 0x02)
                     {
                         int count = Math.Min(MaxAxes, (n - 1) / 2);
-                        var axes = new int[count];
-                        for (int i = 0; i < count; i++) axes[i] = ReadAxis(buf, 1 + 2 * i);
-                        // Hand the newest axes to the pump; a report flood collapses
-                        // to whatever the ~60 Hz pump reads, not per-report UI work.
-                        Interlocked.Exchange(ref reader.Pending, axes);
+                        lock (reader.PendingLock)
+                        {
+                            for (int i = 0; i < count; i++)
+                                reader.PendingAxes[i] = ReadAxis(buf, 1 + 2 * i);
+                            reader.PendingCount = count;
+                            reader.HasPending = true;
+                        }
+                        RequestFaderPump();
                     }
                 }
             }
         }
-        catch { }
+        catch (Exception ex) { Program.LogRateLimited($"hid-reader:{reader.Key}", ex, "Reading a fader device"); }
         finally
         {
-            lock (_readersLock) { if (_readers.TryGetValue(reader.Key, out var cur) && cur == reader) _readers.Remove(reader.Key); }
+            lock (_readersLock)
+            {
+                if (_readers.TryGetValue(reader.Key, out var cur) && cur == reader) _readers.Remove(reader.Key);
+                PublishReaderSnapshotLocked();
+            }
             OnDeviceDisconnected(reader.Key);
             UpdateAggregateStatus();
+            if (_run) _discoveryWake.Set();
         }
+    }
+
+    void StopHid()
+    {
+        _run = false;
+        if (_hidChanged != null)
+        {
+            try { DeviceList.Local.Changed -= _hidChanged; } catch { }
+            _hidChanged = null;
+        }
+        var readers = _readerSnapshot;
+        StopReaders();
+        _discoveryWake.Set();
+        bool discoveryStopped = _discoveryThread?.Join(2_000) ?? true;
+        _discoveryThread = null;
+
+        foreach (var reader in readers) reader.Thread.Join(1_000);
+        if (discoveryStopped) _discoveryWake.Dispose();
+        try { HidSharp.Utility.HidSharpLibrary.ManualShutdown().WaitOne(2_000); }
+        catch (Exception ex) { Program.LogRateLimited("hid-shutdown", ex, "Stopping HidSharp"); }
     }
 
     // Signal every reader to stop and close its stream (unblocking any pending
     // read) — called on shutdown so background threads exit promptly.
     void StopReaders()
     {
-        List<Reader> snapshot;
-        lock (_readersLock) snapshot = _readers.Values.ToList();
+        var snapshot = _readerSnapshot;
         foreach (var r in snapshot) { r.Stop = true; try { r.Stream?.Close(); } catch { } }
     }
 
     // Footer status from the set of open readers: names when few, a count when many.
     void UpdateAggregateStatus()
     {
-        List<string> names;
-        lock (_readersLock) names = _readers.Values.Select(r => r.Name).ToList();
+        var names = _readerSnapshot.Select(r => r.Name).ToList();
         if (names.Count == 0) { SetStatus("No fader device — plug one in…", false); return; }
         if (names.Count == 1) { SetStatus($"Connected to {names[0]}", true); return; }
         if (names.Count <= 3) { SetStatus($"Connected — {string.Join(", ", names)}", true); return; }
@@ -3069,24 +3213,56 @@ public class MainForm : Form
     void FaderPumpTick()
     {
         if (!IsHandleCreated) return;
-        List<Reader> readers;
-        lock (_readersLock) readers = _readers.Values.ToList();
-        foreach (var r in readers)
+        foreach (var r in _readerSnapshot)
         {
-            var axes = Interlocked.Exchange(ref r.Pending, null);
-            if (axes == null) continue;
+            int count;
+            lock (r.PendingLock)
+            {
+                if (!r.HasPending) continue;
+                count = r.PendingCount;
+                Array.Copy(r.PendingAxes, r.SnapshotAxes, count);
+                r.HasPending = false;
+            }
             // Synth isolation: drain real reports but let the synthetic motion
             // below be the only thing driving the sliders.
             if (Program.DiagSynth) continue;
             if (!_rawByDevice.TryGetValue(r.Key, out var raw) || raw.Length != MaxAxes)
                 _rawByDevice[r.Key] = raw = new int[MaxAxes];
-            for (int i = 0; i < axes.Length && i < MaxAxes; i++) raw[i] = axes[i];
+            for (int i = 0; i < count; i++) raw[i] = r.SnapshotAxes[i];
             foreach (var s in _sliders)
-                if (s.GroupKey == r.Key && s.AxisIndex >= 0 && s.AxisIndex < axes.Length)
-                    ApplyAxis(s, axes[s.AxisIndex]);
+                if (s.GroupKey == r.Key && s.AxisIndex >= 0 && s.AxisIndex < count)
+                    ApplyAxis(s, r.SnapshotAxes[s.AxisIndex]);
         }
         if (Program.DiagSynth) SynthTick();
         FlushPendingVolumes();
+        if (!Program.DiagSynth && !PumpHasWork())
+        {
+            _faderPump.Stop();
+            _pumpActive = false;
+            // Close the race where a reader published immediately before the flag
+            // changed but saw the pump as active and therefore did not queue a wake.
+            if (PumpHasWork()) RequestFaderPump();
+        }
+    }
+
+    // Wake the UI pump only when work exists. At rest there is no permanent 60 Hz
+    // WinForms timer wakeup; report floods are still coalesced by Reader.Pending.
+    void RequestFaderPump()
+    {
+        if (_pumpActive || Interlocked.Exchange(ref _pumpStartQueued, 1) != 0) return;
+        SafeUi(() =>
+        {
+            Interlocked.Exchange(ref _pumpStartQueued, 0);
+            if (_pumpActive) return;
+            _pumpActive = true;
+            _faderPump.Start();
+        });
+    }
+
+    bool PumpHasWork()
+    {
+        if (_sliders.Any(a => a.VolPending >= 0)) return true;
+        return _readerSnapshot.Any(r => r.HasPending);
     }
 
     // Synthetic fader motion (--diag-synth): sweep every physical slider through
@@ -3125,8 +3301,13 @@ public class MainForm : Form
         a.Sm = a.Sm < 0 || Math.Abs(raw - a.Sm) > SnapBand
             ? raw
             : a.Sm * 0.85 + raw * 0.15;
-        Render(a);
+        Render(a, takeOwnership: true);
     }
+
+    bool IsFaderConnected(Axis a) =>
+        a.IsVirtual || _groups.FirstOrDefault(g => g.Key == a.GroupKey)?.Connected == true;
+
+    void TakeTargetOwnership(Axis a) => a.DriveSequence = ++_nextDriveSequence;
 
     // Is this slider actually driving something right now? False if the unit is
     // unplugged, an output target isn't present, or an app/category target has no
@@ -3135,15 +3316,15 @@ public class MainForm : Form
     {
         // Virtual faders don't depend on the dongle, so a disconnect doesn't grey
         // them; they still grey when their app/category target isn't playing.
-        if (!a.IsVirtual && !_connected) return false;
+        if (!IsFaderConnected(a)) return false;
         switch (a.Target)
         {
             case TargetKind.App:
-                return a.AppKey != null && _appSessions.ContainsKey(a.AppKey);
+                return a.AppKey != null && _liveApps.Contains(a.AppKey);
             case TargetKind.Category:
                 if (a.CategoryName == UnassignedCategory) return UnassignedKeys().Any();
                 var c = _categories.FirstOrDefault(x => x.Name == a.CategoryName);
-                return c != null && c.AppKeys.Any(_appSessions.ContainsKey);
+                return c != null && c.AppKeys.Any(_liveApps.Contains);
             default:
                 return Resolve(a) != null;
         }
@@ -3159,7 +3340,7 @@ public class MainForm : Form
 
     void UpdateAllSliderStates() { foreach (var s in _sliders) UpdateSliderState(s); }
 
-    void Render(Axis a)
+    void Render(Axis a, bool takeOwnership = false)
     {
         // no-draw isolation: the muted tint / % color are paint work too.
         if (!Program.DiagNoDraw) UpdateSliderState(a);
@@ -3198,86 +3379,94 @@ public class MainForm : Form
         }
 
         if (applied == a.LastApplied) return;
+        if (takeOwnership) TakeTargetOwnership(a);
         a.LastApplied = applied;
         if (!Program.DiagNoDraw && !Program.DiagNoTray) UpdateTrayText();
         if (_calibrating) return;   // visualize, but don't drive anything while calibrating
-        if (Program.DiagNoVolume) return;   // leak isolation: never touch the audio APIs
+        if (Program.DiagNoVolume) return;   // leak isolation: never send a volume set
 
-        // Queue rather than write: FlushPendingVolumes rate-limits the actual
-        // Windows calls (see the VolPending comment for why).
+        // Queue a logical change. The audio worker coalesces complete desired maps
+        // and limits actual Windows calls after app/category session fan-out.
         a.VolPending = applied;
+        RequestFaderPump();
     }
 
-    // Minimum gap between volume writes per slider (~20/s). Inaudible vs the
-    // ~60/s the pump can produce, and it cuts the ETW-notification kernel-pool
-    // leak those writes trigger by the same factor.
+    // Minimum gap between desired-state publications per slider (~20/s). Actual
+    // Core Audio calls have a separate global ceiling in AudioController.
     const int MinVolWriteMs = 50;
 
-    // Called every pump tick: write each slider's newest pending volume once
-    // it's out of the rate-limit window. The pump keeps ticking after reports
-    // stop, so the final settled value always lands within MinVolWriteMs.
+    // Publish each slider's newest desired value once it leaves this window. The
+    // pump stays awake until the final settled value has been handed off.
     void FlushPendingVolumes()
     {
         long now = Environment.TickCount64;
+        bool changed = false;
         foreach (var a in _sliders)
         {
             if (a.VolPending < 0 || now - a.VolLastWrite < MinVolWriteMs) continue;
-            int applied = a.VolPending;
             a.VolPending = -1;
             a.VolLastWrite = now;
-            WriteVolume(a, applied);
+            changed = true;
         }
+        if (changed) PublishDesiredVolumes();
     }
 
-    void WriteVolume(Axis a, int applied)
+
+    // Build one complete logical target map. Replacing the previous map clears
+    // stale targets after reassignment/removal. Dictionary assignment preserves
+    // the existing "last fader wins" behavior when target groups overlap.
+    void PublishDesiredVolumes()
     {
-        float scalar = applied / 100f;
-        if (a.Target == TargetKind.App)
+        if (_audio == null) return;
+        var endpoints = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+        var apps = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+
+        if (!Program.DiagNoVolume)
         {
-            // Drive the app on every output it's currently playing to. Nothing is
-            // driven when it has no live session; it takes effect once one appears.
-            ApplyAppVolume(a.AppKey, scalar);
-        }
-        else if (a.Target == TargetKind.Category)
-        {
-            // Move every app in the category together.
-            if (a.CategoryName == UnassignedCategory)
-                foreach (var key in UnassignedKeys()) ApplyAppVolume(key, scalar);
-            else
+            // Older owners are written first; the most recently manipulated
+            // fader wins if two logical targets overlap.
+            foreach (var a in _sliders.OrderBy(a => a.DriveSequence))
             {
-                var cat = _categories.FirstOrDefault(c => c.Name == a.CategoryName);
-                if (cat != null) foreach (var key in cat.AppKeys) ApplyAppVolume(key, scalar);
+                if (a.LastApplied < 0 || !IsFaderConnected(a)) continue;
+                float scalar = a.LastApplied / 100f;
+                if (a.Target == TargetKind.Output)
+                {
+                    string? id = Resolve(a);
+                    if (id != null) endpoints[id] = scalar;
+                }
+                else if (a.Target == TargetKind.App)
+                {
+                    if (a.AppKey != null) apps[a.AppKey] = scalar;
+                }
+                else if (a.CategoryName == UnassignedCategory)
+                {
+                    foreach (var key in UnassignedKeys()) apps[key] = scalar;
+                }
+                else
+                {
+                    var category = _categories.FirstOrDefault(c => c.Name == a.CategoryName);
+                    if (category != null)
+                        foreach (var key in category.AppKeys) apps[key] = scalar;
+                }
             }
         }
-        // Each fader drives its own active output. If two sliders resolve to the
-        // same endpoint they both write its volume (last move wins) — by design,
-        // so point them at different outputs to use them independently.
-        else if (a.Combo.SelectedItem is DeviceItem di)
-        {
-            try { di.Device.AudioEndpointVolume.MasterVolumeLevelScalar = scalar; }
-            catch { }
-        }
-    }
-
-    void ApplyAppVolume(string? key, float scalar)
-    {
-        if (key != null && _appSessions.TryGetValue(key, out var list))
-            foreach (var sc in list) { try { sc.SimpleAudioVolume.Volume = scalar; } catch { } }
+        _audio.SetDesiredVolumes(endpoints, apps);
     }
 
     void SetStatus(string text, bool connected)
     {
-        if (!IsHandleCreated) return;
-        try
+        lock (_statusPostLock)
         {
-            BeginInvoke(() =>
-            {
-                _connText = text;
-                _connected = connected;
-                RefreshStatus();
-            });
+            if (_lastStatusText == text && _lastStatusConnected == connected) return;
+            _lastStatusText = text;
+            _lastStatusConnected = connected;
         }
-        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
+        SafeUi(() =>
+        {
+            _connText = text;
+            _connected = connected;
+            RefreshStatus();
+        });
     }
 
     // Footer status reflects the dongle connection. (A fader with no output to
@@ -3297,10 +3486,24 @@ public class MainForm : Form
     // NotifyIcon 63-char limit).
     void UpdateTrayText()
     {
+        if (Program.DiagNoTray) return;
         string body = _connected
             ? string.Join(" · ", _sliders.Select(s => $"{s.Bar.Value}%"))
             : "Disconnected";
         string t = $"ZMK Volume Fader\n{body}";
-        _tray.Text = t.Length <= 63 ? t : t[..63];
+        t = t.Length <= 63 ? t : t[..63];
+        if (t == _pendingTrayText || t == _lastTrayText) return;
+        _pendingTrayText = t;
+        if (!_trayUpdate.Enabled) _trayUpdate.Start();
+    }
+
+    void FlushTrayText()
+    {
+        string? text = _pendingTrayText;
+        _pendingTrayText = null;
+        _trayUpdate.Stop();
+        if (text == null || text == _lastTrayText) return;
+        _tray.Text = text;
+        _lastTrayText = text;
     }
 }

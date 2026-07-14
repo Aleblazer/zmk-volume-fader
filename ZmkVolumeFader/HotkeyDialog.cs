@@ -48,7 +48,7 @@ sealed class HotkeyDialog : Form
         _up = Clone(up); _down = Clone(down); _mute = Clone(mute);
 
         Text = "Hotkeys";
-        Font = new Font("Segoe UI", 9.75f);
+        Font = UiFonts.Get(9.75f);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
@@ -62,7 +62,7 @@ sealed class HotkeyDialog : Form
         root.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         for (int r = 0; r < 7; r++) root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        var title = new Label { Text = $"Hotkeys — {faderName}", AutoSize = true, ForeColor = _t.Text, Font = new Font("Segoe UI", 12.5f, FontStyle.Bold), Margin = new Padding(0, 0, 0, 4) };
+        var title = new Label { Text = $"Hotkeys — {faderName}", AutoSize = true, ForeColor = _t.Text, Font = UiFonts.Get(12.5f, FontStyle.Bold), Margin = new Padding(0, 0, 0, 4) };
         root.Controls.Add(title, 0, 0); root.SetColumnSpan(title, 3);
 
         var intro = new Label { Text = "Click a field, then press the key combo. F13–F24 work great with no modifier.", AutoSize = true, MaximumSize = new Size(W - 40, 0), ForeColor = _t.Subtle, Margin = new Padding(0, 0, 0, 10) };

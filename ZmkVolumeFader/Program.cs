@@ -29,14 +29,15 @@ static class Program
     // read itself, GDI repaints, the tray-icon text, and the audio volume set.
     // Each switch surgically disables exactly one channel so a leak run can
     // attribute the flood. Diagnostic-only; no effect unless passed.
-    //   --diag-sink       read + discard HID reports (nothing downstream runs)
+    //   --diag-sink       read + discard HID reports (no fader pipeline work)
     //   --diag-no-draw    full pipeline, but no bar/label repaints or tray text
     //   --diag-no-tray    full pipeline, but no tray-icon text updates
-    //   --diag-no-volume  full pipeline + UI, but never touch the audio APIs
+    //   --diag-no-volume  full pipeline + UI/session tracking, but no volume sets
+    //   --diag-audio-stats show cumulative endpoint/session setter counts in title
     //   --diag-synth      ignore real reports; synthesize continuous fader motion
     //                     (2..30% triangle) below the HID layer, so draw/tray/volume
     //                     run at full rate with the hardware untouched
-    internal static bool DiagSink, DiagNoDraw, DiagNoTray, DiagNoVolume, DiagSynth;
+    internal static bool DiagSink, DiagNoDraw, DiagNoTray, DiagNoVolume, DiagSynth, DiagAudioStats;
 
     internal static string DiagText()
     {
@@ -46,6 +47,7 @@ static class Program
         if (DiagNoTray) on.Add("no-tray");
         if (DiagNoVolume) on.Add("no-volume");
         if (DiagSynth) on.Add("synth");
+        if (DiagAudioStats) on.Add("audio-stats");
         return on.Count == 0 ? "" : $"[diag: {string.Join(" ", on)}]";
     }
 
@@ -53,6 +55,8 @@ static class Program
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ZmkVolumeFader", "error.log");
 
     static bool _errorShown;
+    static readonly object LogLock = new();
+    static readonly Dictionary<string, long> LastLogByKey = new(StringComparer.Ordinal);
 
     [STAThread]
     static void Main(string[] args)
@@ -64,6 +68,7 @@ static class Program
             else if (a.Equals("--diag-no-tray", StringComparison.OrdinalIgnoreCase)) DiagNoTray = true;
             else if (a.Equals("--diag-no-volume", StringComparison.OrdinalIgnoreCase)) DiagNoVolume = true;
             else if (a.Equals("--diag-synth", StringComparison.OrdinalIgnoreCase)) DiagSynth = true;
+            else if (a.Equals("--diag-audio-stats", StringComparison.OrdinalIgnoreCase)) DiagAudioStats = true;
         }
 
         // Single instance: a second copy would fight over the HID stream, the
@@ -99,14 +104,31 @@ static class Program
         catch { }
     }
 
-    static void Log(Exception ex)
+    internal static void LogRateLimited(string key, Exception ex, string? context = null, int minimumIntervalMs = 60_000)
+    {
+        lock (LogLock)
+        {
+            long now = Environment.TickCount64;
+            if (LastLogByKey.TryGetValue(key, out long last) && now - last < minimumIntervalMs) return;
+            LastLogByKey[key] = now;
+            LogCore(ex, context);
+        }
+    }
+
+    internal static void Log(Exception ex, string? context = null)
+    {
+        lock (LogLock) LogCore(ex, context);
+    }
+
+    static void LogCore(Exception ex, string? context)
     {
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!);
             var f = new FileInfo(LogPath);
             if (f.Exists && f.Length > 512 * 1024) f.Delete();   // keep the log bounded
-            File.AppendAllText(LogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {ex}\n\n");
+            string prefix = context == null ? "" : $"{context}: ";
+            File.AppendAllText(LogPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {prefix}{ex}\n\n");
         }
         catch { }
     }

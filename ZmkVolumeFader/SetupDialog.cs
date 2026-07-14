@@ -46,7 +46,7 @@ sealed class SetupDialog : Form
     int _candidate = -1;
 
     // --- controls ---
-    readonly Label _title = new() { AutoSize = false, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 8), Font = new Font("Segoe UI", 12.5f, FontStyle.Bold) };
+    readonly Label _title = new() { AutoSize = false, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 8), Font = UiFonts.Get(12.5f, FontStyle.Bold) };
     // Same themed scroll viewport as the main window (native AutoScroll would
     // paint a squared scrollbar and ignore the wheel unless focused).
     readonly RoundedScrollPanel _listScroll = new() { Dock = DockStyle.Fill, BackColor = Color.Transparent };
@@ -77,7 +77,7 @@ sealed class SetupDialog : Form
             _items.Add(new Item { Kind = it.Kind, Axis = it.Axis, Min = it.Min, Max = it.Max, SourceIndex = it.SourceIndex, Label = it.Label });
 
         Text = "Set Up Faders";
-        Font = new Font("Segoe UI", 9.75f);
+        Font = UiFonts.Get(9.75f);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
@@ -106,7 +106,7 @@ sealed class SetupDialog : Form
         _capturePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         _capturePanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         _capturePanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        var captureHead = new Label { AutoSize = false, Dock = DockStyle.Fill, Height = 26, Text = "Add physical fader", Font = new Font("Segoe UI", 10.5f, FontStyle.Bold), ForeColor = _t.Text };
+        var captureHead = new Label { AutoSize = false, Dock = DockStyle.Fill, Height = 26, Text = "Add physical fader", Font = UiFonts.Get(10.5f, FontStyle.Bold), ForeColor = _t.Text };
         _captureDetail.ForeColor = _t.Subtle;
         _capturePanel.Controls.Add(captureHead, 0, 0);
         _capturePanel.Controls.Add(_captureDetail, 0, 1);
@@ -161,10 +161,10 @@ sealed class SetupDialog : Form
                 Math.Min(LogicalToDeviceUnits(H),
                     Math.Max(LogicalToDeviceUnits(300),
                         Screen.FromControl(this).WorkingArea.Height - LogicalToDeviceUnits(80))));
-            _tick.Start();
             StartPulse();
         };
         FormClosing += (_, _) => { _tick.Stop(); _pulse?.Stop(); };
+        FormClosed += (_, _) => { _tick.Dispose(); _pulse?.Dispose(); };
     }
 
     // ---- list mode --------------------------------------------------------
@@ -226,7 +226,7 @@ sealed class SetupDialog : Form
             Text = it.Label,
             PlaceholderText = it.Kind == ItemKind.Virtual ? "Virtual fader" : "Physical fader",
             BorderStyle = BorderStyle.FixedSingle, BackColor = _t.CtlBg, ForeColor = _t.Text,
-            Font = new Font("Segoe UI", 9.75f),
+            Font = UiFonts.Get(9.75f),
             Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom, Margin = new Padding(0, 0, 6, 1),
         };
         name.TextChanged += (_, _) => it.Label = name.Text;
@@ -293,10 +293,12 @@ sealed class SetupDialog : Form
         _captureButtons.Visible = true;
         UpdateTitle();
         UpdateCaptureText();
+        _tick.Start();
     }
 
     void ExitCapture()
     {
+        _tick.Stop();
         _mode = Mode.List;
         _capturePanel.Visible = false;
         _captureButtons.Visible = false;

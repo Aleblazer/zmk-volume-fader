@@ -43,7 +43,7 @@ sealed class CategoriesDialog : Form
         _apps = knownApps.Select(kv => (kv.Key, kv.Value)).OrderBy(a => a.Value, StringComparer.OrdinalIgnoreCase).ToArray();
 
         Text = "Manage Categories";
-        Font = new Font("Segoe UI", 9.75f);
+        Font = UiFonts.Get(9.75f);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;

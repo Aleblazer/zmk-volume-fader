@@ -38,7 +38,7 @@ sealed class DevicesDialog : Form
         _rows = rows;
 
         Text = "Fader Devices";
-        Font = new Font("Segoe UI", 9.75f);
+        Font = UiFonts.Get(9.75f);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;

@@ -46,7 +46,7 @@ sealed class OutputsDialog : Form
         _list = new ListBox[_n]; _add = new RoundedComboBox[_n]; _addBtn = new RoundedButton[_n];
 
         Text = "Set Default Outputs";
-        Font = new Font("Segoe UI", 9.75f);
+        Font = UiFonts.Get(9.75f);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
@@ -263,13 +263,21 @@ sealed class OutputsDialog : Form
     {
         try
         {
-            _known = _enum.EnumerateAudioEndPoints(DataFlow.Render,
-                    DeviceState.Active | DeviceState.Unplugged | DeviceState.Disabled)
-                .Select(d => new OutputPref { Id = d.ID, Name = d.FriendlyName })
-                .OrderBy(o => o.Name)
-                .ToList();
-            _present = _enum.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
-                .Select(d => d.ID).ToHashSet();
+            var known = new List<OutputPref>();
+            foreach (var d in _enum.EnumerateAudioEndPoints(DataFlow.Render,
+                         DeviceState.Active | DeviceState.Unplugged | DeviceState.Disabled))
+            {
+                try { known.Add(new OutputPref { Id = d.ID, Name = d.FriendlyName }); }
+                finally { try { d.Dispose(); } catch { } }
+            }
+            var present = new HashSet<string>();
+            foreach (var d in _enum.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
+            {
+                try { present.Add(d.ID); }
+                finally { try { d.Dispose(); } catch { } }
+            }
+            _known = known.OrderBy(o => o.Name).ToList();
+            _present = present;
         }
         catch { return; }
 

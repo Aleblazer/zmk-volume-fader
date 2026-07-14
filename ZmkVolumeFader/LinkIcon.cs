@@ -68,6 +68,16 @@ sealed class LinkIcon : Control
         }
     }
 
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _vector?.Dispose();
+            _image?.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+
     static void Open(string url)
     {
         try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }

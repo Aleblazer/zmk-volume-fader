@@ -44,6 +44,10 @@ sealed class OptionsDialog : Form
     readonly MainForm.FaderBar[] _bar;
     readonly bool[] _recording;
     readonly bool[] _virtual;   // per slider: virtual faders have no calibration
+    readonly int[] _lastRaw;
+    readonly (int v, int pct)[][] _previewCurves;
+    readonly (int Min, int Max, TaperKind Taper)[] _previewCurveSpecs;
+    readonly bool[] _previewCurveValid;
 
     readonly CheckBox _startup = new() { Text = "Start with Windows", AutoSize = true, FlatStyle = FlatStyle.Standard, Margin = new Padding(0, 0, 0, 0) };
     readonly RoundedComboBox _themeCombo = new() { Width = 190 };
@@ -88,9 +92,13 @@ sealed class OptionsDialog : Form
         _muteStep = new MainForm.Stepper?[_n];
         _bar = new MainForm.FaderBar[_n]; _recording = new bool[_n];
         _virtual = virtuals ?? new bool[_n];
+        _lastRaw = Enumerable.Repeat(int.MinValue, _n).ToArray();
+        _previewCurves = new (int v, int pct)[_n][];
+        _previewCurveSpecs = new (int, int, TaperKind)[_n];
+        _previewCurveValid = new bool[_n];
 
         Text = "Options";
-        Font = new Font("Segoe UI", 9.75f);
+        Font = UiFonts.Get(9.75f);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
         ShowInTaskbar = false;
@@ -154,6 +162,7 @@ sealed class OptionsDialog : Form
             _tick.Start();
         };
         FormClosing += (_, _) => _tick.Stop();
+        FormClosed += (_, _) => { _tick.Dispose(); _tip.Dispose(); };
     }
 
     // Size the dialog to its content up to a cap; the fader list scrolls beyond.
@@ -187,7 +196,7 @@ sealed class OptionsDialog : Form
             // AutoSize so both lines are always fully shown — a fixed height clipped
             // the second line at 125%+ scaling. Anchor.None centres it in the cell.
             AutoSize = true, Anchor = AnchorStyles.None, TextAlign = ContentAlignment.MiddleCenter,
-            ForeColor = _t.Subtle, Font = new Font("Segoe UI", 8.25f), Margin = new Padding(0, 0, 0, 4),
+            ForeColor = _t.Subtle, Font = UiFonts.Get(8.25f), Margin = new Padding(0, 0, 0, 4),
         }, 0, 0);
 
         var icons = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Anchor = AnchorStyles.None, BackColor = Color.Transparent, Margin = new Padding(0) };
@@ -324,7 +333,7 @@ sealed class OptionsDialog : Form
         for (int r = 0; r < 5; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         t.Controls.Add(new Label { Text = name, AutoSize = true, ForeColor = _t.Subtle, Anchor = AnchorStyles.Left, Margin = new Padding(0, 4, 0, 0) }, 0, 0);
-        _rawLbl[i] = new Label { Text = "raw —", AutoSize = true, ForeColor = _t.Text, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 11f) };
+        _rawLbl[i] = new Label { Text = "raw —", AutoSize = true, ForeColor = _t.Text, Anchor = AnchorStyles.Right, Font = UiFonts.Get(11f) };
         t.Controls.Add(_rawLbl[i], 1, 0);
 
         _rangeLbl[i] = new Label { Text = "range —", AutoSize = true, ForeColor = _t.Text, Anchor = AnchorStyles.Left, Margin = new Padding(0, 8, 0, 0) };
@@ -355,7 +364,7 @@ sealed class OptionsDialog : Form
             BackColor = _t.CtlBg, ForeColor = _t.Text, BorderColor = _t.CtlBorder,
             ChevronColor = _t.Subtle, Surround = _t.Card,
         };
-        ms.ValueChanged += (_, _) => _cal[idx].MuteRaw = ms.Value;
+        ms.ValueChanged += (_, _) => { _cal[idx].MuteRaw = ms.Value; _lastRaw[idx] = int.MinValue; };
         _muteStep[i] = ms;
         mutePanel.Controls.Add(ms);
         mutePanel.Controls.Add(new Label { Text = "(0 = off)", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(6, 6, 0, 0) });
@@ -370,7 +379,7 @@ sealed class OptionsDialog : Form
             Knob = _t.Dark ? Color.FromArgb(0xE6, 0xE8, 0xEB) : Color.White,
             KnobEdge = _t.Dark ? Color.FromArgb(0x0E, 0x10, 0x14) : Color.FromArgb(0xC2, 0xC6, 0xCC),
         };
-        _previewLbl[i] = new Label { Text = "0%", AutoSize = true, ForeColor = _t.Accent, Anchor = AnchorStyles.Right, Font = new Font("Segoe UI", 11f) };
+        _previewLbl[i] = new Label { Text = "0%", AutoSize = true, ForeColor = _t.Accent, Anchor = AnchorStyles.Right, Font = UiFonts.Get(11f) };
         t.Controls.Add(_bar[i], 0, 4);
         t.Controls.Add(_previewLbl[i], 1, 4);
 
@@ -395,6 +404,7 @@ sealed class OptionsDialog : Form
 
     void ToggleRecord(int i)
     {
+        _lastRaw[i] = int.MinValue;
         _recording[i] = !_recording[i];
         if (_recording[i])
         {
@@ -409,12 +419,20 @@ sealed class OptionsDialog : Form
         }
     }
 
-    void OnTaperChanged(int i) => _cal[i].Taper = (TaperKind)_taper[i].SelectedIndex;
+    void OnTaperChanged(int i)
+    {
+        _cal[i].Taper = (TaperKind)_taper[i].SelectedIndex;
+        _lastRaw[i] = int.MinValue;
+    }
 
     void Tick(int i)
     {
         if (_virtual[i]) return;   // no calibration controls on a virtual fader
         int v = _raw[i]();
+        var spec = (_cal[i].Min, _cal[i].Max, _cal[i].Taper);
+        bool curveChanged = !_previewCurveValid[i] || _previewCurveSpecs[i] != spec;
+        if (v == _lastRaw[i] && !curveChanged) return;
+        _lastRaw[i] = v;
         _rawLbl[i].Text = $"raw {v}";
         if (_recording[i])
         {
@@ -423,7 +441,14 @@ sealed class OptionsDialog : Form
         }
         _rangeLbl[i].Text = _cal[i].Min <= _cal[i].Max ? $"range {_cal[i].Min} – {_cal[i].Max}" : "range —";
 
-        int p = Math.Clamp((int)Math.Round(Calibration.Eval(_cal[i].BuildCurve(), v)), 0, 100);
+        spec = (_cal[i].Min, _cal[i].Max, _cal[i].Taper);
+        if (!_previewCurveValid[i] || _previewCurveSpecs[i] != spec)
+        {
+            _previewCurves[i] = _cal[i].BuildCurve();
+            _previewCurveSpecs[i] = spec;
+            _previewCurveValid[i] = true;
+        }
+        int p = Math.Clamp((int)Math.Round(Calibration.Eval(_previewCurves[i], v)), 0, 100);
         if (_cal[i].MuteRaw > 0 && v < _cal[i].MuteRaw) p = 0;   // preview the mute dead zone
         _previewLbl[i].Text = $"{p}%";
         _bar[i].Value = p;

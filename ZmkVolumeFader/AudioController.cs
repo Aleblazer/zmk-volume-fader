@@ -1,0 +1,563 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using NAudio.CoreAudioApi;
+using NAudio.CoreAudioApi.Interfaces;
+
+namespace ZmkVolumeFader;
+
+/// <summary>
+/// Owns every Core Audio COM object on one MTA thread. Endpoints and sessions are
+/// long-lived: device notifications trigger endpoint reconciliation, and one
+/// IAudioSessionNotification registration per endpoint supplies new sessions.
+///
+/// The UI publishes complete desired-volume snapshots. They are coalesced here,
+/// then drained through a single OS-call budget after app/category fan-out. This
+/// keeps a category with many sessions from multiplying a per-fader rate limit
+/// into hundreds of Core Audio notifications per second.
+/// </summary>
+sealed class AudioController : IDisposable
+{
+    internal sealed record AppSnapshot(string Key, int Pid);
+
+    const string SystemAppKey = "#system";
+    const int MinOsCallIntervalMs = 25;       // system-wide ceiling: 40 setters/s
+    const int SessionSweepMs = 30_000;        // state query only; no re-enumeration
+    const float VolumeEpsilon = 0.0049f;      // smaller than one integer-percent step
+
+    readonly Action<IReadOnlyList<AppSnapshot>> _appsChanged;
+    readonly Action<Exception> _faulted;
+    readonly ConcurrentQueue<Action> _commands = new();
+    readonly AutoResetEvent _wake = new(false);
+    readonly object _lifecycleLock = new();
+    readonly object _desiredLock = new();
+    readonly Thread _thread;
+
+    DesiredSnapshot? _pendingDesired;
+    bool _desiredDirty;
+    volatile bool _stopping;
+
+    // Worker-thread-only state below this line.
+    MMDeviceEnumerator? _enumerator;
+    readonly Dictionary<string, EndpointEntry> _endpoints = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, SessionEntry> _sessions = new(StringComparer.Ordinal);
+    readonly List<VolumeTarget> _writeOrder = new();
+    Dictionary<string, float> _desiredEndpoints = new(StringComparer.OrdinalIgnoreCase);
+    Dictionary<string, float> _desiredApps = new(StringComparer.OrdinalIgnoreCase);
+    int _writeCursor;
+    long _nextOsCall;
+    long _nextSessionSweep;
+    long _nextRetryAt = long.MaxValue;
+    bool _writeWorkPending;
+    bool _appsDirty;
+
+    long _endpointSetCalls, _sessionSetCalls;
+    internal long EndpointSetCalls => Interlocked.Read(ref _endpointSetCalls);
+    internal long SessionSetCalls => Interlocked.Read(ref _sessionSetCalls);
+
+    sealed record DesiredSnapshot(Dictionary<string, float> Endpoints, Dictionary<string, float> Apps);
+
+    abstract class VolumeTarget
+    {
+        public required string DesiredKey;
+        public bool WasDesired;
+        public float LastKnown = float.NaN;
+        public long RetryAfter;
+        public abstract bool IsEndpoint { get; }
+        public abstract void RefreshActual();
+        public abstract void Set(float scalar);
+        public virtual void Dispose() { }
+    }
+
+    sealed class EndpointEntry : VolumeTarget
+    {
+        public required string Id;
+        public required MMDevice Device;
+        public AudioSessionManager? Manager;
+        public AudioSessionManager.SessionCreatedDelegate? CreatedHandler;
+        public override bool IsEndpoint => true;
+
+        public override void RefreshActual()
+        {
+            LastKnown = Device.AudioEndpointVolume.MasterVolumeLevelScalar;
+        }
+
+        public override void Set(float scalar)
+        {
+            Device.AudioEndpointVolume.MasterVolumeLevelScalar = scalar;
+            LastKnown = scalar;
+        }
+
+        public override void Dispose()
+        {
+            if (Manager != null && CreatedHandler != null)
+                try { Manager.OnSessionCreated -= CreatedHandler; } catch { }
+            try { Device.Dispose(); } catch { }
+        }
+    }
+
+    sealed class SessionEntry : VolumeTarget
+    {
+        public required string Id;
+        public required string EndpointId;
+        public required int Pid;
+        public required AudioSessionControl Control;
+        public override bool IsEndpoint => false;
+
+        public override void RefreshActual()
+        {
+            LastKnown = Control.SimpleAudioVolume.Volume;
+        }
+
+        public override void Set(float scalar)
+        {
+            Control.SimpleAudioVolume.Volume = scalar;
+            LastKnown = scalar;
+        }
+
+        public override void Dispose()
+        {
+            try { Control.Dispose(); } catch { }
+        }
+    }
+
+    public AudioController(Action<IReadOnlyList<AppSnapshot>> appsChanged, Action<Exception>? faulted = null)
+    {
+        _appsChanged = appsChanged;
+        _faulted = faulted ?? (_ => { });
+        _thread = new Thread(Worker)
+        {
+            IsBackground = true,
+            Name = "core-audio"
+        };
+        _thread.SetApartmentState(ApartmentState.MTA);
+        _thread.Start();
+    }
+
+    /// <summary>Re-scan endpoints after a real device notification or user refresh.</summary>
+    public void RefreshEndpoints() => TryPost(ReconcileEndpoints);
+
+    /// <summary>
+    /// Replace, rather than append to, the desired state. Fast fader updates only
+    /// overwrite this one pending snapshot; they can never build an unbounded work
+    /// queue behind the audio worker.
+    /// </summary>
+    public void SetDesiredVolumes(Dictionary<string, float> endpoints, Dictionary<string, float> apps)
+    {
+        lock (_lifecycleLock)
+        {
+            if (_stopping) return;
+            lock (_desiredLock)
+            {
+                _pendingDesired = new DesiredSnapshot(endpoints, apps);
+                _desiredDirty = true;
+            }
+            _wake.Set();
+        }
+    }
+
+    bool TryPost(Action action)
+    {
+        lock (_lifecycleLock)
+        {
+            if (_stopping) return false;
+            _commands.Enqueue(action);
+            _wake.Set();
+            return true;
+        }
+    }
+
+    void Worker()
+    {
+        int failures = 0;
+        while (!_stopping)
+        {
+            try
+            {
+                RunWorkerCore();
+                failures = 0;
+            }
+            catch (Exception ex)
+            {
+                try { _faulted(ex); } catch { }
+            }
+            finally { CleanupWorkerState(); }
+
+            if (_stopping) break;
+            int delay = Math.Min(30_000, 1_000 << Math.Min(failures++, 4));
+            _wake.WaitOne(delay);
+        }
+    }
+
+    void RunWorkerCore()
+    {
+        _enumerator = new MMDeviceEnumerator();
+        ReconcileEndpoints();
+        PublishAppsIfDirty();
+        _nextSessionSweep = Environment.TickCount64 + SessionSweepMs;
+
+        while (!_stopping)
+        {
+            DrainCommands();
+            TakeDesiredSnapshot();
+
+            long now = Environment.TickCount64;
+            if (now >= _nextSessionSweep)
+            {
+                SweepExpiredSessions();
+                _nextSessionSweep = now + SessionSweepMs;
+            }
+            PublishAppsIfDirty();
+
+            bool wrote = false;
+            if (_writeWorkPending && now >= _nextOsCall && now >= _nextRetryAt)
+            {
+                wrote = TryWriteOne(now, out long earliestRetry);
+                if (wrote)
+                {
+                    _nextOsCall = now + MinOsCallIntervalMs;
+                    _nextRetryAt = long.MinValue;
+                }
+                else
+                {
+                    _writeWorkPending = earliestRetry != long.MaxValue;
+                    _nextRetryAt = earliestRetry;
+                }
+            }
+
+            long deadline = _nextSessionSweep;
+            if (_writeWorkPending)
+            {
+                if (_nextRetryAt > now) deadline = Math.Min(deadline, _nextRetryAt);
+                else if (_nextOsCall > now) deadline = Math.Min(deadline, _nextOsCall);
+                else deadline = now + 1;
+            }
+            int wait = (int)Math.Clamp(deadline - now, 1, SessionSweepMs);
+            _wake.WaitOne(wait);
+        }
+    }
+
+    void CleanupWorkerState()
+    {
+        // Dispose any session wrappers accepted immediately before shutdown or a
+        // Core Audio restart. The desired snapshot survives and is replayed.
+        DrainCommands();
+        foreach (var s in _sessions.Values) s.Dispose();
+        _sessions.Clear();
+        foreach (var e in _endpoints.Values) e.Dispose();
+        _endpoints.Clear();
+        _writeOrder.Clear();
+        try { _enumerator?.Dispose(); } catch { }
+        _enumerator = null;
+        _writeCursor = 0;
+        _nextOsCall = 0;
+        _nextRetryAt = long.MinValue;
+        _writeWorkPending = true;
+        _appsDirty = true;
+    }
+
+    void DrainCommands()
+    {
+        while (_commands.TryDequeue(out var action))
+        {
+            try { action(); }
+            catch (Exception ex) { Program.LogRateLimited("audio-command", ex, "Core Audio command"); }
+        }
+    }
+
+    void TakeDesiredSnapshot()
+    {
+        DesiredSnapshot? next = null;
+        lock (_desiredLock)
+        {
+            if (_desiredDirty)
+            {
+                next = _pendingDesired;
+                _pendingDesired = null;
+                _desiredDirty = false;
+            }
+        }
+        if (next == null) return;
+
+        _desiredEndpoints = next.Endpoints;
+        _desiredApps = next.Apps;
+        _writeWorkPending = true;
+        _nextRetryAt = long.MinValue;
+
+        // A target leaving the desired set must re-read its actual volume if it is
+        // assigned again later; another mixer may have changed it in between.
+        foreach (var t in _writeOrder)
+        {
+            bool wanted = t.IsEndpoint
+                ? _desiredEndpoints.ContainsKey(t.DesiredKey)
+                : _desiredApps.ContainsKey(t.DesiredKey);
+            if (!wanted) t.WasDesired = false;
+        }
+    }
+
+    bool TryWriteOne(long now, out long earliestRetry)
+    {
+        earliestRetry = long.MaxValue;
+        int count = _writeOrder.Count;
+        for (int checkedCount = 0; checkedCount < count; checkedCount++)
+        {
+            if (_writeCursor >= _writeOrder.Count) _writeCursor = 0;
+            if (_writeOrder.Count == 0) return false;
+            var target = _writeOrder[_writeCursor++];
+
+            var desiredMap = target.IsEndpoint ? _desiredEndpoints : _desiredApps;
+            if (!desiredMap.TryGetValue(target.DesiredKey, out float desired))
+            {
+                target.WasDesired = false;
+                continue;
+            }
+            if (now < target.RetryAfter)
+            {
+                earliestRetry = Math.Min(earliestRetry, target.RetryAfter);
+                continue;
+            }
+
+            try
+            {
+                if (!target.WasDesired)
+                {
+                    target.WasDesired = true;
+                    target.RefreshActual();       // once per assignment, not per tick
+                }
+                if (!float.IsNaN(target.LastKnown) && Math.Abs(target.LastKnown - desired) < VolumeEpsilon)
+                    continue;
+
+                target.Set(desired);
+                if (target.IsEndpoint) Interlocked.Increment(ref _endpointSetCalls);
+                else Interlocked.Increment(ref _sessionSetCalls);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                // A disappearing device/session should not create a tight retry
+                // loop. Endpoint reconciliation or the slow session sweep cleans it.
+                target.RetryAfter = now + 5_000;
+                earliestRetry = Math.Min(earliestRetry, target.RetryAfter);
+                Program.LogRateLimited($"audio-target:{target.DesiredKey}", ex, "Core Audio volume target");
+            }
+        }
+        return false;
+    }
+
+    void ReconcileEndpoints()
+    {
+        if (_enumerator == null) return;
+        var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var discovered = new List<MMDevice>();
+        try
+        {
+            discovered.AddRange(_enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active));
+            foreach (var device in discovered)
+            {
+                string id;
+                try { id = device.ID; }
+                catch { try { device.Dispose(); } catch { } continue; }
+                present.Add(id);
+                if (_endpoints.ContainsKey(id))
+                {
+                    try { device.Dispose(); } catch { }
+                    continue;
+                }
+                AddEndpoint(id, device);
+            }
+        }
+        catch (Exception ex)
+        {
+            foreach (var d in discovered)
+                if (!_endpoints.Values.Any(e => ReferenceEquals(e.Device, d)))
+                    try { d.Dispose(); } catch { }
+            Program.LogRateLimited("audio-endpoint-reconcile", ex, "Enumerating audio endpoints");
+            return;
+        }
+
+        foreach (var id in _endpoints.Keys.Where(id => !present.Contains(id)).ToArray())
+            RemoveEndpoint(id);
+    }
+
+    void AddEndpoint(string id, MMDevice device)
+    {
+        var endpoint = new EndpointEntry { Id = id, DesiredKey = id, Device = device };
+        _endpoints[id] = endpoint;
+        _writeOrder.Add(endpoint);
+        if (_desiredEndpoints.ContainsKey(id))
+        {
+            _writeWorkPending = true;
+            _nextRetryAt = long.MinValue;
+        }
+
+        try
+        {
+            var manager = device.AudioSessionManager; // one stable registration
+            endpoint.Manager = manager;
+            AudioSessionManager.SessionCreatedDelegate created = (_, raw) =>
+            {
+                AudioSessionControl? control = null;
+                try { control = new AudioSessionControl(raw); } catch { }
+                if (control != null && !TryPost(() =>
+                    {
+                        if (_endpoints.TryGetValue(id, out var current) && ReferenceEquals(current, endpoint))
+                            AddSession(id, control);
+                        else
+                            try { control.Dispose(); } catch { }
+                    }))
+                    try { control.Dispose(); } catch { }
+            };
+            endpoint.CreatedHandler = created;
+            manager.OnSessionCreated += created;
+
+            var sessions = manager.Sessions;
+            int count = sessions.Count;
+            for (int i = 0; i < count; i++)
+            {
+                AudioSessionControl? control = null;
+                try { control = sessions[i]; } catch { }
+                if (control != null) AddSession(id, control);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Endpoint volume control can still work when session management is
+            // unavailable (service restart, exclusive-mode transition, etc.).
+            Program.LogRateLimited($"audio-session-manager:{id}", ex, "Opening an audio session manager");
+        }
+    }
+
+    bool AddSession(string endpointId, AudioSessionControl control)
+    {
+        if (!_endpoints.ContainsKey(endpointId))
+        {
+            try { control.Dispose(); } catch { }
+            return false;
+        }
+
+        try
+        {
+            if (control.State == AudioSessionState.AudioSessionStateExpired)
+            {
+                control.Dispose();
+                return false;
+            }
+
+            int pid = 0;
+            string appKey;
+            if (control.IsSystemSoundsSession) appKey = SystemAppKey;
+            else
+            {
+                pid = checked((int)control.GetProcessID);
+                var key = AppKeyForPid(pid);
+                if (key == null) { control.Dispose(); return false; }
+                appKey = key;
+            }
+
+            string instanceId;
+            try { instanceId = control.GetSessionInstanceIdentifier; }
+            catch { instanceId = $"{endpointId}:{pid}:{Guid.NewGuid():N}"; }
+            string id = $"{endpointId}\n{instanceId}";
+            if (_sessions.ContainsKey(id))
+            {
+                control.Dispose();
+                return false;
+            }
+
+            var session = new SessionEntry
+            {
+                Id = id,
+                EndpointId = endpointId,
+                DesiredKey = appKey,
+                Pid = pid,
+                Control = control,
+            };
+            _sessions[id] = session;
+            _writeOrder.Add(session);
+            _appsDirty = true;
+            if (_desiredApps.ContainsKey(appKey))
+            {
+                _writeWorkPending = true;
+                _nextRetryAt = long.MinValue;
+            }
+            return true;
+        }
+        catch
+        {
+            try { control.Dispose(); } catch { }
+            return false;
+        }
+    }
+
+    bool RemoveEndpoint(string id)
+    {
+        if (!_endpoints.Remove(id, out var endpoint)) return false;
+        _writeOrder.Remove(endpoint);
+        foreach (var sessionId in _sessions.Values
+                     .Where(s => s.EndpointId.Equals(id, StringComparison.OrdinalIgnoreCase))
+                     .Select(s => s.Id).ToArray())
+            RemoveSession(sessionId);
+        endpoint.Dispose();
+        _appsDirty = true;
+        return true;
+    }
+
+    void RemoveSession(string id)
+    {
+        if (!_sessions.Remove(id, out var session)) return;
+        _writeOrder.Remove(session);
+        session.Dispose();
+        _appsDirty = true;
+        if (_writeCursor > _writeOrder.Count) _writeCursor = 0;
+    }
+
+    void SweepExpiredSessions()
+    {
+        foreach (var session in _sessions.Values.ToArray())
+        {
+            try
+            {
+                if (session.Control.State != AudioSessionState.AudioSessionStateExpired) continue;
+            }
+            catch { }
+            RemoveSession(session.Id);
+        }
+    }
+
+    void PublishAppsIfDirty()
+    {
+        if (!_appsDirty) return;
+        _appsDirty = false;
+        PublishApps();
+    }
+
+    void PublishApps()
+    {
+        var apps = _sessions.Values
+            .GroupBy(s => s.DesiredKey, StringComparer.OrdinalIgnoreCase)
+            .Select(g => new AppSnapshot(g.Key, g.Select(x => x.Pid).FirstOrDefault(pid => pid != 0)))
+            .OrderBy(a => a.Key, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        try { _appsChanged(apps); } catch { }
+    }
+
+    static string? AppKeyForPid(int pid)
+    {
+        try
+        {
+            using var p = Process.GetProcessById(pid);
+            return p.ProcessName.ToLowerInvariant();
+        }
+        catch { return null; }
+    }
+
+    public void Dispose()
+    {
+        lock (_lifecycleLock)
+        {
+            if (_stopping) return;
+            _stopping = true;
+            _wake.Set();
+        }
+        if (_thread.Join(3_000)) _wake.Dispose();
+    }
+}

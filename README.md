@@ -150,6 +150,21 @@ py -m pip install hidapi
 py fader_read.py
 ```
 
+## Leak diagnostics
+
+The executable accepts opt-in isolation switches for troubleshooting:
+
+- `--diag-no-volume` keeps device/session tracking active but sends no volume setters.
+- `--diag-sink` reads and discards HID reports before the fader pipeline.
+- `--diag-synth` drives physical faders with a synthetic triangle wave.
+- `--diag-no-draw` and `--diag-no-tray` isolate UI repaint/notification work.
+- `--diag-audio-stats` shows cumulative endpoint and session setter counts in the
+  window title, making those calls easy to correlate with pool growth.
+
+Normal operation uses event-driven endpoint, session, and HID discovery. Desired
+volumes are coalesced, unchanged targets are skipped, and actual Core Audio setters
+share one global call budget after category/session fan-out.
+
 ## License
 
 [MIT](LICENSE)
