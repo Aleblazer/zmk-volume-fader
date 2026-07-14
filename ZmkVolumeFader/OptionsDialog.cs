@@ -43,6 +43,7 @@ sealed class OptionsDialog : Form
     readonly MainForm.Theme _t;
 
     readonly Label[] _rawLbl, _rangeLbl, _previewLbl;
+    readonly Label[] _qualityLbl;
     readonly RoundedButton[] _recordBtn;
     readonly RoundedComboBox[] _taper;
     readonly MainForm.Stepper?[] _muteStep;   // physical faders' mute dead zone
@@ -53,6 +54,8 @@ sealed class OptionsDialog : Form
     readonly (int v, int pct)[][] _previewCurves;
     readonly (int Min, int Max, TaperKind Taper)[] _previewCurveSpecs;
     readonly bool[] _previewCurveValid;
+    readonly List<int>[] _captureSamples;
+    readonly int[] _priorSpans;
 
     readonly CheckBox _startup = new() { Text = "Start with Windows", AutoSize = true, FlatStyle = FlatStyle.Standard, Margin = new Padding(0, 0, 0, 0) };
     readonly CheckBox _softTakeover = new() { Text = "Soft takeover for physical faders", AutoSize = true, FlatStyle = FlatStyle.Standard, Margin = new Padding(0, 6, 0, 0) };
@@ -96,6 +99,7 @@ sealed class OptionsDialog : Form
         _known = known;
         _presentIds = presentIds.ToArray();
         _rawLbl = new Label[_n]; _rangeLbl = new Label[_n]; _previewLbl = new Label[_n];
+        _qualityLbl = new Label[_n];
         _recordBtn = new RoundedButton[_n]; _taper = new RoundedComboBox[_n];
         _muteStep = new MainForm.Stepper?[_n];
         _bar = new MainForm.FaderBar[_n]; _recording = new bool[_n];
@@ -104,6 +108,8 @@ sealed class OptionsDialog : Form
         _previewCurves = new (int v, int pct)[_n][];
         _previewCurveSpecs = new (int, int, TaperKind)[_n];
         _previewCurveValid = new bool[_n];
+        _captureSamples = Enumerable.Range(0, _n).Select(_ => new List<int>()).ToArray();
+        _priorSpans = new int[_n];
 
         Text = "Options";
         Font = UiFonts.Get(9.75f);
@@ -352,10 +358,10 @@ sealed class OptionsDialog : Form
         // clip at any scaling.
         var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
 
-        var t = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2, RowCount = 5, BackColor = Color.Transparent };
+        var t = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2, RowCount = 6, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        for (int r = 0; r < 5; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        for (int r = 0; r < 6; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         t.Controls.Add(new Label { Text = name, AutoSize = true, ForeColor = _t.Subtle, Anchor = AnchorStyles.Left, Margin = new Padding(0, 4, 0, 0) }, 0, 0);
         _rawLbl[i] = new Label { Text = "raw —", AutoSize = true, ForeColor = _t.Text, Anchor = AnchorStyles.Right, Font = UiFonts.Get(11f) };
@@ -363,6 +369,7 @@ sealed class OptionsDialog : Form
 
         _rangeLbl[i] = new Label { Text = "range —", AutoSize = true, ForeColor = _t.Text, Anchor = AnchorStyles.Left, Margin = new Padding(0, 8, 0, 0) };
         _recordBtn[i] = MakeButton("Record", false, _t.Card);
+        _recordBtn[i].AccessibleName = $"Record {name} calibration";
         _recordBtn[i].Click += (_, _) => ToggleRecord(idx);
         t.Controls.Add(_rangeLbl[i], 0, 1);
         t.Controls.Add(_recordBtn[i], 1, 1);
@@ -370,6 +377,7 @@ sealed class OptionsDialog : Form
         var taperPanel = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 6, 0, 4) };
         taperPanel.Controls.Add(new Label { Text = "Taper", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(0, 6, 8, 0) });
         _taper[i] = new RoundedComboBox { Width = 150, BackColor = _t.CtlBg, ForeColor = _t.Text, Surround = _t.Card, BoxColor = _t.CtlBg, BorderColor = _t.CtlBorder, ChevronColor = _t.Subtle };
+        _taper[i].AccessibleName = $"{name} taper";
         _taper[i].Items.AddRange(TaperItems);
         _taper[i].SelectedIndex = Math.Clamp((int)_cal[i].Taper, 0, TaperItems.Length - 1);
         _cal[i].Taper = (TaperKind)_taper[i].SelectedIndex;   // normalize any stale value
@@ -404,9 +412,20 @@ sealed class OptionsDialog : Form
             Knob = _t.Dark ? Color.FromArgb(0xE6, 0xE8, 0xEB) : Color.White,
             KnobEdge = _t.Dark ? Color.FromArgb(0x0E, 0x10, 0x14) : Color.FromArgb(0xC2, 0xC6, 0xCC),
         };
+        _bar[i].AccessibleName = $"{name} calibration preview";
+        _bar[i].AccessibleRole = AccessibleRole.Indicator;
         _previewLbl[i] = new Label { Text = "0%", AutoSize = true, ForeColor = _t.Accent, Anchor = AnchorStyles.Right, Font = UiFonts.Get(11f) };
         t.Controls.Add(_bar[i], 0, 4);
         t.Controls.Add(_previewLbl[i], 1, 4);
+
+        _qualityLbl[i] = new Label
+        {
+            AutoSize = true, MaximumSize = new Size(360, 0), ForeColor = _t.Subtle,
+            Margin = new Padding(0, 4, 0, 0), AccessibleName = $"{name} calibration quality",
+        };
+        ms.AccessibleName = $"{name} mute threshold in raw units";
+        t.Controls.Add(_qualityLbl[i], 0, 5);
+        t.SetColumnSpan(_qualityLbl[i], 2);
 
         card.Controls.Add(t);
         return card;
@@ -433,14 +452,24 @@ sealed class OptionsDialog : Form
         _recording[i] = !_recording[i];
         if (_recording[i])
         {
+            _priorSpans[i] = Math.Max(0, _cal[i].Max - _cal[i].Min);
+            _captureSamples[i].Clear();
             _cal[i].Min = int.MaxValue;
             _cal[i].Max = int.MinValue;
             _recordBtn[i].Text = "Stop";
+            _qualityLbl[i].Text = "Recording… sweep slowly across the full travel";
+            _qualityLbl[i].ForeColor = _t.Accent;
         }
         else
         {
             if (_cal[i].Min > _cal[i].Max) { _cal[i].Min = 0; _cal[i].Max = 3250; }  // nothing swept
             _recordBtn[i].Text = "Record";
+            var quality = CalibrationCaptureLogic.Analyze(_captureSamples[i], _priorSpans[i]);
+            _qualityLbl[i].Text = quality.Message;
+            _qualityLbl[i].ForeColor = quality.Good ? _t.Accent : Color.FromArgb(0xF0, 0x8A, 0x3C);
+            _tip.SetToolTip(_qualityLbl[i], quality.SuggestedMuteRaw is int mute
+                ? $"The lower endpoint appeared stable; consider setting Mute below raw to {mute}"
+                : "Record again if the captured range or coverage looks incomplete");
         }
     }
 
@@ -454,6 +483,7 @@ sealed class OptionsDialog : Form
     {
         if (_virtual[i]) return;   // no calibration controls on a virtual fader
         int v = _raw[i]();
+        if (_recording[i] && _captureSamples[i].Count < 4096) _captureSamples[i].Add(v);
         var spec = (_cal[i].Min, _cal[i].Max, _cal[i].Taper);
         bool curveChanged = !_previewCurveValid[i] || _previewCurveSpecs[i] != spec;
         if (v == _lastRaw[i] && !curveChanged) return;

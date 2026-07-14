@@ -202,6 +202,8 @@ internal sealed class RoundedButton : Button
     protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
     protected override void OnMouseDown(MouseEventArgs e) { _down = true; Invalidate(); base.OnMouseDown(e); }
     protected override void OnMouseUp(MouseEventArgs e) { _down = false; Invalidate(); base.OnMouseUp(e); }
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
 
     protected override void OnPaint(PaintEventArgs e)
     {
@@ -224,19 +226,22 @@ internal sealed class RoundedButton : Button
         {
             TextRenderer.DrawText(g, Text, Font, new Rectangle(0, 0, Width, Height), ForeColor,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
-            return;
         }
-
-        // Icon + text centred as a group.
-        const int gap = 6;
-        var ts = TextRenderer.MeasureText(g, Text, Font, new Size(int.MaxValue, Height),
-            TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
-        int total = IconSize + gap + ts.Width;
-        int x = Math.Max(2, (Width - total) / 2);
-        DrawIcon(g, new Rectangle(x, (Height - IconSize) / 2, IconSize, IconSize), ForeColor);
-        var tr = new Rectangle(x + IconSize + gap, 0, Width - (x + IconSize + gap), Height);
-        TextRenderer.DrawText(g, Text, Font, tr, ForeColor,
-            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+        else
+        {
+            // Icon + text centred as a group.
+            const int gap = 6;
+            var ts = TextRenderer.MeasureText(g, Text, Font, new Size(int.MaxValue, Height),
+                TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+            int total = IconSize + gap + ts.Width;
+            int x = Math.Max(2, (Width - total) / 2);
+            DrawIcon(g, new Rectangle(x, (Height - IconSize) / 2, IconSize, IconSize), ForeColor);
+            var tr = new Rectangle(x + IconSize + gap, 0, Width - (x + IconSize + gap), Height);
+            TextRenderer.DrawText(g, Text, Font, tr, ForeColor,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+        }
+        if (Focused && ShowFocusCues)
+            ControlPaint.DrawFocusRectangle(g, Rectangle.Inflate(ClientRectangle, -3, -3), ForeColor, fill);
     }
 }
 
@@ -287,6 +292,9 @@ internal sealed class RoundedComboBox : ComboBox
         // clips descenders at high DPI.
         IntegralHeight = false;
     }
+
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
 
     // Report the forced height to the layout engine too, so the row/card that
     // holds this combo is sized tall enough and doesn't clip its bottom.
@@ -367,5 +375,7 @@ internal sealed class RoundedComboBox : ComboBox
         float ax = LogicalToDeviceUnits(4), ay = LogicalToDeviceUnits(2);
         using var cp = new Pen(ChevronColor, 1.6f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
         g.DrawLines(cp, new[] { new PointF(cxv - ax, cyv - ay), new PointF(cxv, cyv + ay + 0.5f), new PointF(cxv + ax, cyv - ay) });
+        if (Focused && ShowFocusCues)
+            ControlPaint.DrawFocusRectangle(g, Rectangle.Inflate(ClientRectangle, -3, -3), ForeColor, BoxColor);
     }
 }

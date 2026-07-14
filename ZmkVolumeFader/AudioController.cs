@@ -17,10 +17,11 @@ namespace ZmkVolumeFader;
 /// </summary>
 sealed class AudioController : IDisposable
 {
-    internal sealed record AppSnapshot(string Key, int Pid, string LegacyKey);
+    internal sealed record AppSnapshot(string Key, int Pid, IReadOnlyList<string> Aliases);
     internal sealed record VolumeSnapshot(
         IReadOnlyDictionary<string, float> Endpoints,
         IReadOnlyDictionary<string, float> Apps);
+    internal sealed record ExternalVolumeChange(string Key, bool IsEndpoint, float Volume);
 
     const string SystemAppKey = "#system";
     const int MinOsCallIntervalMs = 25;       // system-wide ceiling: 40 setters/s
@@ -28,6 +29,7 @@ sealed class AudioController : IDisposable
     const float VolumeEpsilon = 0.0049f;      // smaller than one integer-percent step
 
     readonly Action<IReadOnlyList<AppSnapshot>> _appsChanged;
+    readonly Action<ExternalVolumeChange> _externalVolumeChanged;
     readonly Action<Exception> _faulted;
     readonly ConcurrentQueue<Action> _commands = new();
     readonly AutoResetEvent _wake = new(false);
@@ -52,11 +54,13 @@ sealed class AudioController : IDisposable
     long _nextRetryAt = long.MaxValue;
     bool _writeWorkPending;
     bool _appsDirty;
+    readonly Guid _notificationGuid = Guid.NewGuid();
 
-    long _endpointSetCalls, _sessionSetCalls;
+    long _endpointSetCalls, _sessionSetCalls, _externalChangeCount;
     volatile int _endpointCount, _sessionCount;
     internal long EndpointSetCalls => Interlocked.Read(ref _endpointSetCalls);
     internal long SessionSetCalls => Interlocked.Read(ref _sessionSetCalls);
+    internal long ExternalChangeCount => Interlocked.Read(ref _externalChangeCount);
     internal int EndpointCount => _endpointCount;
     internal int SessionCount => _sessionCount;
 
@@ -68,6 +72,7 @@ sealed class AudioController : IDisposable
         public bool WasDesired;
         public float LastKnown = float.NaN;
         public long RetryAfter;
+        public bool HoldForExternal;
         public abstract bool IsEndpoint { get; }
         public abstract void RefreshActual();
         public abstract void Set(float scalar);
@@ -80,6 +85,7 @@ sealed class AudioController : IDisposable
         public required MMDevice Device;
         public AudioSessionManager? Manager;
         public AudioSessionManager.SessionCreatedDelegate? CreatedHandler;
+        public AudioEndpointVolumeNotificationDelegate? VolumeHandler;
         public override bool IsEndpoint => true;
 
         public override void RefreshActual()
@@ -97,6 +103,8 @@ sealed class AudioController : IDisposable
         {
             if (Manager != null && CreatedHandler != null)
                 try { Manager.OnSessionCreated -= CreatedHandler; } catch { }
+            if (VolumeHandler != null)
+                try { Device.AudioEndpointVolume.OnVolumeNotification -= VolumeHandler; } catch { }
             try { Device.Dispose(); } catch { }
         }
     }
@@ -106,8 +114,11 @@ sealed class AudioController : IDisposable
         public required string Id;
         public required string EndpointId;
         public required int Pid;
-        public required string LegacyKey;
+        public required IReadOnlyList<string> Aliases;
         public required AudioSessionControl Control;
+        public SessionVolumeEvents? Events;
+        public float ExpectedVolume = float.NaN;
+        public long ExpectedUntil;
         public override bool IsEndpoint => false;
 
         public override void RefreshActual()
@@ -117,19 +128,36 @@ sealed class AudioController : IDisposable
 
         public override void Set(float scalar)
         {
+            Volatile.Write(ref ExpectedVolume, scalar);
+            Interlocked.Exchange(ref ExpectedUntil, Environment.TickCount64 + 1_000);
             Control.SimpleAudioVolume.Volume = scalar;
             LastKnown = scalar;
         }
 
         public override void Dispose()
         {
+            if (Events != null)
+                try { Control.UnRegisterEventClient(Events); } catch { }
             try { Control.Dispose(); } catch { }
         }
     }
 
-    public AudioController(Action<IReadOnlyList<AppSnapshot>> appsChanged, Action<Exception>? faulted = null)
+    sealed class SessionVolumeEvents(Action<float, bool> changed) : IAudioSessionEventsHandler
+    {
+        public void OnVolumeChanged(float volume, bool isMuted) => changed(volume, isMuted);
+        public void OnDisplayNameChanged(string displayName) { }
+        public void OnIconPathChanged(string iconPath) { }
+        public void OnChannelVolumeChanged(uint channelCount, IntPtr newVolumes, uint channelIndex) { }
+        public void OnGroupingParamChanged(ref Guid groupingId) { }
+        public void OnStateChanged(AudioSessionState state) { }
+        public void OnSessionDisconnected(AudioSessionDisconnectReason disconnectReason) { }
+    }
+
+    public AudioController(Action<IReadOnlyList<AppSnapshot>> appsChanged,
+        Action<ExternalVolumeChange>? externalVolumeChanged = null, Action<Exception>? faulted = null)
     {
         _appsChanged = appsChanged;
+        _externalVolumeChanged = externalVolumeChanged ?? (_ => { });
         _faulted = faulted ?? (_ => { });
         _thread = new Thread(Worker)
         {
@@ -206,6 +234,23 @@ sealed class AudioController : IDisposable
             try { completed(new VolumeSnapshot(endpoints, apps)); } catch { }
         });
     }
+
+    /// <summary>
+    /// Resolve the temporary write hold installed before notifying the UI about
+    /// an external mixer change. Physical pickup leaves it held until that target
+    /// disappears from the next desired snapshot; virtual control resumes writes.
+    /// </summary>
+    public void ResolveExternalChange(ExternalVolumeChange change, bool continueDriving) => TryPost(() =>
+    {
+        foreach (var target in _writeOrder.Where(t => t.IsEndpoint == change.IsEndpoint
+                     && t.DesiredKey.Equals(change.Key, StringComparison.OrdinalIgnoreCase)))
+            if (continueDriving) target.HoldForExternal = false;
+        if (continueDriving)
+        {
+            _writeWorkPending = true;
+            _nextRetryAt = long.MinValue;
+        }
+    });
 
     bool TryPost(Action action)
     {
@@ -344,7 +389,11 @@ sealed class AudioController : IDisposable
             bool wanted = t.IsEndpoint
                 ? _desiredEndpoints.ContainsKey(t.DesiredKey)
                 : _desiredApps.ContainsKey(t.DesiredKey);
-            if (!wanted) t.WasDesired = false;
+            if (!wanted)
+            {
+                t.WasDesired = false;
+                t.HoldForExternal = false;
+            }
         }
     }
 
@@ -369,6 +418,7 @@ sealed class AudioController : IDisposable
                 earliestRetry = Math.Min(earliestRetry, target.RetryAfter);
                 continue;
             }
+            if (target.HoldForExternal) continue;
 
             try
             {
@@ -438,6 +488,23 @@ sealed class AudioController : IDisposable
         _endpoints[id] = endpoint;
         _endpointCount = _endpoints.Count;
         _writeOrder.Add(endpoint);
+        try
+        {
+            device.AudioEndpointVolume.NotificationGuid = _notificationGuid;
+            AudioEndpointVolumeNotificationDelegate changed = data =>
+            {
+                if (data.EventContext == _notificationGuid) return;
+                float volume = data.MasterVolume;
+                Guid context = data.EventContext;
+                TryPost(() => OnEndpointVolumeChanged(endpoint, volume, context));
+            };
+            endpoint.VolumeHandler = changed;
+            device.AudioEndpointVolume.OnVolumeNotification += changed;
+        }
+        catch (Exception ex)
+        {
+            Program.LogRateLimited($"audio-endpoint-events:{id}", ex, "Registering endpoint volume notifications");
+        }
         if (_desiredEndpoints.ContainsKey(id))
         {
             _writeWorkPending = true;
@@ -498,14 +565,16 @@ sealed class AudioController : IDisposable
             }
 
             int pid = 0;
-            string appKey, legacyKey;
-            if (control.IsSystemSoundsSession) appKey = legacyKey = SystemAppKey;
+            string appKey;
+            IReadOnlyList<string> aliases;
+            if (control.IsSystemSoundsSession) { appKey = SystemAppKey; aliases = new[] { SystemAppKey }; }
             else
             {
                 pid = checked((int)control.GetProcessID);
                 var identity = AppIdentityForPid(pid);
                 if (identity == null) { control.Dispose(); return false; }
-                (appKey, legacyKey) = identity.Value;
+                appKey = identity.Value.Key;
+                aliases = identity.Value.Aliases;
             }
 
             string instanceId;
@@ -523,10 +592,30 @@ sealed class AudioController : IDisposable
                 Id = id,
                 EndpointId = endpointId,
                 DesiredKey = appKey,
-                LegacyKey = legacyKey,
+                Aliases = aliases,
                 Pid = pid,
                 Control = control,
             };
+            var events = new SessionVolumeEvents((volume, muted) =>
+            {
+                long now = Environment.TickCount64;
+                if (AudioNotificationLogic.MatchesExpectedWrite(Volatile.Read(ref session.ExpectedVolume),
+                        Interlocked.Read(ref session.ExpectedUntil), now, volume, VolumeEpsilon))
+                {
+                    Interlocked.Exchange(ref session.ExpectedUntil, 0);
+                    return;
+                }
+                TryPost(() => OnSessionVolumeChanged(session, volume, muted));
+            });
+            try
+            {
+                control.RegisterEventClient(events);
+                session.Events = events;
+            }
+            catch (Exception ex)
+            {
+                Program.LogRateLimited($"audio-session-events:{id}", ex, "Registering session volume notifications");
+            }
             _sessions[id] = session;
             _sessionCount = _sessions.Count;
             _writeOrder.Add(session);
@@ -569,6 +658,36 @@ sealed class AudioController : IDisposable
         if (_writeCursor > _writeOrder.Count) _writeCursor = 0;
     }
 
+    void OnEndpointVolumeChanged(EndpointEntry endpoint, float volume, Guid context)
+    {
+        if (!_endpoints.TryGetValue(endpoint.Id, out var current) || !ReferenceEquals(current, endpoint)) return;
+        float previous = endpoint.LastKnown;
+        endpoint.LastKnown = volume;
+        if (!endpoint.WasDesired || context == _notificationGuid
+            || !AudioNotificationLogic.HasMeaningfulChange(previous, volume, VolumeEpsilon)) return;
+        endpoint.HoldForExternal = true;
+        Interlocked.Increment(ref _externalChangeCount);
+        try { _externalVolumeChanged(new ExternalVolumeChange(endpoint.DesiredKey, true, volume)); } catch { }
+    }
+
+    void OnSessionVolumeChanged(SessionEntry session, float volume, bool isMuted)
+    {
+        if (!_sessions.TryGetValue(session.Id, out var current) || !ReferenceEquals(current, session)) return;
+        float previous = session.LastKnown;
+        session.LastKnown = volume;
+        long now = Environment.TickCount64;
+        if (AudioNotificationLogic.MatchesExpectedWrite(session.ExpectedVolume, session.ExpectedUntil,
+                now, volume, VolumeEpsilon))
+        {
+            session.ExpectedUntil = 0;
+            return;
+        }
+        if (!session.WasDesired || !AudioNotificationLogic.HasMeaningfulChange(previous, volume, VolumeEpsilon)) return;
+        session.HoldForExternal = true;
+        Interlocked.Increment(ref _externalChangeCount);
+        try { _externalVolumeChanged(new ExternalVolumeChange(session.DesiredKey, false, volume)); } catch { }
+    }
+
     void SweepExpiredSessions()
     {
         foreach (var session in _sessions.Values.ToArray())
@@ -595,15 +714,15 @@ sealed class AudioController : IDisposable
             .GroupBy(s => s.DesiredKey, StringComparer.OrdinalIgnoreCase)
             .Select(g =>
             {
-                var first = g.First();
-                return new AppSnapshot(g.Key, g.Select(x => x.Pid).FirstOrDefault(pid => pid != 0), first.LegacyKey);
+                var aliases = g.SelectMany(x => x.Aliases).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                return new AppSnapshot(g.Key, g.Select(x => x.Pid).FirstOrDefault(pid => pid != 0), aliases);
             })
             .OrderBy(a => a.Key, StringComparer.OrdinalIgnoreCase)
             .ToArray();
         try { _appsChanged(apps); } catch { }
     }
 
-    static (string Key, string LegacyKey)? AppIdentityForPid(int pid)
+    static (string Key, IReadOnlyList<string> Aliases)? AppIdentityForPid(int pid)
     {
         try
         {
@@ -613,10 +732,14 @@ sealed class AudioController : IDisposable
             {
                 string? path = p.MainModule?.FileName;
                 if (!string.IsNullOrWhiteSpace(path))
-                    return (AppIdentityLogic.KeyFor(legacy, path), legacy);
+                {
+                    var info = FileVersionInfo.GetVersionInfo(path);
+                    var identity = AppIdentityLogic.Create(legacy, path, info.CompanyName, info.ProductName);
+                    return (identity.Key, identity.Aliases);
+                }
             }
             catch { }
-            return (legacy, legacy);
+            return (legacy, new[] { legacy });
         }
         catch { return null; }
     }

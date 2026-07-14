@@ -90,12 +90,15 @@ sealed class CategoriesDialog : Form
 
         _search.BackColor = _t.CtlBg;
         _search.ForeColor = _t.Text;
+        _search.AccessibleName = "Search known apps";
         _search.Dock = DockStyle.Fill;
         _search.Margin = new Padding(0, 0, 0, 6);
         _search.TextChanged += (_, _) => RebuildAppFilter();
         root.Controls.Add(_search, 0, 4);
 
         _appList.BackColor = _t.CtlBg; _appList.ForeColor = _t.Text; _appList.Dock = DockStyle.Fill; _appList.Margin = new Padding(0);
+        _catList.AccessibleName = "Categories";
+        _appList.AccessibleName = "Apps in selected category";
         _appList.DrawItem += (s, e) => DrawApp(e);
         _appList.MouseDown += (s, e) => ToggleApp(_appList.IndexFromPoint(e.Location));
         foreach (var a in _filteredApps) _appList.Items.Add(AppText(a));

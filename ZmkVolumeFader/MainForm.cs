@@ -141,6 +141,15 @@ public class MainForm : Form
         Text: Hex(0x1B, 0x1D, 0x21), Subtle: Hex(0x66, 0x6C, 0x74), Accent: Hex(0x1F, 0xA6, 0x4E),
         CtlBg: Hex(0xFF, 0xFF, 0xFF), CtlBorder: Hex(0xD2, 0xD5, 0xDA));
 
+    static Theme HighContrastTheme()
+    {
+        Color window = SystemColors.Window;
+        double lum = (0.299 * window.R + 0.587 * window.G + 0.114 * window.B) / 255d;
+        return new Theme(lum < 0.5, window, SystemColors.Control, SystemColors.ControlDark,
+            SystemColors.WindowText, SystemColors.GrayText, SystemColors.Highlight,
+            SystemColors.Window, SystemColors.WindowText);
+    }
+
     Theme _theme = LightTheme;
     ThemeMode _themeMode = ThemeMode.Auto;   // Auto follows the OS; Light/Dark force it
     CloseBehavior _closeBehavior = CloseBehavior.Ask;   // what the X button does
@@ -155,7 +164,18 @@ public class MainForm : Form
     internal sealed class FaderBar : Control
     {
         int _value;
-        public int Value { get => _value; set { int v = Math.Clamp(value, 0, 100); if (v != _value) { _value = v; Invalidate(); } } }
+        public int Value
+        {
+            get => _value;
+            set
+            {
+                int v = Math.Clamp(value, 0, 100);
+                if (v == _value) return;
+                _value = v;
+                Invalidate();
+                AccessibilityNotifyClients(AccessibleEvents.ValueChange, -1);
+            }
+        }
         public Color Track { get; set; } = Color.Gray;       // unfilled groove
         public Color Fill { get; set; } = Color.LimeGreen;   // green (low)
         public Color Mid { get; set; } = Color.FromArgb(0xF2, 0xC4, 0x3D);   // yellow (mid)
@@ -212,6 +232,16 @@ public class MainForm : Form
                      | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
             SetStyle(ControlStyles.Selectable, false);   // display-only until Interactive
             TabStop = false;
+        }
+
+        protected override AccessibleObject CreateAccessibilityInstance() => new FaderAccessibleObject(this);
+
+        sealed class FaderAccessibleObject(FaderBar owner) : ControlAccessibleObject(owner)
+        {
+            public override string? Value => $"{owner.Value}%";
+            public override AccessibleRole Role => owner.AccessibleRole == AccessibleRole.Default
+                ? AccessibleRole.Slider
+                : owner.AccessibleRole;
         }
 
         // Horizontal span the knob centre travels across, matching OnPaint. Returns
@@ -579,8 +609,14 @@ public class MainForm : Form
     sealed class CategoryItem
     {
         public required string Name;   // stored CategoryName (may be the Unassigned sentinel)
+        public int ActiveCount;
+        public int TotalCount;
         public bool IsUnassigned => Name == UnassignedCategory;
-        public override string ToString() => IsUnassigned ? UnassignedDisplay : Name;
+        public override string ToString()
+        {
+            string name = IsUnassigned ? UnassignedDisplay : Name;
+            return TotalCount == 0 ? $"{name}  ·  empty" : $"{name}  ·  {ActiveCount}/{TotalCount} active";
+        }
     }
 
     const string SystemAppKey = "#system";
@@ -602,12 +638,14 @@ public class MainForm : Form
     // pseudo-category drives. Apps another fader targets *directly* are also
     // excluded, so "Everything Else" never fights a dedicated app fader.
     // (System Sounds counts as unassigned on purpose.)
-    IEnumerable<string> UnassignedKeys() =>
-        _liveApps.Where(k =>
+    IEnumerable<string> UnassignedKnownKeys() =>
+        _knownApps.Keys.Where(k =>
             !_categories.Any(c => c.AppKeys.Contains(k, StringComparer.OrdinalIgnoreCase))
             && !_sliders.Any(s => IsFaderConnected(s)
                                   && s.Target == TargetKind.App
                                   && string.Equals(s.AppKey, k, StringComparison.OrdinalIgnoreCase)));
+
+    IEnumerable<string> UnassignedKeys() => UnassignedKnownKeys().Where(_liveApps.Contains);
 
     // Fires a callback whenever the set of audio endpoints changes (plug/unplug,
     // enable/disable) so the app can re-pick each fader's active output live.
@@ -635,6 +673,7 @@ public class MainForm : Form
         public RoundedButton[] Tabs = Array.Empty<RoundedButton>();  // Output/Apps/Categories
         public RoundedButton? Mute;
         public RoundedButton? More;     // virtual faders only: reset/hotkeys/remove menu
+        public string? ConflictHint;
         // Which fader group (device) this slider belongs to — a device key for
         // physical faders, or VirtualKey for the virtual home. Axis reports from a
         // device only drive sliders whose GroupKey matches, so two devices can be
@@ -883,6 +922,7 @@ public class MainForm : Form
     static string LegacySettingsPath => Path.Combine(SettingsDir, "settings.json");
     const int CurrentSettingsSchema = 3;
     bool _settingsFaultShown;
+    string? _settingsRecoveryNotice;
 
     // ---- controls ---------------------------------------------------------
 
@@ -1032,7 +1072,13 @@ public class MainForm : Form
         _vramp.Tick += (_, _) => VrampTick();
         _faderPump.Tick += (_, _) => FaderPumpTick();
         _trayUpdate.Tick += (_, _) => FlushTrayText();
-        Load += (_, _) => { ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); PruneKnownApps(); EnsureVirtualGroup(); RelayoutGroups(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight(); StartAudio(); StartHid(); RegisterDeviceNotifications(); StartHotkeys(); };
+        Load += (_, _) =>
+        {
+            ApplyTheme(CurrentTheme()); LoadDevices(); LoadSettings(); PruneKnownApps();
+            EnsureVirtualGroup(); RelayoutGroups(); LoadCachedIcons(); PopulateCombos(); FitWindowHeight();
+            StartAudio(); StartHid(); RegisterDeviceNotifications(); StartHotkeys();
+            ShowSettingsRecoveryNotice();
+        };
         FormClosing += OnFormClosing;
     }
 
@@ -1253,7 +1299,22 @@ public class MainForm : Form
             _tip.SetToolTip(limit, "Maximum volume this fader can reach");
             limit.ValueChanged += (_, _) => OnLimitChanged(axis);
         }
+        UpdateAxisAccessibility(axis);
         return axis;
+    }
+
+    void UpdateAxisAccessibility(Axis axis)
+    {
+        string name = axis.Name.Text;
+        axis.Combo.AccessibleName = $"{name} target";
+        axis.Limit.AccessibleName = $"{name} maximum volume";
+        axis.Pct.AccessibleName = $"{name} current volume";
+        axis.Bar.AccessibleName = $"{name} level";
+        axis.Bar.AccessibleRole = AccessibleRole.Slider;
+        if (axis.Mute != null) axis.Mute.AccessibleName = $"{(axis.VMuted ? "Unmute" : "Mute")} {name}";
+        if (axis.More != null) axis.More.AccessibleName = $"More actions for {name}";
+        for (int i = 0; i < axis.Tabs.Length; i++)
+            axis.Tabs[i].AccessibleName = $"{name}: control {((TargetKind)i)} targets";
     }
 
     RoundedButton MuteButton(Axis axis)
@@ -1338,7 +1399,12 @@ public class MainForm : Form
             if (save)
             {
                 var nm = box.Text.Trim();
-                if (nm.Length > 0 && nm != a.Name.Text) { a.Name.Text = nm; SaveSettings(); }
+                if (nm.Length > 0 && nm != a.Name.Text)
+                {
+                    a.Name.Text = nm;
+                    UpdateAxisAccessibility(a);
+                    SaveSettings();
+                }
             }
             a.Card.Controls.Remove(box);
             box.Dispose();
@@ -1408,12 +1474,16 @@ public class MainForm : Form
         return true;
     }
 
-    Theme CurrentTheme() => _themeMode switch
+    Theme CurrentTheme()
     {
-        ThemeMode.Light => LightTheme,
-        ThemeMode.Dark => DarkTheme,
-        _ => OsLightTheme() ? LightTheme : DarkTheme,   // Auto
-    };
+        if (SystemInformation.HighContrast) return HighContrastTheme();
+        return _themeMode switch
+        {
+            ThemeMode.Light => LightTheme,
+            ThemeMode.Dark => DarkTheme,
+            _ => OsLightTheme() ? LightTheme : DarkTheme,   // Auto
+        };
+    }
 
     // ---- "start with Windows" (HKCU Run key) ------------------------------
 
@@ -1845,9 +1915,10 @@ public class MainForm : Form
             bool conflict = conflicts.Length > 0;
             a.Combo.BorderColor = conflict ? Color.FromArgb(0xF0, 0x8A, 0x3C) : _theme.CtlBorder;
             a.Combo.Invalidate();
-            _tip.SetToolTip(a.Combo, conflict
+            a.ConflictHint = conflict
                 ? $"Also controlled by {string.Join(", ", conflicts)}. The most recently moved fader wins."
-                : "Pick what this fader controls");
+                : null;
+            UpdateTargetTooltip(a);
         }
     }
 
@@ -1879,10 +1950,20 @@ public class MainForm : Form
             case TargetKind.Category:
                 cb.Items.AddRange(_categories
                     .OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
-                    .Select(c => new CategoryItem { Name = c.Name })
+                    .Select(c => new CategoryItem
+                    {
+                        Name = c.Name,
+                        TotalCount = c.AppKeys.Distinct(StringComparer.OrdinalIgnoreCase).Count(),
+                        ActiveCount = c.AppKeys.Distinct(StringComparer.OrdinalIgnoreCase).Count(_liveApps.Contains),
+                    })
                     .Cast<object>().ToArray());
                 // Always last: catch-all for apps in no category.
-                cb.Items.Add(new CategoryItem { Name = UnassignedCategory });
+                var unassigned = UnassignedKnownKeys().ToArray();
+                cb.Items.Add(new CategoryItem
+                {
+                    Name = UnassignedCategory, TotalCount = unassigned.Length,
+                    ActiveCount = unassigned.Count(_liveApps.Contains),
+                });
                 break;
         }
         cb.EndUpdate();
@@ -1935,7 +2016,7 @@ public class MainForm : Form
 
     void StartAudio()
     {
-        _audio = new AudioController(QueueAudioSnapshot, ex =>
+        _audio = new AudioController(QueueAudioSnapshot, QueueExternalVolumeChange, ex =>
         {
             Program.LogRateLimited("audio-worker", ex, "Core Audio worker restarted");
             SafeUi(() =>
@@ -2036,8 +2117,9 @@ public class MainForm : Form
         foreach (var app in snapshot)
         {
             string key = app.Key;
-            if (!key.Equals(app.LegacyKey, StringComparison.OrdinalIgnoreCase))
-                identitiesChanged |= MigrateAppIdentity(app.LegacyKey, key);
+            foreach (string alias in app.Aliases)
+                if (!key.Equals(alias, StringComparison.OrdinalIgnoreCase))
+                    identitiesChanged |= MigrateAppIdentity(alias, key);
             _appSeen[key] = nowSec;
             if (key == SystemAppKey)
             {
@@ -2214,9 +2296,11 @@ public class MainForm : Form
     static string IconDir => Path.Combine(SettingsDir, "icons");
     static string IconFile(string key)
     {
-        if (key.StartsWith("exe:", StringComparison.OrdinalIgnoreCase))
+        if (key.Contains(':'))
         {
             string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key))).ToLowerInvariant();
+            // Keep the historical "exe-" prefix so existing cached icons remain
+            // discoverable while old executable-path identities migrate.
             return Path.Combine(IconDir, $"exe-{hash}.png");
         }
         return Path.Combine(IconDir,
@@ -2280,16 +2364,12 @@ public class MainForm : Form
 
     // The output the ranking alone would choose: highest-ranked present device.
     string? AutoTarget(Axis a)
-    {
-        foreach (var p in a.Prefs)
-            if (_present.ContainsKey(p.Id)) return p.Id;
-        return null;
-    }
+        => OutputFallbackLogic.Resolve(a.Prefs, static p => p.Id, _present.ContainsKey);
 
     // The output to actually drive: a present manual override wins, else the
     // ranking's auto target.
-    string? Resolve(Axis a) =>
-        a.OverrideId != null && _present.ContainsKey(a.OverrideId) ? a.OverrideId : AutoTarget(a);
+    string? Resolve(Axis a) => OutputFallbackLogic.Resolve(a.Prefs, static p => p.Id,
+        _present.ContainsKey, a.OverrideId);
 
     bool TargetIncludesAny(Axis a, HashSet<string> appKeys)
     {
@@ -2344,6 +2424,7 @@ public class MainForm : Form
             a.Pct.Text = "Syncing…";
             a.Pct.ForeColor = _theme.Accent;
         }
+        a.Bar.AccessibleDescription = "Reading the current Windows volume before physical pickup";
         if (publish) PublishDesiredVolumes();
 
         if (_audio.RequestCurrentVolumes(endpoints, apps, snapshot => SafeUi(() =>
@@ -2382,9 +2463,7 @@ public class MainForm : Form
         a.PickupReady = false;
         a.PickupPosition = null;
         a.Bar.PickupPosition = null;
-        _tip.SetToolTip(a.Bar, a.IsVirtual
-            ? "Drag to set the volume (or focus it and use the arrow keys)"
-            : "Physical fader position");
+        UpdateTargetTooltip(a);
     }
 
     // Reflect a slider's active target in its combo and re-push. App targets just
@@ -2540,8 +2619,10 @@ public class MainForm : Form
         CancelPickup(a);
         if (a.IsVirtual)
         {
-            if (a.VMuted) { a.VTarget = a.VPreMute; a.VMuted = false; }
-            else { a.VPreMute = a.VTarget; a.VTarget = 0; a.VMuted = true; }
+            var state = FaderMuteLogic.Toggle(a.VMuted, a.VTarget, a.VPreMute);
+            a.VMuted = state.Muted;
+            a.VTarget = state.Target;
+            a.VPreMute = state.PreMute;
             EnsureRamp();
         }
         else
@@ -2570,7 +2651,7 @@ public class MainForm : Form
     {
         if (a.Mute == null) return;
         a.Mute.Text = a.VMuted ? "Unmute" : "Mute";
-        a.Mute.AccessibleName = a.VMuted ? "Unmute fader" : "Mute fader";
+        a.Mute.AccessibleName = $"{(a.VMuted ? "Unmute" : "Mute")} {a.Name.Text}";
     }
 
     void EnsureRamp() { if (!_vramp.Enabled) _vramp.Start(); }
@@ -2701,8 +2782,8 @@ public class MainForm : Form
             Settings? s = null;
             Exception? readError = null;
             string? loadedFrom = null;
-            string[] candidates = path == SettingsPath
-                ? new[] { path, SettingsPath + ".bak" }
+            IReadOnlyList<string> candidates = path == SettingsPath
+                ? SettingsRecoveryLogic.CandidatePaths(path)
                 : new[] { path };
             foreach (string candidate in candidates)
             {
@@ -2721,6 +2802,7 @@ public class MainForm : Form
                 // every profile with the empty defaults we're falling back to.
                 try { File.Copy(path, path + ".bad", overwrite: true); } catch { }
                 if (readError != null) Program.Log(readError, "Loading settings");
+                _settingsRecoveryNotice = "Settings could not be loaded. The damaged file was preserved as settings.v2.json.bad and safe defaults are in use.";
                 return;
             }
             if (loadedFrom != path)
@@ -2734,11 +2816,13 @@ public class MainForm : Form
                     File.Copy(loadedFrom!, path, overwrite: true);
                 }
                 catch (Exception ex) { Program.Log(ex, "Restoring settings backup"); }
+                _settingsRecoveryNotice = $"A damaged settings file was recovered automatically from {Path.GetFileName(loadedFrom)}.";
             }
-            if (s.SchemaVersion > CurrentSettingsSchema)
+            if (!SettingsRecoveryLogic.SupportsSchema(s.SchemaVersion, CurrentSettingsSchema))
             {
                 Program.Log(new InvalidDataException(
                     $"Settings schema {s.SchemaVersion} is newer than supported schema {CurrentSettingsSchema}."));
+                _settingsRecoveryNotice = $"Settings schema {s.SchemaVersion} is not supported by this build. Safe defaults are in use and the file was left unchanged.";
                 return;
             }
 
@@ -2765,6 +2849,12 @@ public class MainForm : Form
         }
         catch (Exception ex) { Program.Log(ex, "Applying settings"); }
         finally { _loadingSettings = false; }
+    }
+
+    void ShowSettingsRecoveryNotice()
+    {
+        if (_settingsRecoveryNotice == null) return;
+        _tray.ShowBalloonTip(6500, "ZMK Volume Fader settings", _settingsRecoveryNotice, ToolTipIcon.Warning);
     }
 
     // Turn old flat Left/Right settings into a 2-slider profile (and carry the
@@ -3319,6 +3409,7 @@ public class MainForm : Form
         sb.AppendLine($"  Live app keys: {_liveApps.Count}");
         sb.AppendLine($"  Endpoint setters: {_audio?.EndpointSetCalls ?? 0}");
         sb.AppendLine($"  Session setters: {_audio?.SessionSetCalls ?? 0}");
+        sb.AppendLine($"  External volume changes: {_audio?.ExternalChangeCount ?? 0}");
         sb.AppendLine($"  Desired snapshots: {Interlocked.Read(ref _desiredSnapshotCount)}");
         sb.AppendLine();
         sb.AppendLine("Faders");
@@ -3360,6 +3451,60 @@ public class MainForm : Form
         }
     }
 
+    void QueueExternalVolumeChange(AudioController.ExternalVolumeChange change) =>
+        SafeUi(() => ApplyExternalVolumeChange(change));
+
+    void ApplyExternalVolumeChange(AudioController.ExternalVolumeChange change)
+    {
+        if (_audio == null) return;
+        // Several sessions can report one mixer gesture. Once a physical owner is
+        // already waiting for pickup, keep the whole logical target handed off.
+        bool physicalPickup = _sliders.Any(a => !a.IsVirtual && a.PickupArmed
+            && AxisTargetsChange(a, change));
+        if (!physicalPickup)
+        {
+            var owner = _sliders
+                .Where(a => a.LastApplied >= 0 && !a.PickupArmed && IsFaderConnected(a)
+                    && AxisTargetsChange(a, change))
+                .OrderBy(a => a.DriveSequence)
+                .LastOrDefault();
+            if (owner is { IsVirtual: false, VMuted: false })
+            {
+                ArmPickup(owner, publish: false);
+                physicalPickup = owner.PickupArmed;
+            }
+            else if (owner is { IsVirtual: true })
+            {
+                // A virtual fader has no physical position to reconcile, so let
+                // it follow the external mixer gesture instead of fighting it.
+                int level = Math.Clamp((int)Math.Round(change.Volume * 100), 0, 100);
+                owner.VMuted = false;
+                owner.VTarget = level;
+                owner.VCur = level;
+                owner.LastApplied = level;
+                owner.VolPending = -1;
+                UpdateMuteButton(owner);
+                Render(owner);
+            }
+        }
+        PublishDesiredVolumes();
+        _audio.ResolveExternalChange(change, continueDriving: !physicalPickup);
+    }
+
+    bool AxisTargetsChange(Axis a, AudioController.ExternalVolumeChange change)
+    {
+        if (change.IsEndpoint)
+            return a.Target == TargetKind.Output
+                && string.Equals(Resolve(a), change.Key, StringComparison.OrdinalIgnoreCase);
+        if (a.Target == TargetKind.App)
+            return string.Equals(a.AppKey, change.Key, StringComparison.OrdinalIgnoreCase);
+        if (a.Target != TargetKind.Category) return false;
+        if (a.CategoryName == UnassignedCategory)
+            return UnassignedKeys().Contains(change.Key, StringComparer.OrdinalIgnoreCase);
+        return _categories.FirstOrDefault(c => c.Name == a.CategoryName)?.AppKeys
+            .Contains(change.Key, StringComparer.OrdinalIgnoreCase) == true;
+    }
+
     void ImportSettings()
     {
         using var dialog = new OpenFileDialog
@@ -3373,7 +3518,7 @@ public class MainForm : Form
         {
             var imported = JsonSerializer.Deserialize<Settings>(File.ReadAllText(dialog.FileName));
             if (imported == null) throw new InvalidDataException("The selected file does not contain settings.");
-            if (imported.SchemaVersion > CurrentSettingsSchema)
+            if (!SettingsRecoveryLogic.SupportsSchema(imported.SchemaVersion, CurrentSettingsSchema))
                 throw new InvalidDataException($"Settings schema {imported.SchemaVersion} is newer than this app supports ({CurrentSettingsSchema}).");
             if (MessageBox.Show(this,
                     "Importing will replace the current configuration and restart the app. Continue?",
@@ -3803,6 +3948,48 @@ public class MainForm : Form
         }
     }
 
+    string TargetStatusText(Axis a)
+    {
+        string status;
+        if (a.Target == TargetKind.Output)
+        {
+            status = Resolve(a) is string id
+                ? $"Controlling output {NameFor(id)}"
+                : "No configured output is currently connected";
+        }
+        else if (a.Target == TargetKind.App)
+        {
+            string name = a.AppKey != null && _knownApps.TryGetValue(a.AppKey, out var known) ? known : "Selected app";
+            status = a.AppKey != null && _liveApps.Contains(a.AppKey)
+                ? $"Controlling {name}"
+                : $"{name} is not currently running";
+        }
+        else
+        {
+            IEnumerable<string> keys = a.CategoryName == UnassignedCategory
+                ? UnassignedKnownKeys()
+                : _categories.FirstOrDefault(c => c.Name == a.CategoryName)?.AppKeys ?? Enumerable.Empty<string>();
+            string[] distinct = keys.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            int active = distinct.Count(_liveApps.Contains);
+            string name = a.CategoryName == UnassignedCategory ? UnassignedDisplay : a.CategoryName ?? "Selected category";
+            status = $"{name}: {active} of {distinct.Length} apps active";
+        }
+        return a.ConflictHint == null ? status : $"{status}. {a.ConflictHint}";
+    }
+
+    void UpdateTargetTooltip(Axis a)
+    {
+        string status = TargetStatusText(a);
+        _tip.SetToolTip(a.Combo, status);
+        a.Combo.AccessibleDescription = status;
+        if (a.PickupArmed) return;
+        string interaction = a.IsVirtual
+            ? "Drag or use the arrow keys to set volume."
+            : "Position is controlled by the physical fader.";
+        _tip.SetToolTip(a.Bar, $"{status}. {interaction}");
+        a.Bar.AccessibleDescription = $"{status}. {interaction}";
+    }
+
     // Refresh a slider's "active vs idle" visuals (muted bar + dimmed %).
     void UpdateSliderState(Axis a)
     {
@@ -3865,6 +4052,7 @@ public class MainForm : Form
                 a.Pct.Text = $"Pickup {a.PickupTarget}%";
                 a.Pct.ForeColor = _theme.Accent;
                 _tip.SetToolTip(a.Bar, $"Move the physical fader to {a.PickupTarget}% to take control");
+                a.Bar.AccessibleDescription = $"Move the physical fader to {a.PickupTarget}% to take control";
             }
             if (!reached) return;
 
@@ -3937,21 +4125,23 @@ public class MainForm : Form
                 if (a.Target == TargetKind.Output)
                 {
                     string? id = Resolve(a);
-                    if (id != null) endpoints[id] = scalar;
+                    if (id != null) DesiredVolumeLogic.Apply(endpoints, apps, true, id, scalar);
                 }
                 else if (a.Target == TargetKind.App)
                 {
-                    if (a.AppKey != null && _liveApps.Contains(a.AppKey)) apps[a.AppKey] = scalar;
+                    if (a.AppKey != null && _liveApps.Contains(a.AppKey))
+                        DesiredVolumeLogic.Apply(endpoints, apps, false, a.AppKey, scalar);
                 }
                 else if (a.CategoryName == UnassignedCategory)
                 {
-                    foreach (var key in UnassignedKeys()) apps[key] = scalar;
+                    foreach (var key in UnassignedKeys()) DesiredVolumeLogic.Apply(endpoints, apps, false, key, scalar);
                 }
                 else
                 {
                     var category = _categories.FirstOrDefault(c => c.Name == a.CategoryName);
                     if (category != null)
-                        foreach (var key in category.AppKeys.Where(_liveApps.Contains)) apps[key] = scalar;
+                        foreach (var key in category.AppKeys.Where(_liveApps.Contains))
+                            DesiredVolumeLogic.Apply(endpoints, apps, false, key, scalar);
                 }
             }
         }
