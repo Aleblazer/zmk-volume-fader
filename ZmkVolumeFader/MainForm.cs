@@ -633,10 +633,8 @@ public class MainForm : Form
         public required Stepper Limit;
         public required CardPanel Card;
         public RoundedButton[] Tabs = Array.Empty<RoundedButton>();  // Output/Apps/Categories
-        public RoundedButton? Remove;   // virtual faders only: the delete button
-        public RoundedButton? Hotkey;   // virtual faders only: opens the hotkey dialog
         public RoundedButton? Mute;
-        public RoundedButton? Reset;    // virtual faders only: return to 100%
+        public RoundedButton? More;     // virtual faders only: reset/hotkeys/remove menu
         // Which fader group (device) this slider belongs to — a device key for
         // physical faders, or VirtualKey for the virtual home. Axis reports from a
         // device only drive sliders whose GroupKey matches, so two devices can be
@@ -1211,21 +1209,15 @@ public class MainForm : Form
         t.Controls.Add(tabRow, 0, 2); t.SetColumnSpan(tabRow, 2);
 
         t.Controls.Add(combo, 0, 3);
-        // Physical faders show a Max % cap; virtual faders drag straight to the
-        // final volume (no cap needed) and show Hotkeys + Remove buttons instead.
+        // Physical faders show a Max % cap. Virtual faders keep the frequent Mute
+        // action visible and put reset/hotkeys/remove into a compact More menu.
         axis.Mute = MuteButton(axis);
         if (isVirtual)
         {
-            axis.Reset = ResetButton(axis);
-            axis.Hotkey = HotkeyButton(axis);
-            axis.Remove = RemoveButton(axis);
-            // Compact side-by-side (Hotkeys + a small ✕) so the cell is about as
-            // wide as the physical cards' "Max %" and doesn't widen the card.
+            axis.More = MoreButton(axis);
             var vbtns = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Anchor = AnchorStyles.Right, Margin = new Padding(10, 0, 0, 0) };
             vbtns.Controls.Add(axis.Mute);
-            vbtns.Controls.Add(axis.Reset);
-            vbtns.Controls.Add(axis.Hotkey);
-            vbtns.Controls.Add(axis.Remove);
+            vbtns.Controls.Add(axis.More);
             t.Controls.Add(vbtns, 1, 3);
         }
         else
@@ -1277,47 +1269,42 @@ public class MainForm : Form
         return b;
     }
 
-    RoundedButton ResetButton(Axis axis)
+    RoundedButton MoreButton(Axis axis)
     {
         var b = new RoundedButton
         {
-            Text = "↺", AutoSize = false, Font = UiFonts.Get(10f),
-            Size = new Size(26, 26), Margin = new Padding(0, 0, 4, 0),
-            Anchor = AnchorStyles.None, Radius = 7,
-            AccessibleName = "Reset fader to 100 percent",
+            Text = "More ▾", AutoSize = true, Font = UiFonts.Get(8.25f),
+            Padding = new Padding(8, 4, 8, 4), Margin = new Padding(0),
+            Anchor = AnchorStyles.None, Radius = 7, AccessibleName = "More fader actions",
         };
-        b.Click += (_, _) => ResetVirtual(axis);
-        _tip.SetToolTip(b, "Reset this virtual fader to 100%");
+        b.Click += (_, _) => ShowVirtualActions(axis, b);
+        _tip.SetToolTip(b, "Reset, configure hotkeys, or remove this virtual fader");
         return b;
     }
 
-    // Small buttons shown on a virtual fader's card (where a physical fader shows
-    // its Max cap): assign global hotkeys, or delete the fader.
-    RoundedButton HotkeyButton(Axis axis)
+    void ShowVirtualActions(Axis axis, Control owner)
     {
-        var b = new RoundedButton
+        var menu = new ContextMenuStrip
         {
-            Text = "Hotkeys", AutoSize = true, Font = UiFonts.Get(8.25f),
-            Padding = new Padding(9, 4, 9, 4), Margin = new Padding(0, 0, 4, 0),
-            Anchor = AnchorStyles.None, Radius = 7,
+            Font = UiFonts.Get(9f), BackColor = _theme.CtlBg, ForeColor = _theme.Text,
+            ShowImageMargin = false, ShowCheckMargin = false,
+            Padding = new Padding(2),
         };
-        b.Click += (_, _) => OpenHotkeys(axis);
-        _tip.SetToolTip(b, "Assign global volume hotkeys");
-        return b;
-    }
-
-    RoundedButton RemoveButton(Axis axis)
-    {
-        var b = new RoundedButton
+        var reset = menu.Items.Add("Reset to 100%");
+        reset.Enabled = axis.VMuted || axis.VTarget < 100 || axis.VCur < 99.5;
+        reset.Click += (_, _) => ResetVirtual(axis);
+        menu.Items.Add("Configure hotkeys…", null, (_, _) => OpenHotkeys(axis));
+        menu.Items.Add(new ToolStripSeparator());
+        var remove = menu.Items.Add("Remove fader…");
+        remove.ForeColor = _theme.Dark ? Color.FromArgb(0xFF, 0x9A, 0x91) : Color.FromArgb(0xA8, 0x2E, 0x2E);
+        remove.Click += (_, _) => RemoveSlider(axis);
+        foreach (ToolStripItem item in menu.Items)
         {
-            Text = "✕", AutoSize = false, Font = UiFonts.Get(8.25f),
-            Size = new Size(24, 26), Margin = new Padding(0, 0, 0, 0),
-            Anchor = AnchorStyles.None, Radius = 7,
-            AccessibleName = "Remove fader",
-        };
-        b.Click += (_, _) => RemoveSlider(axis);
-        _tip.SetToolTip(b, "Delete this virtual fader");
-        return b;
+            item.BackColor = _theme.CtlBg;
+            item.Padding = new Padding(8, 4, 12, 4);
+        }
+        menu.Closed += (_, _) => menu.Dispose();
+        menu.Show(owner, new Point(owner.Width, owner.Height), ToolStripDropDownDirection.BelowLeft);
     }
 
     // Inline rename: overlay a themed text box on the fader heading. Commit on
@@ -1482,7 +1469,7 @@ public class MainForm : Form
             var u = s.Limit;
             u.BackColor = t.CtlBg; u.ForeColor = t.Text; u.BorderColor = t.CtlBorder; u.ChevronColor = t.Subtle; u.Surround = t.Card; u.Invalidate();
 
-            foreach (var vb in new[] { s.Remove, s.Hotkey, s.Mute, s.Reset })
+            foreach (var vb in new[] { s.Mute, s.More })
                 if (vb is { } btn)
                 {
                     btn.BackColor = t.CtlBg; btn.ForeColor = t.Text;
