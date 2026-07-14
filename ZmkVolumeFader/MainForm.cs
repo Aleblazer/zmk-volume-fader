@@ -1303,7 +1303,15 @@ public class MainForm : Form
             item.BackColor = _theme.CtlBg;
             item.Padding = new Padding(8, 4, 12, 4);
         }
-        menu.Closed += (_, _) => menu.Dispose();
+        // Closed fires from inside WinForms' modal-menu filter. Disposing here
+        // synchronously leaves that filter holding an already-disposed dropdown,
+        // and the next click-away step calls SetVisibleCore on it. Defer cleanup
+        // until the current Windows message has completely unwound.
+        menu.Closed += (_, _) =>
+        {
+            if (!IsDisposed && IsHandleCreated)
+                BeginInvoke((Action)(() => menu.Dispose()));
+        };
         menu.Show(owner, new Point(owner.Width, owner.Height), ToolStripDropDownDirection.BelowLeft);
     }
 
