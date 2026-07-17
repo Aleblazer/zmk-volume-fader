@@ -23,7 +23,7 @@ sealed class OptionsDialog : Form
     // across several visits to Manage Categories); the owner re-points fader
     // targets on Save so a rename doesn't detach them.
     public Dictionary<string, string> CategoryRenames { get; } = new();
-    // Set when the user clicks "Set up sliders…"; the owner runs the wizard.
+    // Set when the user clicks "Fader layout…"; the owner runs the editor.
     public bool SetupRequested { get; private set; }
     public bool ImportRequested { get; private set; }
     public bool ExportRequested { get; private set; }
@@ -68,7 +68,11 @@ sealed class OptionsDialog : Form
     FlowLayoutPanel _btnRow = null!;
     RoundedScrollPanel _scroll = null!;
 
-    static readonly string[] TaperItems = { "Linear pot", "Audio pot", "Straight" };
+    static readonly string[] TaperItems =
+    {
+        "Linear pot", "Audio pot", "Straight",
+        "Linear pot (reversed)", "Audio pot (reversed)",
+    };
     static readonly string[] ThemeItems = { "Auto (follow Windows)", "Light", "Dark" };
     static readonly string[] CloseItems = { "Ask every time", "Minimize to tray", "Exit the app" };
 
@@ -150,7 +154,15 @@ sealed class OptionsDialog : Form
 
         _btnRow = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, FlowDirection = FlowDirection.RightToLeft, BackColor = Color.Transparent, Padding = new Padding(14, 8, 14, 12) };
         var save = MakeButton("Save", accent: true);
-        save.Click += (_, _) => { DialogResult = DialogResult.OK; Close(); };
+        save.Click += (_, _) =>
+        {
+            // Do not persist int.MaxValue/int.MinValue or a half-finished sweep
+            // when Save is clicked while one or more Record buttons are active.
+            for (int i = 0; i < _recording.Length; i++)
+                if (_recording[i]) ToggleRecord(i);
+            DialogResult = DialogResult.OK;
+            Close();
+        };
         var cancel = MakeButton("Cancel", accent: false);
         cancel.Click += (_, _) => { DialogResult = DialogResult.Cancel; Close(); };
         _btnRow.Controls.Add(save);
@@ -285,7 +297,7 @@ sealed class OptionsDialog : Form
         var btnGrid = new TableLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2, RowCount = 3, BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
         btnGrid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         btnGrid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        var setupBtn = MakeButton("Configure faders…", accent: false, surround: _t.Card);
+        var setupBtn = MakeButton("Fader layout…", accent: false, surround: _t.Card);
         setupBtn.Margin = new Padding(0, 0, 6, 6);
         setupBtn.Click += (_, _) => { SetupRequested = true; DialogResult = DialogResult.OK; Close(); };
         var outBtn = MakeButton("Output fallback order…", accent: false, surround: _t.Card);
@@ -341,7 +353,7 @@ sealed class OptionsDialog : Form
     // compact card that just names it and explains it's dragged in the app.
     Panel BuildVirtualFader(string name)
     {
-        var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
+        var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 8), Padding = new Padding(10, 8, 10, 8), BackColor = _t.Card };
         var t = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, RowCount = 2, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         for (int r = 0; r < 2; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -356,41 +368,54 @@ sealed class OptionsDialog : Form
         int idx = i;
         // Auto-size (like the virtual/General cards) so the added mute row can't
         // clip at any scaling.
-        var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 10), Padding = new Padding(12), BackColor = _t.Card };
+        var card = new Panel { Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0, 0, 0, 8), Padding = new Padding(10, 8, 10, 8), BackColor = _t.Card };
 
         var t = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2, RowCount = 6, BackColor = Color.Transparent };
         t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         for (int r = 0; r < 6; r++) t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        t.Controls.Add(new Label { Text = name, AutoSize = true, ForeColor = _t.Subtle, Anchor = AnchorStyles.Left, Margin = new Padding(0, 4, 0, 0) }, 0, 0);
+        t.Controls.Add(new Label { Text = name, AutoSize = true, ForeColor = _t.Subtle, Anchor = AnchorStyles.Left, Margin = new Padding(0, 2, 0, 0) }, 0, 0);
         _rawLbl[i] = new Label { Text = "raw —", AutoSize = true, ForeColor = _t.Text, Anchor = AnchorStyles.Right, Font = UiFonts.Get(11f) };
         t.Controls.Add(_rawLbl[i], 1, 0);
 
-        _rangeLbl[i] = new Label { Text = "range —", AutoSize = true, ForeColor = _t.Text, Anchor = AnchorStyles.Left, Margin = new Padding(0, 8, 0, 0) };
+        _rangeLbl[i] = new Label { Text = "range —", AutoSize = true, ForeColor = _t.Text, Anchor = AnchorStyles.Left, Margin = new Padding(0, 4, 0, 0) };
         _recordBtn[i] = MakeButton("Record", false, _t.Card);
         _recordBtn[i].AccessibleName = $"Record {name} calibration";
         _recordBtn[i].Click += (_, _) => ToggleRecord(idx);
         t.Controls.Add(_rangeLbl[i], 0, 1);
         t.Controls.Add(_recordBtn[i], 1, 1);
 
-        var taperPanel = new FlowLayoutPanel { AutoSize = true, BackColor = Color.Transparent, Margin = new Padding(0, 6, 0, 4) };
-        taperPanel.Controls.Add(new Label { Text = "Taper", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(0, 6, 8, 0) });
-        _taper[i] = new RoundedComboBox { Width = 150, BackColor = _t.CtlBg, ForeColor = _t.Text, Surround = _t.Card, BoxColor = _t.CtlBg, BorderColor = _t.CtlBorder, ChevronColor = _t.Subtle };
+        var taperPanel = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 2) };
+        taperPanel.Controls.Add(new Label { Text = "Taper", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(0, 5, 8, 0) });
+        _taper[i] = new RoundedComboBox { Width = 205, BackColor = _t.CtlBg, ForeColor = _t.Text, Surround = _t.Card, BoxColor = _t.CtlBg, BorderColor = _t.CtlBorder, ChevronColor = _t.Subtle };
         _taper[i].AccessibleName = $"{name} taper";
         _taper[i].Items.AddRange(TaperItems);
         _taper[i].SelectedIndex = Math.Clamp((int)_cal[i].Taper, 0, TaperItems.Length - 1);
         _cal[i].Taper = (TaperKind)_taper[i].SelectedIndex;   // normalize any stale value
         _taper[i].SelectedIndexChanged += (_, _) => OnTaperChanged(idx);
         taperPanel.Controls.Add(_taper[i]);
+        var invert = new CheckBox
+        {
+            Text = "Invert", Checked = _cal[i].Inverted, AutoSize = true,
+            FlatStyle = FlatStyle.Standard, ForeColor = _t.Text, BackColor = Color.Transparent,
+            Margin = new Padding(12, 4, 0, 0), AccessibleName = $"Invert {name} direction",
+        };
+        invert.CheckedChanged += (_, _) =>
+        {
+            _cal[idx].Inverted = invert.Checked;
+            _lastRaw[idx] = int.MinValue;
+        };
+        _tip.SetToolTip(invert, "Flip the final volume direction independently of taper compensation");
+        taperPanel.Controls.Add(invert);
         t.Controls.Add(taperPanel, 0, 2);
         t.SetColumnSpan(taperPanel, 2);
 
         // Mute dead zone: force 0% output while the raw reading sits below this
         // value (a mixer-style mute detent; also stops a wiper resting a few mV
         // above the calibrated Min from hovering at 1%).
-        var mutePanel = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0, 2, 0, 0) };
-        mutePanel.Controls.Add(new Label { Text = "Mute below raw", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(0, 6, 8, 0) });
+        var mutePanel = new FlowLayoutPanel { AutoSize = true, WrapContents = false, BackColor = Color.Transparent, Margin = new Padding(0) };
+        mutePanel.Controls.Add(new Label { Text = "Mute threshold", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(0, 5, 8, 0) });
         var ms = new MainForm.Stepper
         {
             Minimum = 0, Maximum = 300, Value = Math.Clamp(_cal[i].MuteRaw, 0, 300),
@@ -400,14 +425,14 @@ sealed class OptionsDialog : Form
         ms.ValueChanged += (_, _) => { _cal[idx].MuteRaw = ms.Value; _lastRaw[idx] = int.MinValue; };
         _muteStep[i] = ms;
         mutePanel.Controls.Add(ms);
-        mutePanel.Controls.Add(new Label { Text = "(0 = off)", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(6, 6, 0, 0) });
-        _tip.SetToolTip(ms, "Force 0% volume while the raw reading is below this value");
+        mutePanel.Controls.Add(new Label { Text = "(0 = off)", AutoSize = true, ForeColor = _t.Subtle, Margin = new Padding(6, 5, 0, 0) });
+        _tip.SetToolTip(ms, "Raw threshold at the effective 0% endpoint after taper and inversion");
         t.Controls.Add(mutePanel, 0, 3);
         t.SetColumnSpan(mutePanel, 2);
 
         _bar[i] = new MainForm.FaderBar
         {
-            Height = 22, ShowTicks = false, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 8, 8, 2),
+            Height = 20, ShowTicks = false, Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0, 4, 8, 0),
             Track = _t.Inset, Fill = _t.Accent, BackColor = _t.Card, Tick = _t.Subtle,
             Knob = _t.Dark ? Color.FromArgb(0xE6, 0xE8, 0xEB) : Color.White,
             KnobEdge = _t.Dark ? Color.FromArgb(0x0E, 0x10, 0x14) : Color.FromArgb(0xC2, 0xC6, 0xCC),
@@ -421,7 +446,7 @@ sealed class OptionsDialog : Form
         _qualityLbl[i] = new Label
         {
             AutoSize = true, MaximumSize = new Size(360, 0), ForeColor = _t.Subtle,
-            Margin = new Padding(0, 4, 0, 0), AccessibleName = $"{name} calibration quality",
+            Margin = new Padding(0, 2, 0, 0), AccessibleName = $"{name} calibration quality",
         };
         ms.AccessibleName = $"{name} mute threshold in raw units";
         t.Controls.Add(_qualityLbl[i], 0, 5);
@@ -503,8 +528,8 @@ sealed class OptionsDialog : Form
             _previewCurveSpecs[i] = spec;
             _previewCurveValid[i] = true;
         }
-        int p = Math.Clamp((int)Math.Round(Calibration.Eval(_previewCurves[i], v)), 0, 100);
-        if (_cal[i].MuteRaw > 0 && v < _cal[i].MuteRaw) p = 0;   // preview the mute dead zone
+        int p = Math.Clamp((int)Math.Round(_cal[i].MapRaw(_previewCurves[i], v)), 0, 100);
+        if (_cal[i].IsInMuteZone(v)) p = 0;   // preview the endpoint mute dead zone
         _previewLbl[i].Text = $"{p}%";
         _bar[i].Value = p;
     }

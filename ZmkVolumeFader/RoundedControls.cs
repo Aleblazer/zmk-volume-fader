@@ -229,7 +229,15 @@ internal sealed class RoundedButton : Button
         }
         else
         {
-            // Icon + text centred as a group.
+            // Icon-only buttons keep the glyph precisely centred. For labelled
+            // buttons, centre the icon + text as a group.
+            if (string.IsNullOrEmpty(Text))
+            {
+                DrawIcon(g, new Rectangle((Width - IconSize) / 2, (Height - IconSize) / 2, IconSize, IconSize), ForeColor);
+                if (Focused && ShowFocusCues)
+                    ControlPaint.DrawFocusRectangle(g, Rectangle.Inflate(ClientRectangle, -3, -3), ForeColor, fill);
+                return;
+            }
             const int gap = 6;
             var ts = TextRenderer.MeasureText(g, Text, Font, new Size(int.MaxValue, Height),
                 TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);

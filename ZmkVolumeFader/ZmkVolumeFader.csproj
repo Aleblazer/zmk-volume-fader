@@ -9,9 +9,9 @@
     <RootNamespace>ZmkVolumeFader</RootNamespace>
     <AssemblyName>ZmkVolumeFader</AssemblyName>
     <ApplicationIcon>app.ico</ApplicationIcon>
-    <Version>1.4.6</Version>
-    <FileVersion>1.4.6.0</FileVersion>
-    <AssemblyVersion>1.4.6.0</AssemblyVersion>
+    <Version>1.5.0</Version>
+    <FileVersion>1.5.0.0</FileVersion>
+    <AssemblyVersion>1.5.0.0</AssemblyVersion>
     <Product>ZMK Volume Fader</Product>
     <Company>Aleblazer</Company>
     <!-- Per-monitor DPI so WinForms auto-scales the (hand-coded) layout at 125%+
@@ -21,7 +21,7 @@
 
   <ItemGroup>
     <PackageReference Include="HidSharp" Version="2.6.4" />
-    <PackageReference Include="NAudio" Version="2.3.0" />
+    <PackageReference Include="NAudio.Wasapi" Version="2.3.0" />
   </ItemGroup>
 
   <!-- Embed the current git short hash (with -dirty if the tree has uncommitted

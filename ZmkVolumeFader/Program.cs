@@ -89,7 +89,8 @@ static class Program
 
         try { SetPreferredAppMode(1); } catch { }   // AllowDark
         ApplicationConfiguration.Initialize();
-        Application.Run(new MainForm());
+        using var mainForm = new MainForm();
+        Application.Run(mainForm);
     }
 
     static void OnUiException(Exception ex)
@@ -111,6 +112,14 @@ static class Program
         {
             long now = Environment.TickCount64;
             if (LastLogByKey.TryGetValue(key, out long last) && now - last < minimumIntervalMs) return;
+            if (!LastLogByKey.ContainsKey(key) && LastLogByKey.Count >= 512)
+            {
+                long staleBefore = now - 10 * 60_000;
+                foreach (string stale in LastLogByKey.Where(pair => pair.Value < staleBefore).Select(pair => pair.Key).ToArray())
+                    LastLogByKey.Remove(stale);
+                foreach (string oldest in LastLogByKey.OrderBy(pair => pair.Value).Take(Math.Max(0, LastLogByKey.Count - 384)).Select(pair => pair.Key).ToArray())
+                    LastLogByKey.Remove(oldest);
+            }
             LastLogByKey[key] = now;
             LogCore(ex, context);
         }

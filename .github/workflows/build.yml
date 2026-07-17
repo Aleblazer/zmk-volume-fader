@@ -3,28 +3,52 @@ name: Build
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    # net8.0-windows + WinForms must build on Windows.
+    # net8.0-windows + WinForms and the MSI must build on Windows.
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 8.0.x
 
+      - name: Read application version
+        shell: pwsh
+        run: |
+          [xml] $project = Get-Content -Raw ZmkVolumeFader/ZmkVolumeFader.csproj
+          $version = [string] $project.Project.PropertyGroup.Version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid application version '$version'." }
+          "APP_VERSION=$version" | Add-Content $env:GITHUB_ENV
+
+      - name: Verify tag matches application version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_NAME -ne "v$env:APP_VERSION") {
+            throw "Tag $env:GITHUB_REF_NAME does not match application version v$env:APP_VERSION."
+          }
+
       - name: Restore
         run: |
-          dotnet restore ZmkVolumeFader/ZmkVolumeFader.csproj
+          dotnet restore ZmkVolumeFader/ZmkVolumeFader.csproj -r win-x64
           dotnet restore ZmkVolumeFader.Tests/ZmkVolumeFader.Tests.csproj
+          dotnet restore Installer/ZmkVolumeFader.Installer.wixproj
 
       - name: Build
-        run: dotnet build ZmkVolumeFader/ZmkVolumeFader.csproj -c Release --no-restore
+        run: dotnet build ZmkVolumeFader/ZmkVolumeFader.csproj -c Release --no-restore -warnaserror
+
+      - name: Audit dependencies
+        run: dotnet list ZmkVolumeFader/ZmkVolumeFader.csproj package --vulnerable --include-transitive
 
       - name: Logic tests
         run: dotnet run --project ZmkVolumeFader.Tests/ZmkVolumeFader.Tests.csproj -c Release --no-restore
@@ -33,16 +57,54 @@ jobs:
         if: github.event_name != 'pull_request'
         run: dotnet publish ZmkVolumeFader/ZmkVolumeFader.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o artifacts/publish
 
-      - name: Create checksum
+      - name: Build Windows installer
         if: github.event_name != 'pull_request'
         shell: pwsh
-        run: (Get-FileHash artifacts/publish/ZmkVolumeFader.exe -Algorithm SHA256).Hash.ToLower() + '  ZmkVolumeFader.exe' | Set-Content artifacts/publish/ZmkVolumeFader.exe.sha256
+        run: |
+          $publishDir = (Resolve-Path artifacts/publish).Path
+          dotnet build Installer/ZmkVolumeFader.Installer.wixproj -c Release --no-restore -p:ProductVersion=$env:APP_VERSION -p:PublishDir=$publishDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Upload Windows build
+      - name: Collect release assets
         if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts/release | Out-Null
+          $portableName = "ZmkVolumeFader-$env:APP_VERSION-win-x64.exe"
+          $installerName = "ZmkVolumeFader-$env:APP_VERSION-win-x64.msi"
+          Copy-Item artifacts/publish/ZmkVolumeFader.exe "artifacts/release/$portableName"
+          $installer = Get-ChildItem Installer/bin -Filter $installerName -File -Recurse | Select-Object -First 1
+          if ($null -eq $installer) { throw 'Installer build completed but the MSI could not be found.' }
+          Copy-Item $installer.FullName "artifacts/release/$installerName"
+          @($installerName, $portableName) | ForEach-Object {
+            $hash = (Get-FileHash "artifacts/release/$_" -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $_"
+          } | Set-Content artifacts/release/SHA256SUMS.txt -Encoding ascii
+
+      - name: Upload Windows release assets
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
         with:
-          name: ZmkVolumeFader-win-x64
-          path: |
-            artifacts/publish/ZmkVolumeFader.exe
-            artifacts/publish/ZmkVolumeFader.exe.sha256
+          name: ZmkVolumeFader-win-x64-release
+          path: artifacts/release/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@v7
+        with:
+          name: ZmkVolumeFader-win-x64-release
+          path: artifacts/release
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $assets = Get-ChildItem artifacts/release -File | Select-Object -ExpandProperty FullName
+          gh release create $env:GITHUB_REF_NAME $assets --verify-tag --generate-notes --title "ZMK Volume Fader $env:GITHUB_REF_NAME"

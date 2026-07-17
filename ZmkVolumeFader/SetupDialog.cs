@@ -16,16 +16,29 @@ sealed class SetupDialog : Form
     public sealed class Item
     {
         public ItemKind Kind;
+        public string DeviceKey = "";
+        public string DeviceName = "";
         public int Axis = -1;      // physical: captured HID axis index; -1 for virtual
         public int Min, Max;       // physical: captured raw calibration range (mV)
         public int? SourceIndex;   // index into the `existing` list this row came from; null if newly added in this dialog
         public string Label = "";  // display name
     }
 
+    public sealed class DeviceOption
+    {
+        public string Key = "";
+        public string Name = "";
+        public bool Connected;
+        public override string ToString() => $"{Name} — {(Connected ? "connected" : "offline")}";
+    }
+
     public List<Item> Result { get; } = new();
 
     readonly MainForm.Theme _t;
-    readonly Func<int[]> _rawAxes;
+    readonly Func<string, int[]> _rawAxes;
+    readonly IReadOnlyList<DeviceOption> _devices;
+    readonly Action<string?>? _deviceSelected;
+    readonly Func<string, bool>? _sourceConnected;
     readonly System.Windows.Forms.Timer _tick = new() { Interval = 40 };
 
     const int MaxAxes = 8;   // hid-io vendor report carries up to eight 16-bit axes
@@ -41,9 +54,10 @@ sealed class SetupDialog : Form
     // Capture state (only meaningful in Mode.Capture).
     readonly int[] _min = new int[MaxAxes];
     readonly int[] _max = new int[MaxAxes];
-    readonly HashSet<int> _usedAxes = new();   // axes already bound by existing physical items
+    readonly HashSet<string> _usedAxes = new(StringComparer.OrdinalIgnoreCase);
     bool _haveBaseline;
     int _candidate = -1;
+    int _editingIndex = -1;
 
     // --- controls ---
     readonly Label _title = new() { AutoSize = false, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 8), Font = UiFonts.Get(12.5f, FontStyle.Bold) };
@@ -53,6 +67,9 @@ sealed class SetupDialog : Form
     readonly TableLayoutPanel _listInner;
     readonly TableLayoutPanel _capturePanel;
     readonly Label _captureDetail = new() { AutoSize = false, Dock = DockStyle.Fill, Margin = new Padding(0, 8, 0, 0) };
+    readonly Label _captureHead = new() { AutoSize = false, Dock = DockStyle.Fill, Height = 26, Font = UiFonts.Get(10.5f, FontStyle.Bold) };
+    readonly Label _validation = new() { AutoSize = true, Visible = false, Margin = new Padding(0, 4, 0, 4) };
+    readonly ComboBox _captureDevice = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Top };
     readonly FlowLayoutPanel _listButtons;
     readonly FlowLayoutPanel _captureButtons;
     readonly RoundedButton _addPhysical, _addVirtual, _done, _cancel, _capture, _captureCancel;
@@ -64,19 +81,26 @@ sealed class SetupDialog : Form
 
     [DllImport("dwmapi.dll")]
     static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+    static extern int SetWindowTheme(IntPtr hWnd, string? subApp, string? subId);
 
-    public SetupDialog(MainForm.Theme t, Func<int[]> rawAxes, IReadOnlyList<Item> existing, bool pulseAddButtons = false)
+    public SetupDialog(MainForm.Theme t, Func<string, int[]> rawAxes, IReadOnlyList<DeviceOption> devices,
+        IReadOnlyList<Item> existing, Action<string?>? deviceSelected = null,
+        Func<string, bool>? sourceConnected = null, bool pulseAddButtons = false)
     {
         AutoScaleDimensions = new SizeF(96f, 96f);
         AutoScaleMode = AutoScaleMode.Dpi;
         _t = t;
         _rawAxes = rawAxes;
+        _devices = devices;
+        _deviceSelected = deviceSelected;
+        _sourceConnected = sourceConnected;
 
         // Clone the seed so reorder/remove never mutates the caller's list.
         foreach (var it in existing)
-            _items.Add(new Item { Kind = it.Kind, Axis = it.Axis, Min = it.Min, Max = it.Max, SourceIndex = it.SourceIndex, Label = it.Label });
+            _items.Add(new Item { Kind = it.Kind, DeviceKey = it.DeviceKey, DeviceName = it.DeviceName, Axis = it.Axis, Min = it.Min, Max = it.Max, SourceIndex = it.SourceIndex, Label = it.Label });
 
-        Text = "Set Up Faders";
+        Text = "Fader Layout";
         Font = UiFonts.Get(9.75f);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
@@ -102,14 +126,27 @@ sealed class SetupDialog : Form
         _listScroll.SetContent(_listInner);
 
         // Capture panel (shown while adding a physical fader).
-        _capturePanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, BackColor = Color.Transparent, Visible = false };
+        _capturePanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, BackColor = Color.Transparent, Visible = false };
         _capturePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         _capturePanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        _capturePanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         _capturePanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        var captureHead = new Label { AutoSize = false, Dock = DockStyle.Fill, Height = 26, Text = "Add physical fader", Font = UiFonts.Get(10.5f, FontStyle.Bold), ForeColor = _t.Text };
+        _captureHead.Text = "Add physical fader";
+        _captureHead.ForeColor = _t.Text;
         _captureDetail.ForeColor = _t.Subtle;
-        _capturePanel.Controls.Add(captureHead, 0, 0);
-        _capturePanel.Controls.Add(_captureDetail, 0, 1);
+        _captureDevice.BackColor = _t.CtlBg;
+        _captureDevice.ForeColor = _t.Text;
+        _captureDevice.Margin = new Padding(0, 6, 0, 4);
+        foreach (var device in _devices) _captureDevice.Items.Add(device);
+        if (_captureDevice.Items.Count > 0) _captureDevice.SelectedIndex = 0;
+        _captureDevice.SelectedIndexChanged += (_, _) =>
+        {
+            ResetCapture();
+            if (_captureDevice.SelectedItem is DeviceOption selected) _deviceSelected?.Invoke(selected.Key);
+        };
+        _capturePanel.Controls.Add(_captureHead, 0, 0);
+        _capturePanel.Controls.Add(_captureDevice, 0, 1);
+        _capturePanel.Controls.Add(_captureDetail, 0, 2);
 
         // Both content panels share the content cell; only one is visible at a time.
         var content = new Panel { Dock = DockStyle.Fill, BackColor = Color.Transparent };
@@ -120,6 +157,9 @@ sealed class SetupDialog : Form
         // Bottom buttons: list mode (Add physical / Add virtual / Done / Cancel).
         _listButtons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, Dock = DockStyle.Top, WrapContents = true, BackColor = Color.Transparent, Margin = new Padding(0, 10, 0, 0) };
         _addPhysical = MakeButton("Add physical fader", accent: true);
+        // An offline remembered device can be connected after entering capture;
+        // keep the action available whenever there is at least one known source.
+        _addPhysical.Enabled = _devices.Count > 0;
         _addPhysical.Click += (_, _) => { StopPulse(); EnterCapture(); };
         _addVirtual = MakeButton("Add virtual fader", accent: false);
         _addVirtual.Click += (_, _) => { StopPulse(); AddVirtual(); };
@@ -138,9 +178,16 @@ sealed class SetupDialog : Form
         _captureCancel.Click += (_, _) => ExitCapture();
         _captureButtons.Controls.AddRange(new Control[] { _capture, _captureCancel });
 
-        var btnHost = new Panel { Dock = DockStyle.Fill, AutoSize = true, BackColor = Color.Transparent };
-        btnHost.Controls.Add(_listButtons);
-        btnHost.Controls.Add(_captureButtons);
+        _validation.ForeColor = Color.FromArgb(0xF0, 0x8A, 0x3C);
+        var btnHost = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, RowCount = 2, BackColor = Color.Transparent };
+        btnHost.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        btnHost.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        btnHost.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        btnHost.Controls.Add(_validation, 0, 0);
+        var modeButtons = new Panel { Dock = DockStyle.Top, AutoSize = true, BackColor = Color.Transparent };
+        modeButtons.Controls.Add(_listButtons);
+        modeButtons.Controls.Add(_captureButtons);
+        btnHost.Controls.Add(modeButtons, 0, 1);
         root.Controls.Add(btnHost, 0, 2);
 
         Controls.Add(root);
@@ -170,14 +217,16 @@ sealed class SetupDialog : Form
     // ---- list mode --------------------------------------------------------
 
     void UpdateTitle() => _title.Text = _mode == Mode.Capture
-        ? "Add physical fader"
-        : "Arrange your faders — add, reorder, or remove, then Done.";
+        ? (_editingIndex >= 0 ? "Change physical source" : "Add physical fader")
+        : "Your faders — mix devices, change sources, reorder, or remove.";
 
     // (Re)build the list rows from _items, one per fader (or a hint when empty).
     void RebuildRows()
     {
         _listInner.SuspendLayout();
+        var removed = _listInner.Controls.Cast<Control>().ToArray();
         _listInner.Controls.Clear();
+        foreach (var control in removed) control.Dispose();
         _listInner.RowStyles.Clear();
         int rowH = LogicalToDeviceUnits(58), gap = LogicalToDeviceUnits(8);
         if (_items.Count == 0)
@@ -203,6 +252,7 @@ sealed class SetupDialog : Form
         }
         _listInner.ResumeLayout();
         _listScroll.Reflow();
+        UpdateValidation();
     }
 
     Panel BuildRow(int index, int rowH, int gap)
@@ -214,9 +264,9 @@ sealed class SetupDialog : Form
             Margin = new Padding(0, 0, 0, gap), Padding = new Padding(14, 6, 10, 6), BackColor = _t.Card,
         };
 
-        var grid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 4, RowCount = 2, BackColor = Color.Transparent };
+        var grid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 5, RowCount = 2, BackColor = Color.Transparent };
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int c = 0; c < 3; c++) grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        for (int c = 0; c < 4; c++) grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         grid.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
         grid.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
 
@@ -234,6 +284,12 @@ sealed class SetupDialog : Form
         grid.Controls.Add(name, 0, 0);
         grid.Controls.Add(sub, 0, 1);
 
+        if (it.Kind == ItemKind.Physical)
+        {
+            var source = SourceButton();
+            source.Click += (_, _) => { StopPulse(); EnterCapture(index); };
+            grid.Controls.Add(source, 1, 0); grid.SetRowSpan(source, 2);
+        }
         var up = SmallButton("▲", "Move fader up");
         up.Enabled = index > 0;
         up.Click += (_, _) => { StopPulse(); Swap(index, index - 1); };
@@ -242,17 +298,21 @@ sealed class SetupDialog : Form
         down.Click += (_, _) => { StopPulse(); Swap(index, index + 1); };
         var remove = SmallButton("✕", "Remove fader");
         remove.Click += (_, _) => { StopPulse(); _items.RemoveAt(index); RebuildRows(); };
-        grid.Controls.Add(up, 1, 0); grid.SetRowSpan(up, 2);
-        grid.Controls.Add(down, 2, 0); grid.SetRowSpan(down, 2);
-        grid.Controls.Add(remove, 3, 0); grid.SetRowSpan(remove, 2);
+        grid.Controls.Add(up, 2, 0); grid.SetRowSpan(up, 2);
+        grid.Controls.Add(down, 3, 0); grid.SetRowSpan(down, 2);
+        grid.Controls.Add(remove, 4, 0); grid.SetRowSpan(remove, 2);
 
         row.Controls.Add(grid);
         return row;
     }
 
-    static string Subtitle(Item it) => it.Kind == ItemKind.Virtual
-        ? "Virtual · dragged in the app"
-        : $"Physical · axis {it.Axis + 1} · {it.Min}–{it.Max} mV";
+    string Subtitle(Item it)
+    {
+        if (it.Kind == ItemKind.Virtual) return "Virtual · dragged in the app";
+        var device = _devices.FirstOrDefault(d => d.Key.Equals(it.DeviceKey, StringComparison.OrdinalIgnoreCase));
+        string state = device == null ? "unavailable" : device.Connected ? "connected" : "offline";
+        return $"{it.DeviceName} · axis {it.Axis + 1} · {state} · {it.Min}–{it.Max} mV";
+    }
 
     void Swap(int a, int b)
     {
@@ -269,6 +329,7 @@ sealed class SetupDialog : Form
 
     void Finish()
     {
+        if (!UpdateValidation()) return;
         Result.Clear();
         Result.AddRange(_items);   // may be empty — the owner handles a 0-fader layout
         DialogResult = DialogResult.OK;
@@ -277,20 +338,36 @@ sealed class SetupDialog : Form
 
     // ---- capture mode -----------------------------------------------------
 
-    void EnterCapture()
+    void EnterCapture(int editingIndex = -1)
     {
+        _editingIndex = editingIndex;
         _mode = Mode.Capture;
-        _haveBaseline = false;
-        _candidate = -1;
+        if (_editingIndex >= 0 && _editingIndex < _items.Count)
+        {
+            string key = _items[_editingIndex].DeviceKey;
+            for (int i = 0; i < _captureDevice.Items.Count; i++)
+                if (_captureDevice.Items[i] is DeviceOption option
+                    && option.Key.Equals(key, StringComparison.OrdinalIgnoreCase))
+                { _captureDevice.SelectedIndex = i; break; }
+        }
+        if (_captureDevice.SelectedItem is DeviceOption selected) _deviceSelected?.Invoke(selected.Key);
         // Exclude axes already bound to a physical fader in the current list.
         _usedAxes.Clear();
-        foreach (var it in _items) if (it.Kind == ItemKind.Physical && it.Axis >= 0) _usedAxes.Add(it.Axis);
+        for (int i = 0; i < _items.Count; i++)
+        {
+            var it = _items[i];
+            if (i != _editingIndex && it.Kind == ItemKind.Physical && it.Axis >= 0)
+                _usedAxes.Add(Binding(it.DeviceKey, it.Axis));
+        }
+        ResetCapture();
 
         _capture.Enabled = false;
         _listScroll.Visible = false;
         _listButtons.Visible = false;
         _capturePanel.Visible = true;
         _captureButtons.Visible = true;
+        _captureHead.Text = _editingIndex >= 0 ? "Change physical source" : "Add physical fader";
+        _capture.Text = _editingIndex >= 0 ? "Use source" : "Capture";
         UpdateTitle();
         UpdateCaptureText();
         _tick.Start();
@@ -299,11 +376,14 @@ sealed class SetupDialog : Form
     void ExitCapture()
     {
         _tick.Stop();
+        _deviceSelected?.Invoke(null);
+        _editingIndex = -1;
         _mode = Mode.List;
         _capturePanel.Visible = false;
         _captureButtons.Visible = false;
         _listScroll.Visible = true;
         _listButtons.Visible = true;
+        RebuildRows();
         _listScroll.Reflow();
         UpdateTitle();
     }
@@ -311,8 +391,24 @@ sealed class SetupDialog : Form
     void Poll()
     {
         if (_mode != Mode.Capture) return;   // one timer; only capture mode reads axes
-        var axes = _rawAxes();
-        if (axes.Length < MaxAxes) return;   // wait for a full report
+        if (_captureDevice.SelectedItem is not DeviceOption device) return;
+        if (_sourceConnected != null)
+        {
+            bool connected = _sourceConnected(device.Key);
+            if (device.Connected != connected)
+            {
+                device.Connected = connected;
+                _captureDevice.Invalidate();
+                UpdateCaptureText();
+            }
+        }
+        if (!device.Connected) return;
+        var axes = _rawAxes(device.Key);
+        if (axes.Length < MaxAxes)
+        {
+            _captureDetail.Text = "Waiting for the selected device to begin reporting…";
+            return;
+        }
 
         if (!_haveBaseline)
         {
@@ -323,7 +419,7 @@ sealed class SetupDialog : Form
         int best = -1, bestTravel = 0;
         for (int a = 0; a < MaxAxes; a++)
         {
-            if (_usedAxes.Contains(a)) continue;
+            if (_usedAxes.Contains(Binding(device.Key, a))) continue;
             if (axes[a] < _min[a]) _min[a] = axes[a];
             if (axes[a] > _max[a]) _max[a] = axes[a];
             int travel = _max[a] - _min[a];
@@ -337,15 +433,65 @@ sealed class SetupDialog : Form
 
     void UpdateCaptureText() => _captureDetail.Text = _candidate >= 0
         ? $"Detected on axis {_candidate + 1} — range {_min[_candidate]}–{_max[_candidate]} mV.\n\n" +
-          "Sweep it fully, then Capture."
-        : "Move the fader fully from bottom to top.";
+          (_editingIndex >= 0 ? "Sweep it fully, then use this source." : "Sweep it fully, then Capture.")
+        : _captureDevice.Items.Count == 0
+            ? "No compatible fader devices are currently detected."
+            : _captureDevice.SelectedItem is DeviceOption { Connected: false }
+                ? "This source is offline. Connect it or choose another connected device."
+            : "Choose a device, then move one fader fully from bottom to top.";
 
     void CaptureCandidate()
     {
-        if (_candidate < 0) return;
-        _items.Add(new Item { Kind = ItemKind.Physical, Axis = _candidate, Min = _min[_candidate], Max = _max[_candidate], Label = "" });
+        if (_candidate < 0 || _captureDevice.SelectedItem is not DeviceOption device) return;
+        var captured = new Item
+        {
+            Kind = ItemKind.Physical,
+            DeviceKey = device.Key,
+            DeviceName = device.Name,
+            Axis = _candidate,
+            Min = _min[_candidate],
+            Max = _max[_candidate],
+            Label = "",
+        };
+        if (_editingIndex >= 0 && _editingIndex < _items.Count)
+        {
+            captured.SourceIndex = _items[_editingIndex].SourceIndex;
+            captured.Label = _items[_editingIndex].Label;
+            _items[_editingIndex] = captured;
+        }
+        else _items.Add(captured);
         ExitCapture();
-        RebuildRows();
+    }
+
+    void ResetCapture()
+    {
+        _haveBaseline = false;
+        _candidate = -1;
+        _capture.Enabled = false;
+        UpdateCaptureText();
+    }
+
+    static string Binding(string deviceKey, int axis) => FaderLayoutLogic.BindingKey(deviceKey, axis);
+
+    bool UpdateValidation()
+    {
+        var duplicates = FaderLayoutLogic.FindDuplicates(_items
+            .Where(item => item.Kind == ItemKind.Physical)
+            .Select(item => new PhysicalBinding(item.DeviceKey, item.Axis)));
+        if (duplicates.Count == 0)
+        {
+            _validation.Visible = false;
+            _validation.Text = "";
+            _done.Enabled = true;
+            return true;
+        }
+        var duplicate = duplicates[0];
+        string name = _devices.FirstOrDefault(d => d.Key.Equals(duplicate.DeviceKey,
+            StringComparison.OrdinalIgnoreCase))?.Name ?? duplicate.DeviceKey;
+        _validation.Text = $"Duplicate source: {name}, axis {duplicate.Axis + 1}. Each physical source can be used once.";
+        _validation.Visible = true;
+        _done.Enabled = false;
+        return false;
     }
 
     // ---- pulse ------------------------------------------------------------
@@ -407,6 +553,20 @@ sealed class SetupDialog : Form
         return b;
     }
 
+    RoundedButton SourceButton()
+    {
+        var b = new RoundedButton
+        {
+            Text = "Source…", AutoSize = false, Radius = 7, Anchor = AnchorStyles.None,
+            Size = new Size(LogicalToDeviceUnits(70), LogicalToDeviceUnits(32)),
+            Margin = new Padding(4, 0, 0, 0), Surround = _t.Card,
+            BackColor = _t.CtlBg, ForeColor = _t.Text,
+            AccessibleName = "Change physical fader source",
+        };
+        b.FlatAppearance.BorderColor = _t.CtlBorder;
+        return b;
+    }
+
     RoundedButton MakeButton(string text, bool accent)
     {
         var b = new RoundedButton { Text = text, AutoSize = true, Padding = new Padding(12, 6, 12, 6), Margin = new Padding(0, 0, 8, 0), Surround = _t.Window };
@@ -427,5 +587,7 @@ sealed class SetupDialog : Form
         int v = _t.Dark ? 1 : 0;
         if (DwmSetWindowAttribute(Handle, 20, ref v, sizeof(int)) != 0)
             DwmSetWindowAttribute(Handle, 19, ref v, sizeof(int));
+        if (_captureDevice.IsHandleCreated)
+            SetWindowTheme(_captureDevice.Handle, _t.Dark ? "DarkMode_CFD" : null, null);
     }
 }

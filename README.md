@@ -16,7 +16,7 @@ the background.
 
 ## Features
 
-- **Any number of faders (up to 8)**, each independently controlling one of:
+- **Any number of configured faders** (up to 8 physical axes per device), each independently controlling one of:
   - an **output device** (with ranked fallback across devices),
   - one **app's** volume (followed across every device it's playing on),
   - a **category** of apps that move together, or
@@ -27,19 +27,26 @@ the background.
 - **Global hotkeys** for virtual faders — bind Volume Up / Down / Mute to any key
   (**F13–F24** are ideal) or a modifier combo. Keys pass through, so they still work
   in the focused app; stepping is smoothed and the step size is configurable.
-- **Guided setup** — "Set Up Faders" detects each physical fader as you sweep it, or
-  adds virtual ones; reorder, rename, and remove faders in place.
+- **Unified Fader Layout** — combine physical axes from multiple devices with virtual
+  faders in any order; sweep to detect hardware, then reorder, rename, or remove in place.
 - **Categories editor**, **ranked default outputs** with automatic hotplug failover,
   and per-output **Max %** caps.
 - **Light / dark / auto theme**, **start with Windows**, **minimize to tray**.
-- Per-device profiles keyed by device identity; settings persist in
+- One global custom layout with stable physical device/axis bindings; settings persist in
   `%APPDATA%\ZmkVolumeFader\settings.v2.json`.
 
 ## Install
 
-Download the latest **`ZmkVolumeFader-<version>-win-x64.exe`** from
-[Releases](https://github.com/Aleblazer/zmk-volume-fader/releases) — a self-contained
-single file, no .NET install needed (Windows 10/11 x64).
+Download the latest release from
+[Releases](https://github.com/Aleblazer/zmk-volume-fader/releases) (Windows 10/11 x64):
+
+- **`ZmkVolumeFader-<version>-win-x64.msi`** — recommended installer; adds the app to
+  the Start Menu and Windows Installed Apps, supports in-place upgrades, and uninstalls
+  cleanly.
+- **`ZmkVolumeFader-<version>-win-x64.exe`** — portable, self-contained single file.
+
+Neither build needs a separate .NET installation. Existing settings in
+`%APPDATA%\ZmkVolumeFader` are preserved when installing, upgrading, or uninstalling.
 
 > The build is **unsigned**, so Windows SmartScreen shows a "Windows protected your
 > PC" prompt on first run. Click **More info → Run anyway**.
@@ -69,14 +76,23 @@ dotnet publish ZmkVolumeFader -c Release -r win-x64 --self-contained true ^
   -p:EnableCompressionInSingleFile=true
 ```
 
+Build the tested portable executable and MSI release assets together:
+
+```powershell
+.\tools\build-release.ps1
+```
+
 ## Usage
 
-Open **Options → Set up faders…** to add faders:
+Open **Fader Layout** on the main window—or **Options → Fader layout…**—to add faders:
 
-- **Add physical fader** — sweep the fader fully bottom-to-top; the app detects which
-  axis it is and captures its range.
+- **Add physical fader** — choose a detected device and sweep the fader fully
+  bottom-to-top; the app detects its axis and captures its range.
 - **Add virtual fader** — adds an on-screen fader you drag with the mouse.
-- Reorder with ▲/▼, remove with ✕, and rename each fader right in the list.
+- Reorder with ▲/▼, remove with ✕, rename in place, or use **Source…** to move an
+  existing physical fader to another device/axis without losing its target settings.
+- Connected, offline, and unavailable physical sources are identified in the layout;
+  the editor prevents the same device axis from being assigned twice.
 
 With no faders configured, the main window shows an **"Add fader"** card that jumps
 straight into setup.
@@ -121,10 +137,14 @@ In **Options**, each physical fader has a **taper preset** (Linear / Audio / Str
 plus a **Record** button: hit Record, sweep the fader end-to-end, stop, then pick the
 taper that matches your pot — the preview updates as you move it. This corrects a slide
 pot's compressed top-of-travel so the throw feels even, and output hysteresis keeps a
-parked level from flip-flopping between two percentages. Each physical fader can also
-set **Mute below raw** — a mixer-style mute detent that forces 0% while the raw
-reading sits under the chosen value (handy when a pot's bottom of travel doesn't
-quite reach its calibrated minimum). Virtual faders need no calibration.
+parked level from flip-flopping between two percentages. Choose a **reversed** taper
+when GND and 3V3 are wired to the opposite ends of the potentiometer; this mirrors the
+electrical compensation curve while preserving low-to-high travel. **Invert** remains
+a separate final direction toggle,
+so either setting can be used independently or together. Each physical fader can also set a
+**Mute threshold** — a mixer-style endpoint detent that forces 0% near the chosen raw
+threshold and follows the effective 0% endpoint. Virtual faders need no
+calibration.
 
 ## Physical faders — ZMK firmware (optional)
 

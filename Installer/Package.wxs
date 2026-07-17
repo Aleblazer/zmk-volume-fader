@@ -1,0 +1,46 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="ZMK Volume Fader"
+           Manufacturer="Aleblazer"
+           Version="$(ProductVersion)"
+           UpgradeCode="631B74C0-0F24-4A33-B22A-C8FEAE4C3FDC"
+           Scope="perMachine"
+           Language="1033"
+           InstallerVersion="500">
+    <SummaryInformation Description="Control Windows audio with physical or virtual faders."
+                        Manufacturer="Aleblazer" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of ZMK Volume Fader is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="ApplicationIcon" SourceFile="..\ZmkVolumeFader\app.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ApplicationIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/Aleblazer/zmk-volume-fader/issues" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Aleblazer/zmk-volume-fader" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="ZMK Volume Fader">
+        <Component Id="ApplicationFiles" Guid="9681CB01-3C95-4321-828C-399553650ABF" Bitness="always64">
+          <File Id="ApplicationExecutable"
+                Source="$(PublishDir)\ZmkVolumeFader.exe"
+                KeyPath="yes">
+            <Shortcut Id="StartMenuShortcut"
+                      Directory="ProgramMenuFolder"
+                      Name="ZMK Volume Fader"
+                      Description="Control Windows audio with physical or virtual faders"
+                      Advertise="yes"
+                      WorkingDirectory="INSTALLFOLDER" />
+          </File>
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Complete" Title="ZMK Volume Fader" Level="1">
+      <ComponentRef Id="ApplicationFiles" />
+    </Feature>
+
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+  </Package>
+</Wix>
