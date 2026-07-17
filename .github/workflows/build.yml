@@ -107,4 +107,4 @@ jobs:
         shell: pwsh
         run: |
           $assets = Get-ChildItem artifacts/release -File | Select-Object -ExpandProperty FullName
-          gh release create $env:GITHUB_REF_NAME $assets --verify-tag --generate-notes --title "ZMK Volume Fader $env:GITHUB_REF_NAME"
+          gh release create $env:GITHUB_REF_NAME $assets --repo $env:GITHUB_REPOSITORY --verify-tag --generate-notes --title "ZMK Volume Fader $env:GITHUB_REF_NAME"
